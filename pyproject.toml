@@ -1,0 +1,25 @@
+[project]
+name = "autoanalyst"
+version = "0.1.0"
+description = "Self-Correcting Data Pipeline Agent — analyzes sales data via a PLAN→CODEGEN→EXECUTE→OBSERVE→CRITIQUE loop with independent LLM critique."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "groq",
+    "google-generativeai",
+    "python-dotenv",
+    "pandas",
+    "pydantic-settings",
+    "pytest>=9.1.0",
+    "pytest-mock>=3.15.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-mock",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

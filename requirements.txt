@@ -1,0 +1,10 @@
+# ── Runtime ──────────────────────────────────────────────────────────────────
+groq                      # Primary LLM provider
+google-generativeai       # Fallback LLM provider
+python-dotenv             # Load .env into os.environ
+pandas                    # Dataset manipulation
+numpy                     # Synthetic data generation
+
+# ── Dev / Test ────────────────────────────────────────────────────────────────
+pytest
+pytest-mock
