@@ -10,125 +10,169 @@
 
 | Phase | Description | Status |
 |-------|-------------|--------|
-| **0** | Project skeleton (exploratory scaffold) | ✅ Complete |
-| **1** | LLM client wrapper + synthetic data | ✅ **Complete** |
-| 2 | Sandbox + pipeline loop | 🔲 Next |
-| 3 | Real prompts + live integration | 🔲 Planned |
+| 1 | LLM client wrapper + synthetic data | ✅ Complete |
+| 2 | Safe code execution sandbox | ✅ **Complete** |
+| 3 | Pipeline loop + prompts | 🔲 Next |
 | 4 | Data quality checks in OBSERVE stage | 🔲 Planned |
 | 5 | Evaluation against corruption manifest | 🔲 Planned |
 | 6 | Blog post run log + write-up | 🔲 Planned |
 
 ---
 
-## Phase 1 — What Was Completed
+## Current Repo Structure
 
-### Files Created / Modified
+```
+AutoAnalyst/
+├── agent/
+│   ├── __init__.py
+│   ├── config.py             # model names, retry caps, role constants
+│   ├── llm_client.py         # call_llm() — Groq-first, Gemini-fallback
+│   └── sandbox.py            # run_sandboxed() — process-isolated exec
+├── data/
+│   └── generate_data.py      # generate_sales_data() + inject_corruption()
+├── tests/
+│   ├── __init__.py
+│   ├── test_llm_client.py    # 19 tests ✅
+│   └── test_sandbox.py       # 24 tests ✅
+├── .env.example
+├── .gitignore
+├── main.py                   # stub — wired to agent/pipeline.py in Phase 3
+├── pyproject.toml
+├── requirements.txt
+└── uv.lock
+```
 
-| File | Status | Notes |
-|------|--------|-------|
-| `agent/__init__.py` | ✅ Created | Package init with `__version__` |
-| `agent/config.py` | ✅ Created | All constants: model names, retry caps, role strings |
-| `agent/llm_client.py` | ✅ Created | `call_llm()` — Groq-first + retry + Gemini fallback |
-| `data/generate_data.py` | ✅ Created | `generate_sales_data()` + `inject_corruption()` with manifest |
-| `tests/test_llm_client.py` | ✅ Replaced | 19 tests, all passing — covers full retry/fallback contract |
-| `.env.example` | ✅ Updated | Two keys only: `GROQ_API_KEY`, `GEMINI_API_KEY` — no real values |
-| `requirements.txt` | ✅ Updated | Added `numpy` for data generator |
-| `README.md` | ✅ Written | Quick-start, structure, LLM architecture table, phase roadmap |
+---
+
+## ⚠️ Phase 3 Hard Dependency — Sandbox Result Convention
+
+> **Agent-generated code MUST assign its final answer to a variable named `result`.**
+
+The sandbox reads `local_ns["result"]` after `exec()` and returns its `repr()`
+(truncated to 2000 chars). If `result` is not set, `out["result"]` is `None`.
+
+**Do not change this convention without updating the CODE-GEN prompt in Phase 3.**
+
+The `run_sandboxed()` return dict always has exactly these five keys:
+```python
+{
+    "success":    bool,        # True if no exception was raised
+    "result":     str | None,  # repr of `result` variable, truncated to 2000 chars
+    "stdout":     str,         # everything printed to stdout
+    "error":      str | None,  # full traceback if success=False
+    "error_type": str | None,  # exception class name (e.g. "ZeroDivisionError")
+}
+```
+
+On timeout: `success=False`, `error_type="TimeoutError"`.
+
+---
+
+## Phase 2 — What Was Built
+
+### Files
+
+| File | Notes |
+|------|-------|
+| `agent/sandbox.py` | `run_sandboxed(code, df, timeout_seconds=5)` → dict |
+| `tests/test_sandbox.py` | 24 tests — all passing |
 
 ### Test Results
 
 ```
-tests/test_llm_client.py — 19 passed in 0.12s  ✅
+tests/test_llm_client.py  — 19 passed  ✅
+tests/test_sandbox.py     — 24 passed  ✅
+Total: 43 passed, 0 failed
 ```
 
-All 19 tests pass with zero live API calls (Groq and Gemini both mocked).
+### Bugs Fixed During Phase 2
 
-### Data Generator Output (verified)
+1. **Parquet serialization failed** — `pyarrow` not installed. Switched to
+   `pickle` for DataFrame inter-process transfer. No extra dependency needed;
+   pickle is fine for same-version subprocess communication.
 
-```
-Clean:    700 rows × 7 cols | Jan–Apr 2024 | 4 regions | 6 categories | 0 nulls | 0 dupes
-Corrupt:  703 rows
-  - 21 duplicated transaction IDs  (~3% of 700)
-  - 14 null revenue rows           (~2% of 700)
-  - 3  impossible value rows       (indices 700–702)
-    [700] negative_revenue:              revenue = -999.99
-    [701] revenue_outlier_50x:           revenue = 4960.0 (50× Food & Beverage median)
-    [702] zero_units_positive_revenue:   units_sold = 0, revenue = 59.99
-Total defects in manifest: 38
-```
+2. **`__builtins__` restriction blocked worker-level imports** — The whitelist
+   was set before the worker could import `pandas`/`numpy` at module level.
+   Fixed by applying the restriction only inside `exec()`, not at worker scope.
+
+3. **Test assertions used Python `float` repr** — `df['revenue'].sum()` returns
+   `np.float64`, whose `repr()` is `'np.float64(1000.0)'` not `'1000.0'`.
+   Fixed tests to check `"1000.0" in out["result"]` instead of exact equality.
 
 ---
 
 ## Decisions Made
 
-### Phase 1 Decisions
+### Phase 2 Decisions
 
-#### 1. All roles use Groq (not split-provider per role)
-**Why:** Phase 0 sent `critique` to Gemini as a separate provider for "independence."
-Phase 1 spec overrides this: all roles use Groq by default, with Gemini as an
-availability fallback (not a design choice for independence). The critique model
-(`openai/gpt-oss-120b` on Groq) is larger/stronger than the plan/codegen model
-(`llama-3.3-70b-versatile`) — that model gap provides the independence, not the
-provider gap.
+#### 6. Process-based sandbox (not thread-based)
+**Why:** A thread cannot be hard-killed in CPython. `threading.Event` only
+signals cooperative exit — a `while True: pass` loop will never yield to it.
+`multiprocessing.Process.kill()` sends SIGKILL, which is unconditional.
 
-#### 2. Role parameter is logging-only in `call_llm`
-**Why:** Keeps routing logic centralized in `_default_model_for_role()` rather than
-spread across a role → provider dispatch table. Any caller can override with
-`model=` if needed. This also means the fallback logic is identical for all roles.
+#### 7. `result` variable convention (not last-expression capture)
+**Why:** AST last-expression capture is fragile:
+- Multi-line code has no single "last expression"
+- The `compile()` + `eval()` pattern breaks on assignment-only last lines
+- Different code styles (trailing comments, blank lines) confuse AST walkers
 
-#### 3. Groq retry once before fallback (not immediate fallback)
-**Why:** Transient 429s and timeouts are common on free-tier Groq. Falling back to
-Gemini on every transient error would make Groq the "primary" in name only.
-One retry with 1.5s backoff handles the vast majority of transient failures
-without hitting rate limits on the retry itself.
+A simple convention (`result = ...`) is explicit, reliable, and easy to
+enforce in the CODE-GEN prompt. The prompt will say:
+> "Always assign your final answer to a variable named `result`."
 
-#### 4. `inject_corruption` returns a manifest dict (not just a corrupted DF)
-**Why:** The manifest is the ground truth for Phase 5 scoring. Without it, you'd have
-to re-derive what was injected, which defeats the point of a controlled evaluation.
-The manifest records exact indices, corruption types, and injected values.
+#### 8. DataFrame via `pickle` (not Parquet, not shared memory)
+**Why:** Parquet requires `pyarrow` or `fastparquet` (not installed). Shared
+memory (`multiprocessing.shared_memory`) requires manual lifecycle management
+and array-based serialization incompatible with arbitrary DataFrame schemas.
+`pickle` is stdlib, same-version safe, and fast enough for ~1000-row DataFrames.
 
-#### 5. Three impossible-value types (not just one)
-**Why:** Each type exercises a different detection mechanism:
-- **Negative revenue** → caught by `(df['revenue'] < 0).any()` — trivial range check
-- **50× outlier** → caught by z-score or IQR outlier detection — statistical check
-- **Zero units + positive revenue** → caught by `df[df['units_sold'] == 0]['revenue'] > 0` — logic check
-Phase 5 evaluation can score the agent on each separately.
+#### 9. `spawn` start method (not `fork`)
+**Why:** `fork` inherits the parent's open file descriptors, sockets, and
+random state — a security and stability risk in a sandboxed executor. `spawn`
+starts a clean Python interpreter, matching production safety expectations.
+On macOS, `spawn` is also the default since Python 3.8, so this is consistent.
 
 ---
 
-## Architecture Summary
+## NEXT STEPS — Phase 3: Pipeline Loop + Prompts
 
+### Goal
+Build the `PLAN → CODEGEN → EXECUTE → OBSERVE → CRITIQUE` orchestration loop
+using `call_llm()` and `run_sandboxed()`. Wire `main.py` to run it end-to-end.
+
+### Files to create
+
+| File | Responsibility |
+|------|---------------|
+| `agent/logger.py` | `LogEntry` dataclass + `write_log_entry()` + `read_run_log()` (JSONL append) |
+| `agent/stages/__init__.py` | Package init |
+| `agent/stages/planner.py` | `plan(goal, schema, config)` → `list[str]` |
+| `agent/stages/codegen.py` | `generate_code(question, schema, previous_error)` → `str` |
+| `agent/stages/executor.py` | `execute(code, df)` → sandbox result dict |
+| `agent/stages/observer.py` | `observe(question, code, exec_out)` → `str` |
+| `agent/stages/critic.py` | `critique(question, code, observation)` → `CritiqueResult` |
+| `agent/pipeline.py` | `run_pipeline(goal, df)` → `PipelineRunResult` |
+| `tests/test_pipeline.py` | Integration smoke test with mocked `call_llm` |
+
+### CODE-GEN prompt must include (Phase 3 hard dependency from Phase 2)
 ```
-call_llm(prompt, role, model=None)
-  │
-  ├── role → _default_model_for_role() → Groq model ID
-  │
-  ├── [Attempt 1] _call_groq(prompt, model, groq_api_key)
-  │     └── success → return  │  failure → sleep(1.5s)
-  │
-  ├── [Attempt 2] _call_groq(prompt, model, groq_api_key)  (retry)
-  │     └── success → return  │  failure → fall back
-  │
-  ├── [Fallback]  _call_gemini(prompt, GEMINI_FALLBACK_MODEL, gemini_api_key)
-  │     └── success → return  │  failure ↓
-  │
-  └── raise LLMUnavailableError(groq_error=..., gemini_error=...)
+Always assign your final answer to a variable named `result`.
+Available: df (DataFrame), pd (pandas), np (numpy).
+Do NOT use: import, open, os, sys, subprocess.
 ```
 
+### Pipeline constraints
+- Hard-cap retries at `MAX_PIPELINE_RETRIES` (3) — never unbounded
+- `write_log_entry()` called after **every** stage — partial runs are readable
+- On critique FAIL: pass issues text back to CODE-GEN as `previous_error`
+- Log fields: `run_id, sub_question, stage, iteration, code, result, critique, passed, timestamp`
+
+### CLI target
+```bash
+source .venv/bin/activate
+python main.py --goal "Analyse sales trends" --data data/sales_corrupted.csv
+cat runs/<run_id>.jsonl | python -m json.tool
 ```
-generate_sales_data(n_rows=700, seed=42) → clean DataFrame
-inject_corruption(clean_df, seed=99)    → (corrupted DataFrame, manifest dict)
-```
-
----
-
-## Phase 0 Notes (kept for reference)
-
-Phase 0 created the `autoanalyst/` package as an exploratory scaffold with
-Groq→generate / Gemini→critique split-provider routing. **This is superseded
-by `agent/` (Phase 1+)**. The `autoanalyst/` directory is kept for reference
-but should not be imported by Phase 2+ code. It can be deleted once Phase 3
-is complete.
 
 ---
 
@@ -136,48 +180,6 @@ is complete.
 
 | Issue | Severity | Mitigation |
 |-------|----------|------------|
-| `np.str_` appears in manifest printed output (numpy scalar type) | Low | Cast to `str` in manifest dict if needed for JSON serialisation — `json.dump(default=str)` already handles it |
-| `autoanalyst/` package conflicts with `agent/` — two separate packages with overlapping purpose | Low | Document as Phase 0 scaffold; delete after Phase 3 |
-| `_call_groq` uses temperature=0.2 hardcoded | Low | Move to `config.py` in Phase 3 when prompt tuning begins |
-
----
-
-## NEXT STEPS — Phase 2: Sandbox + Pipeline Loop
-
-### Goal
-Build the execution sandbox and the `PLAN → CODEGEN → EXECUTE → OBSERVE → CRITIQUE`
-orchestration loop. The loop should:
-- Be importable from `agent/pipeline.py`
-- Use `agent/llm_client.call_llm()` for all LLM calls
-- Execute agent-generated code only inside `agent/sandbox.py`
-- Write a structured `LogEntry` (JSONL) after every stage
-- Hard-cap retries at `config.MAX_PIPELINE_RETRIES`
-
-### Files to Create
-
-1. **`agent/sandbox.py`** — Restricted `exec()` jail with:
-   - Curated safe globals (pandas, math, statistics, json, re, datetime)
-   - Stdout capture via `io.StringIO`
-   - Wall-clock timeout via `threading.Event` + daemon thread
-   - `SandboxResult(stdout, return_value, error, timed_out)` dataclass
-
-2. **`agent/logger.py`** — Append-only JSONL writer:
-   - `LogEntry` dataclass with fields: `run_id, sub_question, stage, iteration, code, result, critique, passed, timestamp, extra`
-   - `write_log_entry(entry, log_dir)` — atomic append
-   - `read_run_log(run_id, log_dir)` — for tests and post-run analysis
-
-3. **`agent/pipeline.py`** — `run_pipeline(goal, df, config)`:
-   - Calls `agent/stages/planner.py`, `codegen.py`, `executor.py`, `observer.py`, `critic.py`
-   - Returns `PipelineRunResult` with per-question outcomes and log path
-
-4. **`agent/stages/`** — 5 stage files, each with one public function
-
-5. **`tests/test_sandbox.py`** — isolation, timeout, stdout capture, `_result` return
-
-6. **`tests/test_pipeline.py`** — integration smoke test with mocked `call_llm`
-
-### Entry point
-```bash
-python main.py --dry-run --data data/sales_corrupted.csv
-```
-Should produce a JSONL file in `runs/` with entries for every stage.
+| `scripts/download_data.py` is unused (project uses synthetic data) | Low | Delete at start of Phase 3 |
+| Sandbox `spawn` start method adds ~1–2s overhead per execution on macOS | Low | Acceptable for a CLI tool; pool reuse is a Phase 6 optimization |
+| `pickle` for DataFrame transfer is not safe across Python versions | Low | Same interpreter guaranteed since child is spawned from parent |
