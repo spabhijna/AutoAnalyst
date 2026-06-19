@@ -25,7 +25,7 @@ GROQ_RETRY_BACKOFF_SECONDS: float = 1.5
 
 # Hard cap on PLAN → CODEGEN → EXECUTE → OBSERVE → CRITIQUE iterations
 # per sub-question (default; can be overridden via env MAX_RETRIES)
-MAX_PIPELINE_RETRIES: int = 3
+MAX_PIPELINE_RETRIES: int = 5
 
 # Wall-clock timeout (seconds) for sandbox code execution
 SANDBOX_TIMEOUT_SECONDS: float = 30.0

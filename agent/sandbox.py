@@ -136,16 +136,18 @@ def _worker(
             "stdout": "",
             "error": f"DataFrame deserialization failed: {exc}",
             "error_type": type(exc).__name__,
+            "error_category": "execution_error",
         })
         return
 
     # Build restricted namespace for exec() — pd and np come from worker imports
-    local_ns: dict[str, Any] = {
+    global_ns: dict[str, Any] = {
         "__builtins__": _SAFE_BUILTINS,  # restricted: no open/import/os/sys
         "df": df,
         "pd": pd,
         "np": np,
     }
+    local_ns: dict[str, Any] = {}
 
     # Capture stdout from agent code
     stdout_buf = io.StringIO()
@@ -153,8 +155,8 @@ def _worker(
     sys.stdout = stdout_buf
 
     try:
-        exec(code, local_ns)  # noqa: S102
-        raw_result = local_ns.get("result", None)
+        exec(code, global_ns, local_ns)  # noqa: S102
+        raw_result = local_ns.get("result", global_ns.get("result", None))
         result_repr = _safe_repr(raw_result)
         result_queue.put({
             "success": True,
@@ -162,18 +164,27 @@ def _worker(
             "stdout": stdout_buf.getvalue(),
             "error": None,
             "error_type": None,
+            "error_category": "none",
         })
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         tb = traceback.format_exc()
         # Extract the exception class name from the last line of the traceback
         last_line = tb.strip().splitlines()[-1]
-        exc_type = last_line.split(":")[0].strip()
+        exc_type = type(exc).__name__
+        
+        is_capability_error = False
+        if exc_type in ("ImportError", "ModuleNotFoundError", "PermissionError"):
+            is_capability_error = True
+        elif exc_type == "NameError":
+            is_capability_error = True
+
         result_queue.put({
             "success": False,
             "result": None,
             "stdout": stdout_buf.getvalue(),
             "error": tb,
             "error_type": exc_type,
+            "error_category": "capability_error" if is_capability_error else "execution_error",
         })
     finally:
         sys.stdout = old_stdout
@@ -264,6 +275,7 @@ def run_sandboxed(
             "stdout": "",
             "error": f"Failed to serialize DataFrame for sandbox: {exc}",
             "error_type": type(exc).__name__,
+            "error_category": "execution_error",
         }
 
     # Use 'spawn' context for clean isolation (no inherited file descriptors)
@@ -291,6 +303,7 @@ def run_sandboxed(
                 f"and was forcibly terminated."
             ),
             "error_type": "TimeoutError",
+            "error_category": "execution_error",
         }
 
     # Retrieve result from the queue
@@ -299,12 +312,13 @@ def run_sandboxed(
 
     # Process exited without putting anything in the queue (e.g. OOM kill)
     return {
-        "success": False,
-        "result": None,
-        "stdout": "",
-        "error": (
-            f"Child process exited with code {process.exitcode} "
-            f"without returning a result."
-        ),
-        "error_type": "ProcessError",
-    }
+            "success": False,
+            "result": None,
+            "stdout": "",
+            "error": (
+                f"Child process exited with code {process.exitcode} "
+                f"without returning a result."
+            ),
+            "error_type": "ProcessError",
+            "error_category": "execution_error",
+        }
