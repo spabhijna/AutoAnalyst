@@ -22,10 +22,15 @@ Design decisions
    ``quarter_df = artifacts["quarter_df"]``.
 
 5. **Self-describing for CODE-GEN prompts.**
-   ``describe()`` returns a human-readable block listing every registered
-   artifact with its row count, column names, and producing task ID. This
-   is injected into every CODE-GEN and REPAIR prompt so the LLM knows
-   what pre-validated DataFrames are available without re-deriving them.
+   ``describe()`` includes artifact type ("DataFrame", "Series") and schema
+   so downstream prompts are self-contained — a step referencing ``quarter_df``
+   sees its columns and row count without needing to know which prior step
+   produced it or what filter was applied.
+
+6. **Artifacts are first-class objects.**
+   Each registered result is a :class:`Artifact` bundling name, type, schema,
+   producer, and value in one place.  No separate metadata dict — the artifact
+   IS the metadata.
 """
 
 from __future__ import annotations
@@ -33,6 +38,10 @@ from __future__ import annotations
 import logging
 import pickle
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    pass
 
 import pandas as pd
 
@@ -43,27 +52,86 @@ logger = logging.getLogger(__name__)
 MAX_ARTIFACT_BYTES: int = 50 * 1024 * 1024  # 50 MB
 
 
-@dataclass
-class ArtifactMeta:
-    """Lightweight metadata stored alongside each registered DataFrame."""
+# ---------------------------------------------------------------------------
+# Helper — artifact classification
+# ---------------------------------------------------------------------------
 
-    key: str
-    rows: int
-    columns: list[str]
-    dtypes: dict[str, str]
-    producing_task_id: str = ""
+
+def classify_artifact(df: pd.DataFrame) -> tuple[str, list[str]]:
+    """
+    Classify a DataFrame artifact by its structure.
+
+    Returns a (type_label, schema_list) tuple:
+    - ``"DataFrame"`` if the DataFrame has multiple columns (a full table).
+    - ``"Series"``   if it has exactly one column (e.g. aggregated result).
+    - ``"scalar"``   if it has 1 row × 1 column (single value result).
+
+    The *schema* list contains column names for DataFrames/Series,
+    or ``["<scalar>"]`` for scalar values.
+
+    Args:
+        df: A validated, non-empty DataFrame.
+
+    Returns:
+        (type, schema) tuple.
+    """
+    cols = list(df.columns)
+    if len(df) == 1 and len(df.columns) == 1:
+        return ("scalar", ["<scalar>"])
+    if len(cols) == 1:
+        return ("Series", cols)
+    return ("DataFrame", cols)
+
+
+# Backward-compatible alias (tests use the old name).
+_classify_artifact = classify_artifact
+
+
+# ---------------------------------------------------------------------------
+# Artifact — first-class typed object
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Artifact:
+    """
+    A first-class analytical output — value + self-describing metadata.
+
+    Every result produced by the pipeline (DataFrames, aggregated Series,
+    scalar answers) becomes an :class:`Artifact`.  The ``type`` and ``schema``
+    fields make downstream CODE-GEN prompts self-contained without needing to
+    cross-reference the producing task's scope or filter.
+    """
+
+    name: str               # planner-declared snake_case key (e.g. "quarter_df")
+    type: str               # "DataFrame" | "Series" | "scalar"
+    schema: list[str]       # column names (DataFrame/Series), ["<scalar>"] for scalar
+    producer: str           # producing_task_id
+    value: pd.DataFrame     # the actual data (shallow-copied on registration)
+
+    # ── Derived accessors ─────────────────────────────────────────────────────
+
+    @property
+    def rows(self) -> int:
+        """Return the number of rows in the underlying DataFrame."""
+        return len(self.value)
 
     def column_summary(self, max_cols: int = 8) -> str:
         """Return a compact column list, truncated for prompt embedding."""
-        cols = self.columns[:max_cols]
-        suffix = f", … (+{len(self.columns) - max_cols} more)" if len(self.columns) > max_cols else ""
+        cols = list(self.value.columns)[:max_cols]
+        suffix = f", … (+{len(self.value.columns) - max_cols} more)" if len(self.value.columns) > max_cols else ""
         return ", ".join(cols) + suffix
+
+
+# ---------------------------------------------------------------------------
+# ArtifactStore
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class ArtifactStore:
     """
-    Registry mapping artifact_key → validated pd.DataFrame.
+    Registry mapping artifact_key → :class:`Artifact`.
 
     Populated as tasks are accepted during the agent loop. Later steps read
     their dependency DataFrames from here instead of re-applying filters and
@@ -72,8 +140,7 @@ class ArtifactStore:
     Thread safety: the agent loop is single-threaded; no locking is needed.
     """
 
-    _store: dict[str, pd.DataFrame] = field(default_factory=dict)
-    _meta: dict[str, ArtifactMeta] = field(default_factory=dict)
+    _artifacts: dict[str, Artifact] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Write API
@@ -86,12 +153,15 @@ class ArtifactStore:
         producing_task_id: str = "",
     ) -> bool:
         """
-        Register *df* under *key*.
+        Register *df* under *key* as an :class:`Artifact`.
 
         Performs three validations before accepting:
           1. Value is a non-None pd.DataFrame.
           2. DataFrame is non-empty.
           3. Pickled size is within MAX_ARTIFACT_BYTES.
+
+        The artifact's ``type`` and ``schema`` are auto-detected from the
+        DataFrame structure via :func:`classify_artifact`.
 
         Args:
             key:               Snake_case name declared by the planner.
@@ -124,18 +194,19 @@ class ArtifactStore:
             )
             return False
 
-        # Shallow copy: column data is shared but the dict and index are independent.
-        self._store[key] = df.copy(deep=False)
-        self._meta[key] = ArtifactMeta(
-            key=key,
-            rows=len(df),
-            columns=list(df.columns),
-            dtypes={c: str(df[c].dtype) for c in df.columns},
-            producing_task_id=producing_task_id,
+        # Classify and build the artifact atomically — no separate metadata dict.
+        artifact_type, schema_info = classify_artifact(df)
+
+        self._artifacts[key] = Artifact(
+            name=key,
+            type=artifact_type,
+            schema=schema_info,
+            producer=producing_task_id,
+            value=df.copy(deep=False),
         )
         logger.debug(
-            "ArtifactStore: registered %r (%d rows, %d cols, task=%s)",
-            key, len(df), len(df.columns), producing_task_id,
+            "ArtifactStore: registered %r (type=%s, %d rows, %d cols, producer=%s)",
+            key, artifact_type, len(df), len(df.columns), producing_task_id,
         )
         return True
 
@@ -144,15 +215,20 @@ class ArtifactStore:
     # ------------------------------------------------------------------
 
     def get(self, key: str) -> pd.DataFrame | None:
-        """Return the DataFrame registered under *key*, or None."""
-        return self._store.get(key)
+        """Return the DataFrame for *key*, or ``None`` if not found."""
+        artifact = self._artifacts.get(key)
+        return artifact.value if artifact is not None else None
+
+    def get_artifact(self, key: str) -> Artifact | None:
+        """Return the full :class:`Artifact` for *key*, or ``None``."""
+        return self._artifacts.get(key)
 
     def available_keys(self) -> list[str]:
         """Return the list of currently registered artifact keys."""
-        return list(self._store.keys())
+        return list(self._artifacts.keys())
 
     def __contains__(self, key: str) -> bool:
-        return key in self._store
+        return key in self._artifacts
 
     # ------------------------------------------------------------------
     # Sandbox integration
@@ -170,7 +246,7 @@ class ArtifactStore:
 
             quarter_df = artifacts["quarter_df"]
         """
-        return dict(self._store)  # shallow copy of the registry
+        return {name: a.value for name, a in self._artifacts.items()}
 
     def as_namespace_for(self, keys: list[str]) -> dict[str, pd.DataFrame]:
         """
@@ -180,7 +256,7 @@ class ArtifactStore:
         the relevant DataFrames are shipped to the sandbox (smaller IPC payload).
         Falls back gracefully — missing keys are silently omitted.
         """
-        return {k: self._store[k] for k in keys if k in self._store}
+        return {k: self._artifacts[k].value for k in keys if k in self._artifacts}
 
     # ------------------------------------------------------------------
     # Prompt description
@@ -190,27 +266,30 @@ class ArtifactStore:
         """
         Return a prompt-ready description of all registered artifacts.
 
-        Injected into every CODE-GEN and REPAIR prompt so the LLM knows which
-        pre-validated DataFrames are available and how to access them.
+        Each artifact is listed with its ``type``, schema, and row count —
+        making downstream CODE-GEN prompts self-contained.  A step that reads
+        ``quarter_df`` sees its columns and type without needing to know which
+        prior step produced it.
 
         Returns ``"(no pre-computed artifacts available yet)"`` when empty.
         """
-        if not self._meta:
+        if not self._artifacts:
             return "(no pre-computed artifacts available yet)"
 
         lines = [
-            "AVAILABLE ARTIFACTS (pre-validated DataFrames — use these instead of re-filtering df):",
+            "AVAILABLE ARTIFACTS (pre-validated — use these instead of re-deriving):",
         ]
-        for key, meta in self._meta.items():
-            producer = f" | produced by {meta.producing_task_id}" if meta.producing_task_id else ""
-            lines.append(
-                f'  artifacts["{key}"]  — {meta.rows:,} rows'
-                f" | columns: {meta.column_summary()}"
-                f"{producer}"
-            )
+        for key, a in self._artifacts.items():
+            type_line = f'  artifacts["{key}"]  type={a.type}'
+            if a.schema and a.schema != ["<scalar>"]:
+                schema_str = ", ".join(a.schema[:8])
+                if len(a.schema) > 8:
+                    schema_str += " …"
+                type_line += f"  schema=[{schema_str}]"
+            type_line += f"  ({a.rows:,} rows)"
+            lines.append(type_line)
+
         lines.append(
-            "\nUSAGE: read from artifacts first; only fall back to re-filtering df if the"
-            " artifact you need is not listed above.\n"
-            "Example:  quarter_df = artifacts.get(\"quarter_df\") or df[mask]"
+            "\nUSAGE: val = artifacts.get(\"key\"); if val is None: val = df[mask]"
         )
         return "\n".join(lines)

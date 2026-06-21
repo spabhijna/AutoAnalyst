@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,7 +38,8 @@ import pandas as pd
 from agent import config
 from agent.artifact_store import ArtifactStore
 from agent.llm_client import call_llm
-from agent.logger import LogEntry, new_run_id, write_log_entry
+from agent.observer import observe
+from agent.logger import LogEntry, export_run_json, new_run_id, write_log_entry
 from agent.prompts import (
     codegen_prompt,
     critique_prompt,
@@ -135,6 +137,7 @@ class AgentRun:
     log_dir: str = config.LOG_DIR
     aborted: bool = False
     abort_reason: str = ""
+    llm_call_count: int = 0
     environment_manifest: EnvironmentManifest = field(default_factory=EnvironmentManifest)
     task_memories: dict[str, TaskMemory] = field(default_factory=dict)
     artifact_store: ArtifactStore = field(default_factory=ArtifactStore)
@@ -201,15 +204,19 @@ def run(
     """
     Execute the full five-stage loop for *goal* against *df*.
 
+    At the end of every run (including aborted runs), writes a structured
+    ``runs/<run_id>.json`` summary via :func:`agent.logger.export_run_json`.
+
     Args:
         goal:               High-level analytical question.
         df:                 The pandas DataFrame to analyse.
-        log_dir:            Directory for JSONL run logs.
+        log_dir:            Directory for JSONL and JSON run logs.
         max_retries_per_step: Hard cap on CODE-GEN retries per sub-question.
 
     Returns:
         Completed :class:`AgentRun` with full history and summary populated.
     """
+    t_start = time.monotonic()
     schema_summary = _build_schema_summary(df)
     state = AgentRun(
         goal=goal,
@@ -283,6 +290,8 @@ def run(
         print("  Completed steps are in the JSONL log. Fix the data or")
         print("  increase max_retries_per_step and re-run.")
         print(f"  Log: runs/{state.run_id}.jsonl")
+        # ── Write structured run JSON even on abort ───────────────────────────
+        _finalize_run(state, t_start)
         return state
 
     # ── SUMMARY ───────────────────────────────────────────────────────────────
@@ -294,6 +303,8 @@ def run(
     print(f"{'='*60}")
     print(state.summary)
 
+    # ── Write structured run JSON ─────────────────────────────────────────────
+    _finalize_run(state, t_start)
     return state
 
 
@@ -425,11 +436,26 @@ def _run_question(
 
         error_category = sandbox_result.get("error_category", "none")
 
+        # ── OBSERVE ───────────────────────────────────────────────────────────
+        # Deterministic data-quality checks on the live DataFrame BEFORE critique.
+        # The observer computes actual null counts, duplicates, and outliers so
+        # the critique LLM sees hard facts instead of speculating.
+        print(f"  ► OBSERVE …")
+        obs_report = observe(
+            df,
+            sandbox_result,
+            artifact_store_available_keys=state.artifact_store.available_keys(),
+        )
+        print(f"    ✓ nulls={obs_report.null_counts}, dupes={obs_report.duplicate_txn_ids}, "
+              f"neg_rev={obs_report.negative_revenue_rows}, "
+              f"outliers={len(obs_report.revenue_outliers_iqr)}")
+
         # ── CRITIQUE ──────────────────────────────────────────────────────────
         print(f"  ► CRITIQUE …")
         history_summary = _build_history_summary(state)
         critique_raw, critique_parsed = _do_critique(
-            state, sub_question, code, sandbox_result, history_summary
+            state, sub_question, code, sandbox_result, history_summary,
+            observation_text=obs_report.as_critique_text(),
         )
         trust = critique_parsed.get("trust", "low")
         action = critique_parsed.get("action", "revise_code")
@@ -592,12 +618,19 @@ def _do_critique(
     code: str,
     sandbox_result: dict[str, Any],
     history_summary: str,
+    observation_text: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """
     Call CRITIQUE and return (raw_string, parsed_dict).
 
     Parses the JSON response defensively — if parsing fails, returns a
     safe default that forces a code revision rather than silently accepting.
+
+    Args:
+        observation_text: Structured data-quality report from the OBSERVE stage
+                          (ObservationReport.as_critique_text()). When provided,
+                          the critique prompt includes hard computed facts about
+                          nulls, duplicates, and outliers.
     """
     prompt = critique_prompt(
         state.goal,
@@ -605,6 +638,7 @@ def _do_critique(
         code,
         sandbox_result,
         history_summary,
+        observation_text=observation_text,
     )
     raw = call_llm(prompt, role="critique")
     parsed = _parse_critique_json(raw)
@@ -1146,3 +1180,39 @@ def _print_step_header(step_idx: int, total: int, sub_question: str) -> None:
     print(f"┌─ Step {step_idx + 1}/{total} {'─'*50}")
     print(f"│  {sub_question}")
     print(f"└{'─'*58}")
+
+
+def _finalize_run(state: AgentRun, t_start: float) -> None:
+    """
+    Write the structured run JSON summary at the end of a run.
+
+    Called from ``run()`` on both successful completion and abort.
+    Aggregates metadata (goal, model versions, LLM call count, wall clock)
+    + the full debug history into ``runs/<run_id>.json``.
+    """
+    from agent.llm_client import _default_model_for_role
+
+    wall_clock = time.monotonic() - t_start
+    debug_entries = [attempt.to_legacy_dict() for attempt in state.debug_history]
+
+    # Derive model versions from config (no live introspection needed)
+    model_versions = {
+        "plan": _default_model_for_role("plan"),
+        "codegen": _default_model_for_role("codegen"),
+        "critique": _default_model_for_role("critique"),
+        "observe": _default_model_for_role("observe"),
+    }
+
+    json_path = export_run_json(
+        run_id=state.run_id,
+        goal=state.goal,
+        dataset_label="clean" if not state.aborted else "clean (aborted)",
+        model_versions=model_versions,
+        debug_entries=debug_entries,
+        final_summary=state.summary if not state.aborted else "",
+        aborted=state.aborted,
+        wall_clock_seconds=wall_clock,
+        total_llm_calls=state.llm_call_count,
+        log_dir=state.log_dir,
+    )
+    print(f"\nRun JSON exported: {json_path}")

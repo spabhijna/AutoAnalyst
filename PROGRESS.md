@@ -14,8 +14,8 @@
 | 2 | Safe code execution sandbox | ✅ Complete |
 | 3 | Five-stage PLAN→CODEGEN→EXECUTE→CRITIQUE loop | ✅ Complete |
 | 3.5 | Architectural Redesign (ArtifactStore) | ✅ **Complete** |
-| 4 | Data quality checks in OBSERVE stage | 🔲 Next |
-| 5 | Evaluation against corruption manifest | 🔲 Planned |
+| 4 | Deterministic OBSERVE stage + main.py wiring | ✅ **Complete** |
+| 5 | Evaluation against corruption manifest | 🔲 Next |
 | 6 | Blog post run log + write-up | 🔲 Planned |
 
 ---
@@ -399,47 +399,141 @@ only answer confidence.
 
 ---
 
-## NEXT STEPS — Phase 4: Data Quality Checks in OBSERVE Stage
+## Phase 4 — Deterministic OBSERVE Stage
 
-### Problem
-Currently the loop has no OBSERVE stage — it goes CODE-GEN → EXECUTE → CRITIQUE.
-The critique has the full checklist but operates on the `result` repr (a string).
-It cannot actually *compute* null counts, duplicate rates, or outlier statistics.
-
-### Goal
-Add an OBSERVE stage between EXECUTE and CRITIQUE that:
-1. Runs deterministic data-quality checks on the **live DataFrame** (not the repr string).
-2. Feeds a structured quality report into the CRITIQUE prompt.
-3. Makes critique actionable with actual numbers ("14 null revenue rows = 2% of data")
-   instead of model speculation.
-
-### Files to create / modify
+### What Was Built
 
 | File | Change |
 |------|--------|
-| `agent/observer.py` | `observe(df, sandbox_result)` → `ObservationReport` dataclass |
-| `agent/prompts.py` | Update `critique_prompt` to accept `ObservationReport` |
-| `agent/loop.py` | Insert observer call between EXECUTE and CRITIQUE |
-| `tests/test_observer.py` | Unit tests for each check against corrupted dataset |
+| `agent/observer.py` | `ObservationReport` dataclass + `observe(df, sandbox_result)` — deterministic null/duplicate/outlier checks |
+| `agent/prompts.py` | `critique_prompt()` now accepts `observation_text` param; STEP 3 references hard observation facts |
+| `agent/loop.py` | OBSERVE stage inserted between EXECUTE and CRITIQUE; `_do_critique` forwards observation_text |
+| `main.py` | Wired to `agent.loop.run()` with CLI args (`--goal`, `--rows`, `--seed`, `--corrupt`, `--retries`) |
+| `tests/test_observer.py` | 21 tests covering all check types, edge cases, and report formatting |
 
-### ObservationReport fields (proposed)
-```python
-@dataclass
-class ObservationReport:
-    null_counts: dict[str, int]          # per-column null count
-    null_pct: dict[str, float]           # per-column null %
-    duplicate_txn_ids: int               # count of duplicate transaction_id values
-    negative_revenue_rows: int           # count of revenue < 0
-    zero_units_positive_revenue: int     # count of units_sold=0 with revenue>0
-    revenue_outliers_iqr: list[int]      # row indices flagged by IQR method
-    sample_size_after_filter: int        # rows the code operated on
-    notes: list[str]                     # free-text observations
+### Architecture
+
+```
+CODE-GEN → EXECUTE → OBSERVE → CRITIQUE
+                         │
+                         ├── Deterministic checks on live df (not result string)
+                         ├── Null counts per column, null %
+                         ├── Duplicate transaction_id detection
+                         ├── Negative revenue, zero-units/positive-revenue
+                         ├── IQR outlier detection on revenue column
+                         └── ObservationReport.as_critique_text() → injected into critique prompt
 ```
 
+### Key Design Decisions
+
+#### 26. Observer is deterministic, not LLM-driven
+**Why:** The critique STEP 3 previously asked the LLM to speculate about nulls,
+duplicates, and outliers based on the `result` repr string. The observer computes
+actual counts from the live DataFrame and injects them as hard facts. The critic
+now sees: "3 null revenue rows (2.1% of data)" instead of guessing.
+
+#### 27. Observer operates on the input DataFrame, not the sandbox output
+**Why:** The sandboxed code may have filtered or aggregated data, but the observer
+inspects the *original* `df` to catch quality issues the code silently propagated
+(e.g., summing revenue without dropping nulls or deduplicating transaction IDs).
+
+#### 28. ObservationReport is token-efficient
+**Why:** `as_critique_text()` skips sections with zero findings. Clean data produces
+a minimal 4-line block. Corrupted data surfaces only the relevant signals.
+
+#### 29. main.py wired for real use
+**Why:** The old `main.py` printed stale Phase 1 placeholder text. Now it accepts
+`--goal`, `--rows`, `--seed`, `--corrupt`, and `--retries` CLI args and runs
+the full agent pipeline against either clean or corrupted synthetic data.
+
+#### 30. Typed artifacts — self-describing type/schema metadata (superseded by #31)
+
+#### 31. Artifacts as first-class objects — unified value + metadata
+**Why:** Previously the store maintained `_store: dict[str, pd.DataFrame]` and
+`_meta: dict[str, ArtifactMeta]` separately — two dicts that could drift. Now
+`Artifact` is a single dataclass bundling `name`, `type`, `schema`, `producer`,
+and `value` in one place. Registration is atomic (no partial mismatch possible).
+Every result produced by the system (`quarter_df`, `region_revenue`, `top_region`,
+`monthly_trend`, `category_revenue`, `top_category`) is a first-class Artifact
+with self-describing metadata.
+
+**Key changes:**
+- `Artifact` dataclass replaces `ArtifactMeta` — value + metadata in one object
+- `ArtifactStore._artifacts: dict[str, Artifact]` replaces separate `_store`/`_meta`
+- `register()` creates the `Artifact` atomically — no two-dict update
+- `get_artifact(key)` returns the full `Artifact` object for introspection
+- `classify_artifact()` is now a public function (tested directly)
+- `rows` and `column_summary()` are derived properties on `Artifact`, not stored redundantly
+
+**Zero changes to:** `loop.py`, `sandbox.py`, `prompts.py` — the `register()`,
+`get()`, `as_namespace()`, `available_keys()`, and `describe()` APIs are identical.
+All existing integration points work unchanged.
+
+### Test Results
+
+```
+tests/test_observer.py       — 21 passed  ✅
+tests/test_artifact_store.py — 47 passed  ✅  (44 → 47, +3 classify_artifact / new get_artifact tests)
+tests/test_llm_client.py     — 15 passed  ✅
+tests/test_loop.py           — 47 passed  ✅
+tests/test_sandbox.py        — 25 passed  ✅
+Total: 156 passed, 0 failed
+```
+
+---
+
+#### 32. Structured run JSON + human-readable log viewer
+**Why:** The JSONL streaming log captures every iteration, but for blog post
+inspection, a consolidated run JSON with metadata (goal, dataset label, model
+versions, wall-clock, LLM call count) + full history is more useful.
+`export_run_json()` writes `runs/<run_id>.json` at the end of every run.
+`agent/log_viewer.py` reads these files and prints a clean step-by-step trace
+with code, results, critique verdicts, and final summary.
+
+**Key changes:**
+- `agent/logger.py` — `export_run_json()` writes structured metadata + history
+- `agent/log_viewer.py` — `print_run_trace()` for human-readable format
+- `agent/loop.py` — `AgentRun.llm_call_count` field, `_finalize_run()` called on
+  both abort and success paths, wall-clock timing
+- Example run JSON at `runs/run_526df214.json` (3-step synthetic run)
+
+### Test Results
+
+```
+tests/test_observer.py       — 21 passed  ✅
+tests/test_artifact_store.py — 47 passed  ✅
+tests/test_llm_client.py     — 15 passed  ✅
+tests/test_loop.py           — 47 passed  ✅
+tests/test_sandbox.py        — 25 passed  ✅
+Total: 156 passed, 0 failed
+
+---
+
+## NEXT STEPS — Phase 5: Evaluation Against Corruption Manifest
+
+### Problem
+The observer detects data-quality issues, but there is no automated scoring
+of how many defects the pipeline correctly identified vs. missed.
+
+### Goal
+Run the agent against a corruption-injected dataset, compare detection results
+against the ground-truth manifest from `inject_corruption()`, and score:
+- Precision: what fraction of flagged issues were real defects?
+- Recall: what fraction of injected defects were detected?
+- Pipeline resilience: did corruption cause aborts or incorrect answers?
+
+### Files to create / modify (proposed)
+
+| File | Change |
+|------|--------|
+| `agent/evaluator.py` | `evaluate(run_state, manifest)` → `EvalReport` with precision/recall |
+| `agent/prompts.py` | No changes expected — evaluation is post-hoc |
+| `agent/loop.py` | No changes expected — evaluation reads the run log |
+| `tests/test_evaluator.py` | Unit tests against known manifest |
+
 ### Verification target
-Run `python run_demo.py` with a **real GROQ_API_KEY** in `.env` and capture a
-full `runs/<run_id>.jsonl` with at least 3 accepted steps. Paste a sample log
-into PROGRESS.md under "Phase 4 Demo Output" before moving to Phase 5.
+Run `python main.py --corrupt` and verify the evaluator can match observer-detected
+defects against the manifest. Score precision and recall across multiple seeds.
 
 ---
 

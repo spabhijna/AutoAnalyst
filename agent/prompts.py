@@ -300,6 +300,7 @@ def critique_prompt(
     code: str,
     sandbox_result: dict,
     history_summary: str,
+    observation_text: str = "",
 ) -> str:
     """
     Build the CRITIQUE prompt.
@@ -312,14 +313,20 @@ def critique_prompt(
     detect genuine contradictions (same scope, different answer), NOT to
     penalise correct code that uses a different filter or time window.
 
+    When *observation_text* is provided (as of the OBSERVE stage), STEP 3
+    uses computed data-quality facts instead of LLM speculation.
+
     Args:
-        goal:           Original analytical goal, including global scope.
-        sub_question:    The question the code was trying to answer.
-        code:            The Python code that was executed.
-        sandbox_result:  The full sandbox output dict
-                         (success, result, stdout, error, error_type).
-        history_summary: One-line summaries of previously accepted findings,
-                         so the critique can detect genuine contradictions.
+        goal:             Original analytical goal, including global scope.
+        sub_question:      The question the code was trying to answer.
+        code:              The Python code that was executed.
+        sandbox_result:    The full sandbox output dict
+                           (success, result, stdout, error, error_type).
+        history_summary:   One-line summaries of previously accepted findings,
+                           so the critique can detect genuine contradictions.
+        observation_text:  Structured data-quality report from the OBSERVE
+                           stage (:meth:`ObservationReport.as_critique_text`).
+                           Deterministic null / duplicate / outlier counts.
 
     Returns:
         Complete prompt string.
@@ -330,6 +337,15 @@ def critique_prompt(
     exec_error = sandbox_result.get("error") or ""
 
     error_block = f"\nEXECUTION ERROR:\n{exec_error}" if exec_error else ""
+
+    obs_block = ""
+    if observation_text:
+        obs_block = f"""
+DATA-QUALITY OBSERVATION (computed deterministically from the input DataFrame —
+these are hard facts, not estimates):
+
+{observation_text}
+"""
 
     return f"""You are an independent data quality auditor reviewing an AI agent's work.
 You did NOT write this code. Your PRIMARY job is to verify the CODE LOGIC — not to
@@ -394,16 +410,19 @@ STEP 2B — GOAL SCOPE AND DEPENDENCY CONSISTENCY:
   region is {{"West": 46384.76, "South": 45317.93}}, then a later "top region"
   answer of "South" is a genuine contradiction and MUST revise_code.
 
-STEP 3 — DATA QUALITY CHECKS (verify using the code, not guesswork):
+STEP 3 — DATA QUALITY CHECKS:
+  If a "DATA-QUALITY OBSERVATION" block is present above, those null/duplicate/outlier
+  counts are hard computed facts — use them as ground truth for this step.
   a. NULL HANDLING: Does the code silently drop nulls without filling them?
      Check whether .dropna() is called on a column with significant nulls
-     before summing or averaging.
+     (see OBSERVATION for actual null counts) before summing or averaging.
   b. DUPLICATE ROWS: Does the code aggregate without first calling
      .drop_duplicates() on transaction_id? This inflates sums/counts.
+     (See OBSERVATION for actual duplicate count.)
   c. SAMPLE SIZE: Does a filter in the code reduce rows to a suspiciously
      small subset? Check date/category filter conditions explicitly.
   d. OUTLIER DOMINANCE: Would a single extreme value dominate a sum/mean
-     given the filter the code applies?
+     given the filter the code applies? (See OBSERVATION for IQR outliers.)
 
 STEP 4 — CONTRADICTION CHECK (read the prior code snippets before deciding):
   The "Previously Accepted Findings" above include the code each prior step

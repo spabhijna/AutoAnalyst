@@ -1,11 +1,15 @@
 """
-Structured JSONL run-log writer.
+Structured JSONL run-log writer + run-level JSON export.
 
-Every history entry produced by the loop is appended here as one JSON line.
+Every history entry produced by the loop is appended as one JSON line.
+At the end of each run, a consolidated run JSON is written with metadata
+(goal, dataset info, model versions, wall clock, total LLM calls).
+
+Files:
+- ``runs/<run_id>.jsonl`` — streaming JSONL (one LogEntry per line)
+- ``runs/<run_id>.json``  — structured run summary (written at run end)
+
 The log is the primary deliverable — it's what the blog post will be built from.
-
-File: runs/<run_id>.jsonl
-Each line: one JSON object (a LogEntry as a dict).
 """
 
 from __future__ import annotations
@@ -64,7 +68,7 @@ class LogEntry:
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Public API — JSONL (streaming, one entry at a time)
 # ---------------------------------------------------------------------------
 
 
@@ -144,3 +148,69 @@ def read_run_log(run_id: str, log_dir: str = "runs") -> list[LogEntry]:
                 logger.warning("Skipping malformed log line %d: %s", lineno, exc)
 
     return entries
+
+
+# ---------------------------------------------------------------------------
+# Public API — run-level structured JSON export
+# ---------------------------------------------------------------------------
+
+
+def export_run_json(
+    run_id: str,
+    goal: str,
+    dataset_label: str,
+    model_versions: dict[str, str],
+    debug_entries: list[dict[str, Any]],
+    final_summary: str,
+    aborted: bool,
+    wall_clock_seconds: float,
+    total_llm_calls: int,
+    log_dir: str = "runs",
+) -> Path:
+    """
+    Write a structured run summary JSON file at the end of a run.
+
+    Produces ``<log_dir>/<run_id>.json`` with metadata at the top and
+    the full debug history as an array.  This is the file the log viewer
+    and blog post scripts consume.
+
+    Args:
+        run_id:            Unique run identifier.
+        goal:              Original analytical goal text.
+        dataset_label:     Description of the dataset (e.g. "clean", "corrupted").
+        model_versions:    Dict mapping stage → model name used.
+        debug_entries:     List of serialized AttemptRecord dicts (all iterations).
+        final_summary:     The LLM-generated summary text.
+        aborted:           Whether the run aborted before completing all steps.
+        wall_clock_seconds: Elapsed wall-clock time for the full run.
+        total_llm_calls:   Total number of call_llm invocations during the run.
+        log_dir:           Directory for run logs.
+
+    Returns:
+        Path to the written JSON file.
+    """
+    path = Path(log_dir)
+    path.mkdir(parents=True, exist_ok=True)
+
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "metadata": {
+            "goal": goal,
+            "dataset": dataset_label,
+            "model_versions": model_versions,
+            "total_iterations": len(debug_entries),
+            "total_llm_calls": total_llm_calls,
+            "wall_clock_seconds": round(wall_clock_seconds, 2),
+            "aborted": aborted,
+            "final_summary": final_summary,
+        },
+        "history": debug_entries,
+    }
+
+    json_path = path / f"{run_id}.json"
+    with json_path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, default=str)
+
+    logger.info("Run JSON exported: %s (%d entries)", json_path, len(debug_entries))
+    return json_path
