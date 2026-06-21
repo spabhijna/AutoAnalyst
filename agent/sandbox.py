@@ -50,6 +50,7 @@ Public API
 from __future__ import annotations
 
 import io
+import logging
 import multiprocessing
 import pickle
 import sys
@@ -59,11 +60,17 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 _RESULT_TRUNCATE_CHARS: int = 2000
+
+# Hard limit for DataFrame artifact extraction via sandbox IPC.
+# DataFrames larger than this are not extracted (too costly to pickle/transfer).
+_ARTIFACT_SIZE_LIMIT_BYTES: int = 50 * 1024 * 1024  # 50 MB
 
 # Builtins whitelist — injected as __builtins__ inside exec() only.
 # The worker itself uses the normal builtins; restriction applies only to
@@ -113,6 +120,8 @@ def _worker(
     code: str,
     df_pickle: bytes,
     result_queue: "multiprocessing.Queue[dict[str, Any]]",
+    artifacts_pickle: bytes | None = None,
+    extract_artifact: str | None = None,
 ) -> None:
     """
     Execute *code* in a restricted namespace and push the result dict onto
@@ -122,9 +131,16 @@ def _worker(
     raise — all exceptions are caught and serialized into the result dict.
 
     Args:
-        code:         Python source code string to execute.
-        df_pickle:    Pickled DataFrame bytes.
-        result_queue: Queue to push the result dict onto.
+        code:             Python source code string to execute.
+        df_pickle:        Pickled DataFrame bytes.
+        result_queue:     Queue to push the result dict onto.
+        artifacts_pickle: Pickled dict[str, pd.DataFrame] of pre-computed
+                          artifacts from the ArtifactStore. Injected into
+                          the sandbox namespace as ``artifacts``.
+        extract_artifact: If set, the variable with this name is extracted
+                          from the sandbox local namespace after execution
+                          and included in the result dict as ``"artifact"``.
+                          Must be a pd.DataFrame ≤ _ARTIFACT_SIZE_LIMIT_BYTES.
     """
     # Reconstruct DataFrame — normal unpickling, uses standard builtins
     try:
@@ -137,8 +153,18 @@ def _worker(
             "error": f"DataFrame deserialization failed: {exc}",
             "error_type": type(exc).__name__,
             "error_category": "execution_error",
+            "artifact": None,
+            "artifact_key": extract_artifact,
         })
         return
+
+    # Reconstruct artifacts dict — empty dict if not provided
+    artifacts: dict[str, Any] = {}
+    if artifacts_pickle:
+        try:
+            artifacts = pickle.loads(artifacts_pickle)  # noqa: S301
+        except Exception:  # noqa: BLE001
+            artifacts = {}
 
     # Build restricted namespace for exec() — pd and np come from worker imports
     global_ns: dict[str, Any] = {
@@ -146,6 +172,7 @@ def _worker(
         "df": df,
         "pd": pd,
         "np": np,
+        "artifacts": artifacts,   # pre-validated DataFrames from ArtifactStore
     }
     local_ns: dict[str, Any] = {}
 
@@ -158,6 +185,24 @@ def _worker(
         exec(code, global_ns, local_ns)  # noqa: S102
         raw_result = local_ns.get("result", global_ns.get("result", None))
         result_repr = _safe_repr(raw_result)
+
+        # ── Artifact extraction ───────────────────────────────────────────────
+        # If requested, extract the named DataFrame variable from the sandbox
+        # namespace and include it in the result dict for ArtifactStore registration.
+        extracted_artifact: pd.DataFrame | None = None
+        if extract_artifact:
+            # Use explicit None check — `or` would trigger pd.DataFrame.__bool__
+            # which raises "ValueError: The truth value of a DataFrame is ambiguous".
+            candidate = local_ns.get(extract_artifact)
+            if candidate is None:
+                candidate = global_ns.get(extract_artifact)
+            if isinstance(candidate, pd.DataFrame) and not candidate.empty:
+                try:
+                    if len(pickle.dumps(candidate, protocol=4)) <= _ARTIFACT_SIZE_LIMIT_BYTES:
+                        extracted_artifact = candidate
+                except Exception:  # noqa: BLE001
+                    pass  # silently skip oversized or un-picklable artifacts
+
         result_queue.put({
             "success": True,
             "result": result_repr,
@@ -165,6 +210,8 @@ def _worker(
             "error": None,
             "error_type": None,
             "error_category": "none",
+            "artifact": extracted_artifact,
+            "artifact_key": extract_artifact,
         })
     except Exception as exc:  # noqa: BLE001
         tb = traceback.format_exc()
@@ -185,6 +232,8 @@ def _worker(
             "error": tb,
             "error_type": exc_type,
             "error_category": "capability_error" if is_capability_error else "execution_error",
+            "artifact": None,
+            "artifact_key": extract_artifact,
         })
     finally:
         sys.stdout = old_stdout
@@ -220,6 +269,8 @@ def _safe_repr(value: Any) -> str | None:
 def run_sandboxed(
     code: str,
     df: pd.DataFrame,
+    artifacts: dict[str, pd.DataFrame] | None = None,
+    extract_artifact: str | None = None,
     timeout_seconds: int = 5,
 ) -> dict[str, Any]:
     """
@@ -236,32 +287,43 @@ def run_sandboxed(
     even on success. See module docstring § 3 for rationale.
 
     **Available in the sandbox namespace:**
-    - ``df``  — the pandas DataFrame passed as argument
-    - ``pd``  — pandas module
-    - ``np``  — numpy module
+    - ``df``        — the pandas DataFrame passed as argument
+    - ``pd``        — pandas module
+    - ``np``        — numpy module
+    - ``artifacts`` — dict[str, pd.DataFrame] from ArtifactStore (may be empty)
     - ``__builtins__`` — restricted whitelist (no open, no import, no os/sys)
 
+    **Artifact extraction:**
+    If *extract_artifact* is set (e.g. ``"quarter_df"``), the sandbox extracts
+    the variable with that name from the executed code's local namespace and
+    returns it as ``out["artifact"]`` (a raw pd.DataFrame). The caller
+    (``_run_question`` in loop.py) registers it in the ArtifactStore.
+    Only non-empty DataFrames under _ARTIFACT_SIZE_LIMIT_BYTES are extracted.
+
     Args:
-        code:            Python source code string to execute.
-        df:              The DataFrame to make available as ``df`` inside the code.
-        timeout_seconds: Hard wall-clock limit. The child process is killed if
-                         execution exceeds this value. Defaults to 5 s.
+        code:             Python source code string to execute.
+        df:               The DataFrame to make available as ``df`` inside the code.
+        artifacts:        Pre-computed DataFrames from ArtifactStore to inject as
+                          the ``artifacts`` global dict. Defaults to empty dict.
+        extract_artifact: Variable name to extract from the sandbox namespace
+                          after execution and return as a raw DataFrame.
+        timeout_seconds:  Hard wall-clock limit. Defaults to 5 s.
 
     Returns:
-        A dict with the following keys:
-
-        .. code-block:: python
+        A dict with the following keys::
 
             {
-                "success":    bool,        # True if no exception was raised
-                "result":     str | None,  # repr of ``result`` variable (truncated)
-                "stdout":     str,         # everything printed to stdout
-                "error":      str | None,  # full traceback if success=False
-                "error_type": str | None,  # exception class name if success=False
+                "success":      bool,
+                "result":       str | None,   # repr of ``result`` variable
+                "stdout":       str,
+                "error":        str | None,
+                "error_type":   str | None,
+                "artifact":     pd.DataFrame | None,  # only if extract_artifact set
+                "artifact_key": str | None,           # same as extract_artifact
             }
 
     Notes:
-        - Exceptions raised inside the sandboxed code NEVER propagate to the caller.
+        - Exceptions inside sandboxed code NEVER propagate to the caller.
         - ``success=False`` is returned for: exceptions, import errors, timeouts.
         - On timeout, ``error_type`` is ``"TimeoutError"``.
     """
@@ -276,7 +338,19 @@ def run_sandboxed(
             "error": f"Failed to serialize DataFrame for sandbox: {exc}",
             "error_type": type(exc).__name__,
             "error_category": "execution_error",
+            "artifact": None,
+            "artifact_key": extract_artifact,
         }
+
+    # Pickle the artifacts dict for inter-process transfer
+    artifacts_pickle: bytes | None = None
+    if artifacts:
+        try:
+            artifacts_pickle = pickle.dumps(artifacts, protocol=4)
+        except Exception as exc:  # noqa: BLE001
+            # Non-fatal: proceed without artifacts in the sandbox
+            logger.warning("Failed to serialize artifacts for sandbox: %s", exc)
+            artifacts_pickle = None
 
     # Use 'spawn' context for clean isolation (no inherited file descriptors)
     ctx = multiprocessing.get_context("spawn")
@@ -284,7 +358,7 @@ def run_sandboxed(
 
     process = ctx.Process(
         target=_worker,
-        args=(code, df_pickle, result_queue),
+        args=(code, df_pickle, result_queue, artifacts_pickle, extract_artifact),
         daemon=True,
     )
     process.start()
@@ -304,6 +378,8 @@ def run_sandboxed(
             ),
             "error_type": "TimeoutError",
             "error_category": "execution_error",
+            "artifact": None,
+            "artifact_key": extract_artifact,
         }
 
     # Retrieve result from the queue
@@ -321,4 +397,6 @@ def run_sandboxed(
             ),
             "error_type": "ProcessError",
             "error_category": "execution_error",
+            "artifact": None,
+            "artifact_key": extract_artifact,
         }

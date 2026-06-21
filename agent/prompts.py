@@ -25,7 +25,13 @@ def plan_prompt(goal: str, schema_summary: str) -> str:
     Build the PLAN prompt.
 
     Instructs the model to decompose the analytical goal into 3-6 ordered
-    sub-questions that can each be answered with a short pandas snippet.
+    tasks expressed as a dependency-aware workflow, not just a flat list of
+    questions. Each task declares which DataFrame artifact it produces (if any)
+    and which artifacts from prior tasks it consumes.
+
+    This structured plan is the foundation for artifact reuse: the first task
+    that filters/aggregates the DataFrame registers its result in the
+    ArtifactStore; all later tasks read from it rather than re-deriving.
 
     Args:
         goal:           High-level analytical question from the user.
@@ -34,20 +40,36 @@ def plan_prompt(goal: str, schema_summary: str) -> str:
     Returns:
         Complete prompt string ready for :func:`agent.llm_client.call_llm`.
     """
-    return f"""You are a senior data analyst planning an investigation.
+    return f"""You are a senior data analyst designing a data investigation workflow.
 
 DATASET SCHEMA:
 {schema_summary}
 
 GOAL: {goal}
 
-Decompose this goal into 3-6 specific, ordered sub-questions. Each sub-question:
-- Must be answerable with a single pandas code snippet operating on the dataset above.
-- Should build logically on the previous one (funnel from broad to specific).
-- Should be concrete enough that the answer is a number, table, or ranked list.
+Decompose this goal into 3-6 ordered tasks. Design for MAXIMUM REUSE:
+- The FIRST task should filter/prepare the main DataFrame for the goal scope
+  (e.g. apply the last-quarter window) and produce it as a named artifact.
+- Every subsequent task that needs that same scope MUST consume the artifact
+  rather than re-filtering df from scratch.
+- Tasks should build logically (broad → specific), each consuming artifacts
+  from prior steps instead of repeating work.
 
-Return ONLY a JSON array of strings. No explanation, no markdown fences.
-Example format: ["What is X?", "Which region has Y?", "How does Z compare?"]
+Each task object must have these fields:
+  "question":          A specific, concrete question answerable with one pandas snippet.
+  "produces_artifact": A snake_case DataFrame variable name this task will create and
+                       register (e.g. "quarter_df", "region_revenue"). Use null if the
+                       task returns only a scalar, string, or ranked list — not a DataFrame.
+  "consumes_artifacts": A JSON array of artifact names from PRIOR tasks this task will
+                        use (e.g. ["quarter_df"]). Empty array [] if none.
+
+Return ONLY a JSON array of task objects. No explanation, no markdown fences.
+Example:
+[
+  {{"question": "Filter df to the last quarter and return the filtered DataFrame", "produces_artifact": "quarter_df", "consumes_artifacts": []}},
+  {{"question": "What is the total revenue by region in the last quarter?", "produces_artifact": "region_revenue", "consumes_artifacts": ["quarter_df"]}},
+  {{"question": "Which region has the highest total revenue?", "produces_artifact": null, "consumes_artifacts": ["region_revenue"]}}
+]
 
 JSON array:"""
 
@@ -107,17 +129,34 @@ def codegen_prompt(
     completed_findings: str = "",
     environment_manifest: str = "",
     task_constraints: str = "",
+    available_artifacts: str = "",
 ) -> str:
     """
     Build the CODE-GEN prompt.
+
+    Args:
+        goal:               The original analytical goal.
+        sub_question:       The specific sub-question to answer.
+        schema_summary:     Dataset schema with pre-computed date constants.
+        completed_findings: High-confidence validated findings from prior steps.
+        environment_manifest: Sandbox capabilities and constraints.
+        task_constraints:   Accumulated per-task constraints from failed retries.
+        available_artifacts: Human-readable description of pre-validated DataFrames
+                             available in the ``artifacts`` sandbox global. Generated
+                             by :meth:`ArtifactStore.describe`.
     """
+    artifacts_section = (
+        f"\n{available_artifacts}\n"
+        if available_artifacts and available_artifacts != "(no pre-computed artifacts available yet)"
+        else ""
+    )
     return f"""You are a senior data analyst writing Python/pandas code.
 
 DATASET SCHEMA:
 {schema_summary}
 
 {environment_manifest}
-
+{artifacts_section}
 ORIGINAL ANALYTICAL GOAL:
 {goal}
 
@@ -140,6 +179,23 @@ STRICT RULES — violating any of these will cause execution to fail:
    unless the sub-question explicitly says otherwise.
 5. If this sub-question depends on a previously accepted finding (for example
    "top-performing region"), derive it consistently from that accepted scope.
+6. DATE FILTER — CRITICAL: If the DATASET SCHEMA above contains a
+   PRE-COMPUTED DATE WINDOW section with LAST_QUARTER_START and LAST_QUARTER_END,
+   you MUST use those exact pd.Timestamp values verbatim. Do NOT re-derive the
+   boundaries using pd.DateOffset, datetime.date, or any other arithmetic.
+   Copy the constants exactly as shown and apply this filter:
+     mask = (pd.to_datetime(df['date']) >= LAST_QUARTER_START) & \\
+            (pd.to_datetime(df['date']) <= LAST_QUARTER_END)
+     quarter_df = df[mask]
+   Deviating from these pre-computed values is a logic error.
+7. ARTIFACT REUSE — CRITICAL: If the AVAILABLE ARTIFACTS section above lists
+   a DataFrame that already covers the required scope, read from it instead of
+   re-filtering df. Use the safe None-check pattern:
+     quarter_df = artifacts.get("quarter_df")          # try artifact first
+     if quarter_df is None:                             # explicit None check (not `or`)
+         quarter_df = df[mask]                         # fallback: re-filter df
+   Do NOT write `artifacts.get("key") or df[...]` — that raises ValueError
+   when the artifact is a DataFrame (ambiguous boolean context).
 
 Return ONLY the Python code. No explanation, no markdown fences, no comments beyond inline ones.
 
@@ -155,17 +211,35 @@ def repair_prompt(
     task_constraints: str,
     previous_code: str,
     error_reason: str,
+    available_artifacts: str = "",
 ) -> str:
     """
     Build the REPAIR prompt for localized fixes on a failed attempt.
+
+    Args:
+        goal:               The original analytical goal.
+        sub_question:       The specific sub-question to answer.
+        schema_summary:     Dataset schema with pre-computed date constants.
+        completed_findings: High-confidence validated findings from prior steps.
+        environment_manifest: Sandbox capabilities and constraints.
+        task_constraints:   Accumulated per-task constraints.
+        previous_code:      The code from the last failed attempt.
+        error_reason:       The critique reason explaining what went wrong.
+        available_artifacts: Human-readable description of available pre-validated
+                             DataFrames (from ArtifactStore.describe()).
     """
+    artifacts_section = (
+        f"\n{available_artifacts}\n"
+        if available_artifacts and available_artifacts != "(no pre-computed artifacts available yet)"
+        else ""
+    )
     return f"""You are a senior data analyst repairing a failing Python/pandas script.
 
 DATASET SCHEMA:
 {schema_summary}
 
 {environment_manifest}
-
+{artifacts_section}
 ORIGINAL ANALYTICAL GOAL:
 {goal}
 
@@ -193,7 +267,24 @@ while keeping the working parts of the previous code intact.
 STRICT RULES:
 1. Handle nulls explicitly — do not assume clean data.
 2. Preserve the ORIGINAL ANALYTICAL GOAL scope.
-3. Return ONLY the complete, repaired Python code. No explanation, no markdown fences.
+3. DATE FILTER — CRITICAL: If the DATASET SCHEMA above contains a
+   PRE-COMPUTED DATE WINDOW section with LAST_QUARTER_START and LAST_QUARTER_END,
+   you MUST use those exact pd.Timestamp values verbatim. Do NOT re-derive the
+   boundaries using pd.DateOffset, datetime.date, or any other arithmetic.
+   Copy the constants exactly as shown:
+     LAST_QUARTER_START = pd.Timestamp('<value from schema>')
+     LAST_QUARTER_END   = pd.Timestamp('<value from schema>')
+     mask = (pd.to_datetime(df['date']) >= LAST_QUARTER_START) & \\
+            (pd.to_datetime(df['date']) <= LAST_QUARTER_END)
+     quarter_df = df[mask]
+4. ARTIFACT REUSE — CRITICAL: If the AVAILABLE ARTIFACTS section above lists
+   a DataFrame covering the required scope, use the safe None-check pattern:
+     quarter_df = artifacts.get("quarter_df")          # try artifact first
+     if quarter_df is None:                             # explicit None check (not `or`)
+         quarter_df = df[mask]                         # fallback: re-filter df
+   Do NOT write `artifacts.get("key") or df[...]` — that raises ValueError
+   when the artifact is a DataFrame (ambiguous boolean context).
+5. Return ONLY the complete, repaired Python code. No explanation, no markdown fences.
 
 Python code:"""
 
@@ -290,6 +381,14 @@ STEP 2B — GOAL SCOPE AND DEPENDENCY CONSISTENCY:
   top region, trend, category, or averages over the full dataset, action MUST
   be "revise_code" unless the sub-question explicitly asks for all-time data.
 
+  IMPORTANT — PRE-COMPUTED DATE CONSTANTS: The DATASET SCHEMA (provided to the
+  codegen model) includes pre-computed LAST_QUARTER_START and LAST_QUARTER_END
+  pd.Timestamp constants. If the code defines and uses these exact constants
+  to filter df['date'], the date window IS correct by construction — do NOT
+  flag it as an off-by-one or extra-month error. Only flag the date filter
+  if the code ignores the schema constants and derives its own date arithmetic
+  that produces a provably different window.
+
   If a previous accepted finding directly establishes a parent value, this
   result must be consistent with it. Example: if accepted total revenue by
   region is {{"West": 46384.76, "South": 45317.93}}, then a later "top region"
@@ -358,10 +457,15 @@ def summary_prompt(goal: str, history_entries: list[dict]) -> str:
     reporter, not an auditor: it must not infer new trust levels, reinterpret
     retry counts, or add speculative caveats.
 
+    Every factual claim in the summary must be traceable to a specific finding
+    via its ``artifact_key``. Recommendations are permitted only when a finding
+    explicitly provides causal evidence — they must not be synthesised from
+    generic patterns.
+
     Args:
         goal:            The original analytical goal.
         history_entries: One final entry per sub-question, in plan order.
-                         Fields used: question, answer, trust.
+                         Fields used: question, answer, trust, artifact_key.
 
     Returns:
         Complete prompt string.
@@ -374,6 +478,7 @@ def summary_prompt(goal: str, history_entries: list[dict]) -> str:
             "question": entry.get("question", ""),
             "answer": entry.get("answer", "(no result)"),
             "trust": entry.get("trust", "unknown"),
+            "artifact_key": entry.get("artifact_key", ""),
         })
     findings_json = json.dumps(findings_payload, indent=2)
 
@@ -386,7 +491,7 @@ FINAL RESULTS JSON:
 {findings_json}
 
 STRICT REPORTING RULES:
-1. Use only the question, answer, and trust fields in FINAL RESULTS JSON.
+1. Use only the question, answer, trust, and artifact_key fields in FINAL RESULTS JSON.
 2. Do not infer new trust levels.
 3. Do not reinterpret retries or failed attempts; they are not provided.
 4. Do not add caveats unless trust is exactly "low" or the answer explicitly
@@ -394,13 +499,21 @@ STRICT REPORTING RULES:
 5. Treat np.float64-style reprs as normal numeric answers; round for readability.
 6. If two final results appear inconsistent, state the inconsistency plainly
    without inventing a resolution.
+7. GROUNDING REQUIREMENT: Every factual claim must be derivable from exactly one
+   finding in the FINAL RESULTS JSON. Do not synthesise claims that combine multiple
+   findings into a single assertion that none of them individually supports.
+8. RECOMMENDATION GROUNDING: Include an actionable recommendation only if a specific
+   finding's answer explicitly supports it. If no finding provides causal evidence for
+   a recommendation, omit the recommendation section entirely. Do not fabricate
+   generic business advice.
 
 Write a concise analytical summary (150-300 words) that:
 1. Directly answers the original goal using the findings above.
 2. Quantifies claims where possible (use the actual numbers from results).
 3. Explicitly flags findings whose trust field is exactly "low".
 4. Notes any gaps — sub-questions with no result.
-5. Ends with one actionable recommendation.
+5. If and only if the data explicitly supports a causal conclusion, ends with one
+   actionable recommendation grounded in a specific finding.
 
 Do not hedge everything — be direct. If the data clearly shows X, say "The data shows X."
 

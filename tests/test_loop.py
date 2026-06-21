@@ -24,6 +24,7 @@ from agent.loop import (
     _final_results,
     _parse_critique_json,
     _parse_json_list,
+    _parse_plan_json,
     _strip_markdown_fences,
     run,
 )
@@ -388,7 +389,12 @@ class TestSummaryWorkingMemory:
         state = self._make_state([q], history)
 
         assert _final_results(state) == [
-            {"question": q, "answer": "100", "trust": "high"}
+            {
+                "question": q,
+                "answer": "100",
+                "trust": "high",
+                "artifact_key": "step_1_what_is_total_revenue",
+            }
         ]
 
     def test_summary_payload_comes_from_working_memory_only(self) -> None:
@@ -421,9 +427,85 @@ class TestSummaryWorkingMemory:
         state = self._make_state([q], history)
 
         prompt_payload = _final_results(state)
-        assert prompt_payload == [{"question": q, "answer": "450", "trust": "high"}]
+        assert prompt_payload == [{
+            "question": q,
+            "answer": "450",
+            "trust": "high",
+            "artifact_key": "step_1_what_is_total_revenue",
+        }]
         assert all("NameError" not in str(row) for row in prompt_payload)
         assert all("broken" not in str(row) for row in prompt_payload)
+
+
+# ---------------------------------------------------------------------------
+# _parse_plan_json — structured plan parser
+# ---------------------------------------------------------------------------
+
+class TestParsePlanJson:
+    def test_parses_structured_format(self) -> None:
+        """Structured task-spec JSON is correctly parsed."""
+        raw = '''[
+          {"question": "Filter to last quarter", "produces_artifact": "quarter_df", "consumes_artifacts": []},
+          {"question": "Revenue by region", "produces_artifact": "region_revenue", "consumes_artifacts": ["quarter_df"]},
+          {"question": "Top region?", "produces_artifact": null, "consumes_artifacts": ["region_revenue"]}
+        ]'''
+        specs = _parse_plan_json(raw)
+        assert len(specs) == 3
+        assert specs[0]["question"] == "Filter to last quarter"
+        assert specs[0]["produces_artifact"] == "quarter_df"
+        assert specs[0]["consumes_artifacts"] == []
+        assert specs[1]["consumes_artifacts"] == ["quarter_df"]
+        assert specs[2]["produces_artifact"] is None
+
+    def test_parses_legacy_flat_format(self) -> None:
+        """Legacy flat string arrays are backward-compatible."""
+        raw = '["Q1?", "Q2?", "Q3?"]'
+        specs = _parse_plan_json(raw)
+        assert len(specs) == 3
+        assert specs[0]["question"] == "Q1?"
+        assert specs[0]["produces_artifact"] is None
+        assert specs[0]["consumes_artifacts"] == []
+
+    def test_flat_format_works_in_run_loop(self, small_df: pd.DataFrame) -> None:
+        """End-to-end: flat plan responses work identically to before."""
+        with patch(CALL_LLM, side_effect=[
+            '["Q1?", "Q2?"]',
+            "result = 1", _accept_critique(),
+            "result = 2", _accept_critique(),
+            "Summary.",
+        ]), patch(RUN_SANDBOXED, return_value=_ok_sandbox()), patch(WRITE_LOG):
+            state = run("test goal", small_df, log_dir="/tmp/test_runs")
+        assert len(state.history) == 2
+
+    def test_structured_format_populates_task_node(self, small_df: pd.DataFrame) -> None:
+        """Structured plan correctly sets TaskNode.produces_artifact and consumes_artifacts."""
+        structured_plan = (
+            '[{"question": "Filter df to last quarter", "produces_artifact": "quarter_df", "consumes_artifacts": []},'  # noqa: E501
+            ' {"question": "Revenue by region", "produces_artifact": null, "consumes_artifacts": ["quarter_df"]}]'
+        )
+        with patch(CALL_LLM, side_effect=[
+            structured_plan,
+            "quarter_df = df.copy()\nresult = quarter_df", _accept_critique(),
+            "result = 42", _accept_critique(),
+            "Summary.",
+        ]), patch(RUN_SANDBOXED, return_value=_ok_sandbox()), patch(WRITE_LOG):
+            state = run("test goal", small_df, log_dir="/tmp/test_runs")
+        assert state.tasks[0].produces_artifact == "quarter_df"
+        assert state.tasks[1].consumes_artifacts == ["quarter_df"]
+        assert state.tasks[1].produces_artifact is None
+
+    def test_null_produces_artifact_becomes_none(self) -> None:
+        """JSON null in produces_artifact is coerced to Python None."""
+        raw = '[{"question": "Q?", "produces_artifact": null, "consumes_artifacts": []}]'
+        specs = _parse_plan_json(raw)
+        assert specs[0]["produces_artifact"] is None
+
+    def test_malformed_json_falls_back_gracefully(self) -> None:
+        """Non-JSON input falls back to line-splitting without crashing."""
+        raw = "1. What is revenue?\n2. Which region is top?"
+        specs = _parse_plan_json(raw)
+        assert len(specs) >= 1
+        assert all("question" in s for s in specs)
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +513,7 @@ class TestSummaryWorkingMemory:
 # ---------------------------------------------------------------------------
 
 class TestHelpers:
+
     def test_build_schema_summary_contains_columns(self, small_df: pd.DataFrame) -> None:
         summary = _build_schema_summary(small_df)
         assert "region" in summary

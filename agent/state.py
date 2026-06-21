@@ -78,6 +78,11 @@ class Finding:
     ``answer_confidence`` reflects the critic's final trust verdict only.
     ``execution_difficulty`` records how hard it was to produce the accepted
     answer and must not be used as answer confidence.
+
+    ``produced_artifact_name`` is the key under which this step's output
+    DataFrame was registered in the ArtifactStore (e.g. ``"quarter_df"``),
+    or None if the step returned a scalar / string answer rather than a
+    reusable DataFrame.
     """
 
     task_id: str
@@ -90,20 +95,31 @@ class Finding:
     execution_difficulty: ExecutionDifficulty | None = None
     source_iteration: int = 0
     timestamp: str = field(default_factory=utc_now_iso)
+    # ArtifactStore key for the DataFrame this step emitted (None for scalars).
+    produced_artifact_name: str | None = None
 
     def to_summary_dict(self) -> dict[str, str]:
-        """Return the only fields the summary stage is allowed to see."""
+        """
+        Return the fields the summary stage is allowed to see.
+
+        Includes ``artifact_key`` so the reporter LLM can ground each claim
+        in a specific validated finding rather than synthesising from memory.
+        """
         return {
             "question": self.question,
             "answer": self.answer,
             "trust": self.answer_confidence,
+            "artifact_key": self.artifact_key,
         }
 
     def to_working_memory_line(self) -> str:
         """Return a compact line for CODE-GEN/CRITIQUE context."""
+        artifact_hint = ""
+        if self.produced_artifact_name:
+            artifact_hint = f" [artifact: artifacts[\"{self.produced_artifact_name}\"] available]"
         return (
             f"• {self.artifact_key}: {self.question} → {self.answer} "
-            f"(confidence={self.answer_confidence})"
+            f"(confidence={self.answer_confidence}){artifact_hint}"
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -113,13 +129,28 @@ class Finding:
 
 @dataclass
 class TaskNode:
-    """A planned task and its explicit dependencies."""
+    """
+    A planned task and its explicit dependencies.
+
+    ``produces_artifact`` and ``consumes_artifacts`` are declared by the
+    planner and drive two behaviours in the execution loop:
+
+    * ``produces_artifact``: after the step is accepted, its DataFrame variable
+      (named after this value) is extracted from the sandbox and registered in
+      the ArtifactStore.
+    * ``consumes_artifacts``: before CODE-GEN, the named DataFrames are fetched
+      from the ArtifactStore and injected into the sandbox ``artifacts`` dict,
+      making them available without re-computation.
+    """
 
     task_id: str
     question: str
     depends_on: list[str] = field(default_factory=list)
     status: TaskStatus = "pending"
     failure_reason: str = ""
+    # Artifact lifecycle declarations (from structured plan)
+    produces_artifact: str | None = None
+    consumes_artifacts: list[str] = field(default_factory=list)
 
 
 @dataclass

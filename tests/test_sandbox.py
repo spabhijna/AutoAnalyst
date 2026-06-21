@@ -48,7 +48,7 @@ from agent.sandbox import run_sandboxed
 # Fixtures
 # ---------------------------------------------------------------------------
 
-RESULT_KEYS = {"success", "result", "stdout", "error", "error_type", "error_category"}
+RESULT_KEYS = {"success", "result", "stdout", "error", "error_type", "error_category", "artifact", "artifact_key"}
 
 
 @pytest.fixture()

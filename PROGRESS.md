@@ -12,7 +12,8 @@
 |-------|-------------|--------|
 | 1 | LLM client wrapper + synthetic data | ✅ Complete |
 | 2 | Safe code execution sandbox | ✅ Complete |
-| 3 | Five-stage PLAN→CODEGEN→EXECUTE→CRITIQUE loop | ✅ **Complete** |
+| 3 | Five-stage PLAN→CODEGEN→EXECUTE→CRITIQUE loop | ✅ Complete |
+| 3.5 | Architectural Redesign (ArtifactStore) | ✅ **Complete** |
 | 4 | Data quality checks in OBSERVE stage | 🔲 Next |
 | 5 | Evaluation against corruption manifest | 🔲 Planned |
 | 6 | Blog post run log + write-up | 🔲 Planned |
@@ -29,6 +30,7 @@ AutoAnalyst/
 │   ├── llm_client.py         # call_llm() — Groq-first, Gemini-fallback
 │   ├── sandbox.py            # run_sandboxed() — process-isolated exec
 │   ├── state.py              # typed debug history, working memory, findings, tasks
+│   ├── artifact_store.py     # in-process registry for pre-validated DataFrames
 │   ├── logger.py             # LogEntry dataclass + JSONL writer
 │   ├── prompts.py            # All prompt-template functions (no inline strings)
 │   └── loop.py               # AgentRun + run() — five-stage orchestration
@@ -36,9 +38,10 @@ AutoAnalyst/
 │   └── generate_data.py      # generate_sales_data() + inject_corruption()
 ├── tests/
 │   ├── __init__.py
-│   ├── test_llm_client.py    # 19 tests ✅
-│   ├── test_sandbox.py       # 24 tests ✅
-│   └── test_loop.py          # 36 tests ✅
+│   ├── test_llm_client.py    # 15 tests ✅
+│   ├── test_sandbox.py       # 25 tests ✅
+│   ├── test_artifact_store.py# 28 tests ✅
+│   └── test_loop.py          # 47 tests ✅
 ├── run_demo.py               # Demo script — runs loop on clean synthetic data
 ├── .env.example              # Key template — copy to .env and populate
 ├── .gitignore
@@ -78,11 +81,36 @@ AutoAnalyst/
 ### Test Results
 
 ```
-tests/test_llm_client.py  — 19 passed  ✅
-tests/test_loop.py        — 36 passed  ✅
-tests/test_sandbox.py     — 24 tests   ✅
-Total: 79 passed, 0 failed
+tests/test_llm_client.py     — 15 passed  ✅
+tests/test_loop.py           — 47 passed  ✅
+tests/test_sandbox.py        — 25 passed  ✅
+tests/test_artifact_store.py — 28 passed  ✅
+Total: 115 passed, 0 failed
 ```
+
+---
+
+## Phase 3.5 — Architectural Redesign (ArtifactStore)
+
+Driven by excessive recomputation (e.g. repeatedly applying date filters) and the observer making unsupported claims, this phase redesigned data flow and state accumulation.
+
+### What Was Built
+
+| File | Change |
+|------|--------|
+| `agent/artifact_store.py` | In-process registry: `artifact_key → pd.DataFrame`. Safe pickling checks. |
+| `agent/state.py` | `Finding.produced_artifact_name`, `TaskNode.produces_artifact` + `consumes_artifacts`. |
+| `agent/sandbox.py` | `artifacts` namespace injection and `extract_artifact` extraction logic. |
+| `agent/prompts.py` | Structured plan JSON format with artifact definitions. Explicit None-checking for artifacts in codegen/repair. Strict grounding constraints for summary reporting. |
+| `agent/loop.py` | Structured task parsing (`_parse_plan_json`), artifact wiring around CODE-GEN and EXECUTE. |
+| `tests/test_artifact_store.py`| Comprehensive tests for artifact lifecycle and metadata. |
+
+### Problems Solved
+
+1. **Repeated recomputation**: Step 1 registers `quarter_df`; steps 2-N read from `artifacts["quarter_df"]` directly in the sandbox instead of filtering `df` from scratch.
+2. **Disconnected dependencies**: `TaskNode` now carries `consumes_artifacts` which drives the sandbox namespace injection.
+3. **Flat plans**: The planner outputs structured JSON `[{"question": ..., "produces_artifact": ..., "consumes_artifacts": [...]}]` rather than string arrays.
+4. **Unsupported summary claims**: The observer is bound to a strict reporting contract where each claim must cite a specific finding's `artifact_key`.
 
 ### Loop Architecture (current)
 
@@ -100,10 +128,11 @@ run(goal, df)
         └── for iteration in range(max_retries_per_step):
               │
               ├── CODEGEN:  call_llm(codegen_prompt, role="codegen")
+              │             → Receives `AVAILABLE ARTIFACTS` description
               │             → _strip_markdown_fences() post-processing
               │             (includes previous_code + critique_reason on retry)
               │             (receives WorkingMemory only, never failed attempts)
-              ├── EXECUTE:  run_sandboxed(code, df, timeout=10s)
+              ├── EXECUTE:  run_sandboxed(code, df, artifacts=namespace, extract_artifact=...)
               ├── CRITIQUE: call_llm(critique_prompt, role="critique")
               │             (receives accepted findings/code previews only)
               │             → parse {"trust", "reason", "action"}
@@ -116,9 +145,9 @@ run(goal, df)
               └── action="revise_plan" → replan remaining questions (cap=2)
                                          carry forward accepted findings
   │
-  └── SUMMARY: _final_results(state)      ← question/answer/trust only
+  └── SUMMARY: _final_results(state)      ← question/answer/trust/artifact_key only
                call_llm(summary_prompt, role="observe")
-               → reporter-style conclusion, no inferred caveats
+               → reporter-style conclusion grounded in explicit findings
 ```
 
 ### State Separation (current)

@@ -35,6 +35,7 @@ from typing import Any
 import pandas as pd
 
 from agent import config
+from agent.artifact_store import ArtifactStore
 from agent.llm_client import call_llm
 from agent.logger import LogEntry, new_run_id, write_log_entry
 from agent.prompts import (
@@ -136,6 +137,7 @@ class AgentRun:
     abort_reason: str = ""
     environment_manifest: EnvironmentManifest = field(default_factory=EnvironmentManifest)
     task_memories: dict[str, TaskMemory] = field(default_factory=dict)
+    artifact_store: ArtifactStore = field(default_factory=ArtifactStore)
 
     @property
     def history(self) -> list[dict[str, Any]]:
@@ -223,8 +225,7 @@ def run(
     print(f"{'='*60}\n")
 
     # ── PLAN ──────────────────────────────────────────────────────────────────
-    state.plan = _do_plan(state, df)
-    state.tasks = _build_tasks(state.plan)
+    _do_plan(state, df)  # sets state.plan and state.tasks (with artifact declarations)
 
     # ── Per-sub-question loop ─────────────────────────────────────────────────
     try:
@@ -302,11 +303,14 @@ def run(
 
 
 def _do_plan(state: AgentRun, df: pd.DataFrame) -> list[str]:
-    """Call the PLAN stage and return a list of sub-questions."""
+    """Call the PLAN stage, parse the structured plan, and return sub-question strings."""
     print("► PLAN stage …")
     prompt = plan_prompt(state.goal, state.schema_summary)
     raw = call_llm(prompt, role="plan")
-    questions = _parse_json_list(raw)
+    task_specs = _parse_plan_json(raw)
+    questions = [spec["question"] for spec in task_specs]
+    state.plan = questions
+    state.tasks = _build_tasks(questions, task_specs)
     print(f"  → {len(questions)} sub-questions generated")
     for i, q in enumerate(questions, 1):
         print(f"     {i}. {q}")
@@ -324,7 +328,14 @@ def _do_plan(state: AgentRun, df: pd.DataFrame) -> list[str]:
 
 
 def _do_replan(state: AgentRun, df: pd.DataFrame) -> list[str]:
-    """Re-plan from the current step forward, carrying completed findings."""
+    """Re-plan from the current step forward, carrying completed findings.
+    
+    Replanning emits a flat string array (no artifact declarations) since the
+    LLM doesn't know which artifacts have already been registered. Replanned
+    tasks will still have access to the ArtifactStore via the `artifacts` sandbox
+    global — the code-gen prompt lists all available artifacts regardless of
+    whether the task declared explicit consumes_artifacts.
+    """
     print("► RE-PLAN stage …")
     completed = _build_completed_findings(state)
     # Get the critique reason from the most recent debug attempt.
@@ -339,6 +350,7 @@ def _do_replan(state: AgentRun, df: pd.DataFrame) -> list[str]:
         last_reason,
     )
     raw = call_llm(prompt, role="plan")
+    # Replan uses flat string array for simplicity
     questions = _parse_json_list(raw)
     print(f"  → {len(questions)} new sub-questions")
     for i, q in enumerate(questions, 1):
@@ -355,6 +367,15 @@ def _run_question(
     """
     Run the CODE-GEN → EXECUTE → CRITIQUE loop for one sub-question.
 
+    Before CODE-GEN, builds an artifact namespace from the ArtifactStore for
+    all keys listed in ``task.consumes_artifacts``. This namespace is injected
+    into the sandbox so generated code can read pre-validated DataFrames without
+    re-deriving them.
+
+    After CRITIQUE accepts a result, if ``task.produces_artifact`` is set, the
+    named DataFrame is extracted from the sandbox result and registered in
+    ``state.artifact_store`` for downstream steps.
+
     Returns:
         True if critique returned "revise_plan", False otherwise.
     """
@@ -367,6 +388,14 @@ def _run_question(
         state.task_memories[task.task_id] = TaskMemory(task_id=task.task_id)
     task_memory = state.task_memories[task.task_id]
 
+    # ── Pre-build artifact namespace for this task ───────────────────────────────────
+    # If the task has explicit consumes_artifacts, fetch only those.
+    # Otherwise, expose the full ArtifactStore so any prior artifact is reachable.
+    if task.consumes_artifacts:
+        artifact_namespace = state.artifact_store.as_namespace_for(task.consumes_artifacts)
+    else:
+        artifact_namespace = state.artifact_store.as_namespace()
+
     for iteration in range(state.max_retries_per_step):
         # ── CODE-GEN ──────────────────────────────────────────────────────────
         print(f"  ► CODE-GEN (iter {iteration}) …")
@@ -378,7 +407,13 @@ def _run_question(
 
         # ── EXECUTE ───────────────────────────────────────────────────────────
         print(f"  ► EXECUTE …")
-        sandbox_result = run_sandboxed(code, df, timeout_seconds=SANDBOX_TIMEOUT)
+        sandbox_result = run_sandboxed(
+            code,
+            df,
+            artifacts=artifact_namespace,
+            extract_artifact=task.produces_artifact,
+            timeout_seconds=SANDBOX_TIMEOUT,
+        )
         had_execution_errors = had_execution_errors or not sandbox_result["success"]
         status = "✓ OK" if sandbox_result["success"] else f"✗ {sandbox_result.get('error_type', 'ERROR')}"
         print(f"    {status}")
@@ -457,6 +492,30 @@ def _run_question(
             state.final_results = state.working_memory.accepted_findings(
                 _task_order(state.tasks)
             )
+
+            # ── Artifact registration ──────────────────────────────────────────
+            # If the task declared it would produce an artifact, check whether
+            # the sandbox extracted a DataFrame for it and register it.
+            if task.produces_artifact:
+                extracted_df = sandbox_result.get("artifact")
+                if isinstance(extracted_df, pd.DataFrame):
+                    registered = state.artifact_store.register(
+                        key=task.produces_artifact,
+                        df=extracted_df,
+                        producing_task_id=task.task_id,
+                    )
+                    if registered:
+                        finding.produced_artifact_name = task.produces_artifact
+                        logger.info(
+                            "Artifact %r registered from %s (%d rows)",
+                            task.produces_artifact, task.task_id, len(extracted_df),
+                        )
+                    else:
+                        logger.warning(
+                            "Task %s declared produces_artifact=%r but registration failed",
+                            task.task_id, task.produces_artifact,
+                        )
+
             return False  # move to next sub-question
 
         if action == "revise_plan":
@@ -498,6 +557,7 @@ def _do_codegen(
         completed_findings=_build_working_memory_prompt(state),
         environment_manifest=state.environment_manifest.as_prompt_text(),
         task_constraints=task_memory.as_prompt_text(),
+        available_artifacts=state.artifact_store.describe(),
     )
     raw = call_llm(prompt, role="codegen")
     return _strip_markdown_fences(raw)
@@ -520,6 +580,7 @@ def _do_repair(
         task_constraints=task_memory.as_prompt_text(),
         previous_code=previous_code,
         error_reason=previous_critique_reason,
+        available_artifacts=state.artifact_store.describe(),
     )
     raw = call_llm(prompt, role="codegen")
     return _strip_markdown_fences(raw)
@@ -606,6 +667,12 @@ def _build_schema_summary(df: pd.DataFrame) -> str:
     Includes column names, dtypes, null percentages, and 3 sample values.
     Does NOT include full row data.
 
+    The "last quarter" date window is computed here in Python and injected as
+    concrete constants (LAST_QUARTER_START / LAST_QUARTER_END) so the LLM
+    never has to derive date boundaries itself — eliminating the entire class
+    of off-by-one critique loops that arise when the model re-derives the
+    window independently on every attempt.
+
     Args:
         df: The DataFrame to describe.
 
@@ -619,13 +686,47 @@ def _build_schema_summary(df: pd.DataFrame) -> str:
         samples = df[col].dropna().head(3).tolist()
         sample_str = ", ".join(repr(v) for v in samples)
         lines.append(f"  • {col!r} ({dtype}) nulls={null_pct:.1f}% — e.g. {sample_str}")
+
+    # ── Pre-compute the "last quarter" window in Python so LLMs never have to ──
+    # "Last quarter" = the 3 most-recent complete calendar months in the data.
+    # Example: if max date is 2024-06-15, the window is 2024-04-01 → 2024-06-15.
+    last_quarter_start: str | None = None
+    last_quarter_end: str | None = None
+    if "date" in df.columns:
+        try:
+            date_series = pd.to_datetime(df["date"].dropna())
+            if not date_series.empty:
+                max_ts = date_series.max()  # pandas Timestamp
+                # First day of the month that is 2 full months before max_ts month.
+                # e.g. max=2024-06-15 → start=2024-04-01 (3 months including June).
+                start_ts = (max_ts - pd.DateOffset(months=2)).replace(day=1)
+                last_quarter_start = start_ts.strftime("%Y-%m-%d")
+                last_quarter_end = max_ts.strftime("%Y-%m-%d")
+        except Exception:  # noqa: BLE001 — schema build must never crash
+            pass
+
     lines.append("")
-    lines.append(
-        "Time range note: \"last quarter\" in this dataset means the most recent\n"
-        "3 calendar months present in the data. Use df['date'].max() as the\n"
-        "reference point, then filter back 3 months from there — do not use\n"
-        "pd.Timestamp('today') since the dataset may not be current."
-    )
+    if last_quarter_start and last_quarter_end:
+        lines.append(
+            "PRE-COMPUTED DATE WINDOW (do NOT re-derive these; copy them verbatim):\n"
+            f"  LAST_QUARTER_START = pd.Timestamp('{last_quarter_start}')  # inclusive\n"
+            f"  LAST_QUARTER_END   = pd.Timestamp('{last_quarter_end}')    # inclusive\n"
+            "\n"
+            "Use EXACTLY this filter when the goal mentions 'last quarter':\n"
+            "  mask = (pd.to_datetime(df['date']) >= LAST_QUARTER_START) & \\\n"
+            "         (pd.to_datetime(df['date']) <= LAST_QUARTER_END)\n"
+            "  quarter_df = df[mask]\n"
+            "\n"
+            "Do NOT use pd.Timestamp('today'), datetime.date objects, or\n"
+            "pd.DateOffset arithmetic in your code — the boundaries are already\n"
+            "computed above. Mismatching these constants is a logic error."
+        )
+    else:
+        lines.append(
+            "Time range note: \"last quarter\" means the most recent 3 calendar\n"
+            "months in the data. Use df['date'].max() as reference, filter back\n"
+            "2 full months to the first of that month, and do not use today's date."
+        )
     return "\n".join(lines)
 
 
@@ -691,22 +792,33 @@ def _task_order(tasks: list[TaskNode]) -> list[str]:
     return [task.task_id for task in tasks]
 
 
-def _build_tasks(plan: list[str]) -> list[TaskNode]:
+def _build_tasks(plan: list[str], task_specs: list[dict] | None = None) -> list[TaskNode]:
     """
     Build task nodes from the ordered plan.
 
-    The current agent executes analytically chained plans. Each task depends on
-    all prior accepted tasks, which prevents downstream work from proceeding
-    with missing prerequisites and gives CODE-GEN/CRITIQUE a complete set of
-    validated parent findings.
+    When *task_specs* is provided (structured plan format), each TaskNode is
+    populated with the planner-declared ``produces_artifact`` and
+    ``consumes_artifacts`` values. When *task_specs* is absent or incomplete
+    (flat string array / legacy format), these fields default to None / []
+    and the pipeline operates without artifact declarations.
+
+    The dependency graph (``depends_on``) still chains all prior tasks for
+    safety, regardless of artifact declarations.
     """
     tasks: list[TaskNode] = []
     for index, question in enumerate(plan):
+        spec = (task_specs[index] if task_specs and index < len(task_specs) else {})
+        produces = spec.get("produces_artifact") or None
+        consumes = spec.get("consumes_artifacts") or []
+        if isinstance(consumes, str):
+            consumes = [consumes]  # defensive: normalize stray strings
         tasks.append(
             TaskNode(
                 task_id=_task_id(index),
                 question=question,
                 depends_on=[_task_id(i) for i in range(index)],
+                produces_artifact=produces,
+                consumes_artifacts=list(consumes),
             )
         )
     return tasks
@@ -811,8 +923,18 @@ def _attempt_for_finding(
 
 
 def _build_working_memory_prompt(state: AgentRun) -> str:
-    """Return validated operational memory for downstream stages."""
-    return state.working_memory.as_prompt_text(_task_order(state.tasks))
+    """
+    Return validated operational memory for downstream stages.
+
+    Combines the compact working-memory bullet list with the artifact store
+    description so CODE-GEN sees both the accepted text answers AND which
+    pre-validated DataFrames are available for reuse.
+    """
+    memory_text = state.working_memory.as_prompt_text(_task_order(state.tasks))
+    artifact_text = state.artifact_store.describe()
+    if artifact_text == "(no pre-computed artifacts available yet)":
+        return memory_text
+    return f"{memory_text}\n\n{artifact_text}"
 
 
 def _coerce_trust(value: Any) -> str:
@@ -820,6 +942,89 @@ def _coerce_trust(value: Any) -> str:
     if value in ("high", "low"):
         return str(value)
     return "unknown"
+
+
+def _parse_plan_json(raw: str) -> list[dict]:
+    """
+    Parse the plan LLM response into a list of task specification dicts.
+
+    Handles two formats:
+
+    **Structured format (new)** — a JSON array of task objects::
+
+        [
+          {"question": "...", "produces_artifact": "quarter_df", "consumes_artifacts": []},
+          {"question": "...", "produces_artifact": null,          "consumes_artifacts": ["quarter_df"]}
+        ]
+
+    **Legacy flat format (backward-compatible)** — a JSON array of strings::
+
+        ["Q1?", "Q2?", "Q3?"]
+
+    In the legacy case, each string is wrapped in a minimal dict with
+    ``produces_artifact=None`` and ``consumes_artifacts=[]`` so the rest
+    of the loop can treat both formats identically.
+
+    The function is intentionally defensive: if JSON parsing fails entirely,
+    it falls back to line-splitting (same as the old ``_parse_json_list``).
+
+    Args:
+        raw: Raw LLM response string.
+
+    Returns:
+        List of dicts, each with at least ``{"question": str}``.
+    """
+    # Try to extract the outermost JSON array from the raw string.
+    # Use greedy matching so nested [] (e.g. "consumes_artifacts": []) do not
+    # cause an early match — we need the full outer array.
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, list) and parsed:
+                # Structured format: list of dicts with "question" key
+                if all(isinstance(item, dict) and "question" in item for item in parsed):
+                    return [
+                        {
+                            "question": str(item["question"]).strip(),
+                            "produces_artifact": item.get("produces_artifact") or None,
+                            "consumes_artifacts": list(item.get("consumes_artifacts") or []),
+                        }
+                        for item in parsed
+                        if str(item.get("question", "")).strip()
+                    ]
+                # Legacy flat format: list of strings
+                if all(isinstance(item, str) for item in parsed):
+                    return [
+                        {"question": q.strip(), "produces_artifact": None, "consumes_artifacts": []}
+                        for q in parsed
+                        if q.strip()
+                    ]
+                # Mixed or partial: extract what we can
+                result = []
+                for item in parsed:
+                    if isinstance(item, dict) and item.get("question"):
+                        result.append({
+                            "question": str(item["question"]).strip(),
+                            "produces_artifact": item.get("produces_artifact") or None,
+                            "consumes_artifacts": list(item.get("consumes_artifacts") or []),
+                        })
+                    elif isinstance(item, str) and item.strip():
+                        result.append({"question": item.strip(), "produces_artifact": None, "consumes_artifacts": []})
+                if result:
+                    return result
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: split on numbered lines (same as legacy _parse_json_list)
+    lines = []
+    for line in raw.splitlines():
+        line = re.sub(r"^\d+[\.)\-]\s*", "", line.strip())
+        if line and not line.startswith("{") and not line.startswith("["):
+            lines.append({"question": line, "produces_artifact": None, "consumes_artifacts": []})
+    if lines:
+        return lines
+    return [{"question": raw.strip(), "produces_artifact": None, "consumes_artifacts": []}]
 
 
 def _parse_json_list(raw: str) -> list[str]:
@@ -848,10 +1053,11 @@ def _parse_json_list(raw: str) -> list[str]:
     # Fallback: numbered lines
     lines = []
     for line in raw.splitlines():
-        line = re.sub(r"^\d+[\.\)]\s*", "", line.strip())
+        line = re.sub(r"^\d+[\.)\]\s*", "", line.strip())
         if line:
             lines.append(line)
     return lines or [raw.strip()]
+
 
 
 def _parse_critique_json(raw: str) -> dict[str, Any]:
