@@ -108,6 +108,8 @@ class Artifact:
     schema: list[str]       # column names (DataFrame/Series), ["<scalar>"] for scalar
     producer: str           # producing_task_id
     value: pd.DataFrame     # the actual data (shallow-copied on registration)
+    consumers: list[str] = field(default_factory=list)
+    confidence: str = "unknown"
 
     # ── Derived accessors ─────────────────────────────────────────────────────
 
@@ -121,6 +123,11 @@ class Artifact:
         cols = list(self.value.columns)[:max_cols]
         suffix = f", … (+{len(self.value.columns) - max_cols} more)" if len(self.value.columns) > max_cols else ""
         return ", ".join(cols) + suffix
+
+    def add_consumer(self, task_id: str) -> None:
+        """Record a downstream task that consumes this artifact."""
+        if task_id and task_id not in self.consumers:
+            self.consumers.append(task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +158,8 @@ class ArtifactStore:
         key: str,
         df: pd.DataFrame,
         producing_task_id: str = "",
+        consumers: list[str] | None = None,
+        confidence: str = "unknown",
     ) -> bool:
         """
         Register *df* under *key* as an :class:`Artifact`.
@@ -202,6 +211,8 @@ class ArtifactStore:
             type=artifact_type,
             schema=schema_info,
             producer=producing_task_id,
+            consumers=list(consumers or []),
+            confidence=confidence,
             value=df.copy(deep=False),
         )
         logger.debug(
@@ -280,12 +291,17 @@ class ArtifactStore:
             "AVAILABLE ARTIFACTS (pre-validated — use these instead of re-deriving):",
         ]
         for key, a in self._artifacts.items():
-            type_line = f'  artifacts["{key}"]  type={a.type}'
+            type_line = f'  artifacts["{key}"]  type={a.type}  confidence={a.confidence}'
             if a.schema and a.schema != ["<scalar>"]:
                 schema_str = ", ".join(a.schema[:8])
                 if len(a.schema) > 8:
                     schema_str += " …"
                 type_line += f"  schema=[{schema_str}]"
+            if a.consumers:
+                consumers_str = ", ".join(a.consumers[:4])
+                if len(a.consumers) > 4:
+                    consumers_str += " …"
+                type_line += f"  consumers=[{consumers_str}]"
             type_line += f"  ({a.rows:,} rows)"
             lines.append(type_line)
 

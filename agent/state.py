@@ -151,6 +151,8 @@ class TaskNode:
     # Artifact lifecycle declarations (from structured plan)
     produces_artifact: str | None = None
     consumes_artifacts: list[str] = field(default_factory=list)
+    execution_fn: str = "llm_codegen"
+    output_schema: list[str] = field(default_factory=list)
 
 
 @dataclass

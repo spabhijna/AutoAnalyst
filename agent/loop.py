@@ -37,6 +37,8 @@ import pandas as pd
 
 from agent import config
 from agent.artifact_store import ArtifactStore
+from agent.execution_graph import ExecutionGraph
+from agent.executors import try_execute as try_deterministic_execute
 from agent.llm_client import call_llm
 from agent.observer import observe
 from agent.logger import LogEntry, export_run_json, new_run_id, write_log_entry
@@ -141,6 +143,7 @@ class AgentRun:
     environment_manifest: EnvironmentManifest = field(default_factory=EnvironmentManifest)
     task_memories: dict[str, TaskMemory] = field(default_factory=dict)
     artifact_store: ArtifactStore = field(default_factory=ArtifactStore)
+    execution_graph: ExecutionGraph = field(default_factory=ExecutionGraph)
 
     @property
     def history(self) -> list[dict[str, Any]]:
@@ -200,6 +203,7 @@ def run(
     df: pd.DataFrame,
     log_dir: str = config.LOG_DIR,
     max_retries_per_step: int = config.MAX_PIPELINE_RETRIES,
+    dry_run: bool = False,
 ) -> AgentRun:
     """
     Execute the full five-stage loop for *goal* against *df*.
@@ -212,6 +216,8 @@ def run(
         df:                 The pandas DataFrame to analyse.
         log_dir:            Directory for JSONL and JSON run logs.
         max_retries_per_step: Hard cap on CODE-GEN retries per sub-question.
+        dry_run:            When True, uses canned LLM responses so the
+                            pipeline runs without API keys.  Defaults to False.
 
     Returns:
         Completed :class:`AgentRun` with full history and summary populated.
@@ -231,13 +237,53 @@ def run(
     print(f"  goal   : {goal}")
     print(f"{'='*60}\n")
 
+    # ── Inject dry-run mode ─────────────────────────────────────────────────
+    if dry_run:
+        import sys as _sys
+        _m = _sys.modules[__name__]
+
+        def _dry_call(prompt: str, role: str, model: str | None = None) -> str:
+            plan_json = (
+                '["Filter to last quarter and return quarter_df", '
+                '"What is total revenue by region in the last quarter?", '
+                '"Which region had highest revenue and which category drove it?", '
+                '"Check if top region performance was consistent month-over-month", '
+                '"What was the overall revenue trend by region over the quarter?"]'
+            )
+            code = 'result = df.describe() if len(df) > 0 else "(empty DataFrame)"'
+            critique = '{"trust": "high", "action": "accept", "reason": "Dry-run: verified."}'
+            summary = (
+                'Dry-run summary: The pipeline executed successfully without LLM API keys. '
+                'The plan generated 5 sub-questions, each was answered with sandbox code '
+                'and accepted by the independent critique stage.'
+            )
+            if role == "plan":
+                return plan_json
+            if role == "codegen":
+                return code
+            if role == "critique":
+                return critique
+            return summary
+
+        _m.call_llm = _dry_call
+        logger.info("Dry-run mode enabled — using canned LLM responses")
+        print("  [dry-run] LLM calls return canned responses")
+
     # ── PLAN ──────────────────────────────────────────────────────────────────
     _do_plan(state, df)  # sets state.plan and state.tasks (with artifact declarations)
 
     # ── Per-sub-question loop ─────────────────────────────────────────────────
     try:
-        while state.current_step < len(state.plan):
-            task = state.tasks[state.current_step]
+        while not state.execution_graph.all_completed():
+            completed_task_ids = set(state.working_memory.findings.keys())
+            task = state.execution_graph.next_ready_task(completed_task_ids)
+            if task is None:
+                raise PipelineAbortedError(
+                    sub_question="(scheduler)",
+                    last_reason="No ready task was available before the graph completed.",
+                    run_id=state.run_id,
+                )
+            state.current_step = state.execution_graph.task_index(task.task_id)
             sub_question = task.question
             _print_step_header(state.current_step, len(state.plan), sub_question)
             _ensure_dependencies_available(state, task)
@@ -256,6 +302,8 @@ def run(
                     new_plan_tail = _do_replan(state, df)
                     state.plan = state.plan[: state.current_step] + new_plan_tail
                     state.tasks = _build_tasks(state.plan)
+                    state.execution_graph = ExecutionGraph.from_tasks(state.tasks)
+                    _sync_artifact_consumers(state)
                     state.plan_revisions += 1
                     logger.info(
                         "Plan revised (revision %d/%d): %d new questions",
@@ -322,6 +370,8 @@ def _do_plan(state: AgentRun, df: pd.DataFrame) -> list[str]:
     questions = [spec["question"] for spec in task_specs]
     state.plan = questions
     state.tasks = _build_tasks(questions, task_specs)
+    state.execution_graph = ExecutionGraph.from_tasks(state.tasks)
+    _sync_artifact_consumers(state)
     print(f"  → {len(questions)} sub-questions generated")
     for i, q in enumerate(questions, 1):
         print(f"     {i}. {q}")
@@ -407,6 +457,66 @@ def _run_question(
     else:
         artifact_namespace = state.artifact_store.as_namespace()
 
+    deterministic_result = try_deterministic_execute(task, df, artifact_namespace)
+    if deterministic_result is not None:
+        print("  ► DETERMINISTIC EXECUTE …")
+        sandbox_result = deterministic_result.to_sandbox_result()
+        print("    ✓ OK (deterministic)")
+        obs_report = observe(
+            df,
+            sandbox_result,
+            artifact_store_available_keys=state.artifact_store.available_keys(),
+        )
+        reason = "Deterministic executor validated the reusable dataframe step."
+        trust = "high"
+        attempt = AttemptRecord(
+            task_id=task.task_id,
+            sub_question=sub_question,
+            iteration=0,
+            code="(deterministic executor)",
+            sandbox_result=sandbox_result,
+            critique=reason,
+            action="accept",
+            trust=_coerce_trust(trust),
+            error_category="none",
+        )
+        state.debug_history.append(attempt)
+        _log(state, LogEntry(
+            run_id=state.run_id,
+            sub_question=sub_question,
+            iteration=0,
+            stage="deterministic_execute",
+            action="accept",
+            code=attempt.code,
+            sandbox_result=sandbox_result,
+            critique=reason,
+            trust=trust,
+        ))
+        task.status = "accepted"
+        finding = _finding_from_attempt(
+            attempt=attempt,
+            task=task,
+            attempt_count=1,
+            had_execution_errors=False,
+            reason=reason,
+        )
+        state.working_memory.add_finding(finding)
+        state.final_results = state.working_memory.accepted_findings(_task_order(state.tasks))
+        if task.produces_artifact:
+            extracted_df = sandbox_result.get("artifact")
+            if isinstance(extracted_df, pd.DataFrame):
+                registered = state.artifact_store.register(
+                    key=task.produces_artifact,
+                    df=extracted_df,
+                    producing_task_id=task.task_id,
+                    consumers=state.execution_graph.consumers_for(task.produces_artifact),
+                    confidence=trust,
+                )
+                if registered:
+                    finding.produced_artifact_name = task.produces_artifact
+                    _sync_artifact_consumers(state)
+        return False
+
     for iteration in range(state.max_retries_per_step):
         # ── CODE-GEN ──────────────────────────────────────────────────────────
         print(f"  ► CODE-GEN (iter {iteration}) …")
@@ -417,7 +527,7 @@ def _run_question(
         print(f"    {len(code)} chars generated")
 
         # ── EXECUTE ───────────────────────────────────────────────────────────
-        print(f"  ► EXECUTE …")
+        print("  ► EXECUTE …")
         sandbox_result = run_sandboxed(
             code,
             df,
@@ -440,7 +550,7 @@ def _run_question(
         # Deterministic data-quality checks on the live DataFrame BEFORE critique.
         # The observer computes actual null counts, duplicates, and outliers so
         # the critique LLM sees hard facts instead of speculating.
-        print(f"  ► OBSERVE …")
+        print("  ► OBSERVE …")
         obs_report = observe(
             df,
             sandbox_result,
@@ -451,7 +561,7 @@ def _run_question(
               f"outliers={len(obs_report.revenue_outliers_iqr)}")
 
         # ── CRITIQUE ──────────────────────────────────────────────────────────
-        print(f"  ► CRITIQUE …")
+        print("  ► CRITIQUE …")
         history_summary = _build_history_summary(state)
         critique_raw, critique_parsed = _do_critique(
             state, sub_question, code, sandbox_result, history_summary,
@@ -529,9 +639,12 @@ def _run_question(
                         key=task.produces_artifact,
                         df=extracted_df,
                         producing_task_id=task.task_id,
+                        consumers=state.execution_graph.consumers_for(task.produces_artifact),
+                        confidence=trust,
                     )
                     if registered:
                         finding.produced_artifact_name = task.produces_artifact
+                        _sync_artifact_consumers(state)
                         logger.info(
                             "Artifact %r registered from %s (%d rows)",
                             task.produces_artifact, task.task_id, len(extracted_df),
@@ -844,8 +957,17 @@ def _build_tasks(plan: list[str], task_specs: list[dict] | None = None) -> list[
         spec = (task_specs[index] if task_specs and index < len(task_specs) else {})
         produces = spec.get("produces_artifact") or None
         consumes = spec.get("consumes_artifacts") or []
+        output_schema = spec.get("output_schema") or []
         if isinstance(consumes, str):
             consumes = [consumes]  # defensive: normalize stray strings
+        if isinstance(output_schema, str):
+            output_schema = [output_schema]
+        execution_fn = "llm_codegen"
+        q_lower = question.lower()
+        if produces == "quarter_df" and "last quarter" in q_lower:
+            execution_fn = "deterministic"
+        elif produces == "region_revenue" and "region" in q_lower and "revenue" in q_lower:
+            execution_fn = "deterministic"
         tasks.append(
             TaskNode(
                 task_id=_task_id(index),
@@ -853,9 +975,24 @@ def _build_tasks(plan: list[str], task_specs: list[dict] | None = None) -> list[
                 depends_on=[_task_id(i) for i in range(index)],
                 produces_artifact=produces,
                 consumes_artifacts=list(consumes),
+                execution_fn=execution_fn,
+                output_schema=list(output_schema),
             )
         )
     return tasks
+
+
+def _sync_artifact_consumers(state: AgentRun) -> None:
+    """Annotate artifact metadata with downstream consumer task IDs."""
+    for task in state.tasks:
+        if not task.produces_artifact:
+            continue
+        artifact = state.artifact_store.get_artifact(task.produces_artifact)
+        if artifact is None:
+            continue
+        artifact.consumers = state.execution_graph.consumers_for(task.produces_artifact)
+        if task.output_schema:
+            artifact.schema = list(task.output_schema)
 
 
 def _task_for_attempt(tasks: list[TaskNode], attempt: AttemptRecord) -> TaskNode:
@@ -1023,6 +1160,7 @@ def _parse_plan_json(raw: str) -> list[dict]:
                             "question": str(item["question"]).strip(),
                             "produces_artifact": item.get("produces_artifact") or None,
                             "consumes_artifacts": list(item.get("consumes_artifacts") or []),
+                            "output_schema": list(item.get("output_schema") or []),
                         }
                         for item in parsed
                         if str(item.get("question", "")).strip()
@@ -1042,9 +1180,10 @@ def _parse_plan_json(raw: str) -> list[dict]:
                             "question": str(item["question"]).strip(),
                             "produces_artifact": item.get("produces_artifact") or None,
                             "consumes_artifacts": list(item.get("consumes_artifacts") or []),
+                            "output_schema": list(item.get("output_schema") or []),
                         })
                     elif isinstance(item, str) and item.strip():
-                        result.append({"question": item.strip(), "produces_artifact": None, "consumes_artifacts": []})
+                        result.append({"question": item.strip(), "produces_artifact": None, "consumes_artifacts": [], "output_schema": []})
                 if result:
                     return result
         except json.JSONDecodeError:
@@ -1055,10 +1194,10 @@ def _parse_plan_json(raw: str) -> list[dict]:
     for line in raw.splitlines():
         line = re.sub(r"^\d+[\.)\-]\s*", "", line.strip())
         if line and not line.startswith("{") and not line.startswith("["):
-            lines.append({"question": line, "produces_artifact": None, "consumes_artifacts": []})
+            lines.append({"question": line, "produces_artifact": None, "consumes_artifacts": [], "output_schema": []})
     if lines:
         return lines
-    return [{"question": raw.strip(), "produces_artifact": None, "consumes_artifacts": []}]
+    return [{"question": raw.strip(), "produces_artifact": None, "consumes_artifacts": [], "output_schema": []}]
 
 
 def _parse_json_list(raw: str) -> list[str]:
@@ -1190,17 +1329,21 @@ def _finalize_run(state: AgentRun, t_start: float) -> None:
     Aggregates metadata (goal, model versions, LLM call count, wall clock)
     + the full debug history into ``runs/<run_id>.json``.
     """
-    from agent.llm_client import _default_model_for_role
+    from agent.config import (
+        GROQ_CODEGEN_MODEL,
+        GROQ_CRITIQUE_MODEL,
+        GROQ_DEFAULT_MODEL,
+    )
 
     wall_clock = time.monotonic() - t_start
     debug_entries = [attempt.to_legacy_dict() for attempt in state.debug_history]
 
     # Derive model versions from config (no live introspection needed)
     model_versions = {
-        "plan": _default_model_for_role("plan"),
-        "codegen": _default_model_for_role("codegen"),
-        "critique": _default_model_for_role("critique"),
-        "observe": _default_model_for_role("observe"),
+        "plan": GROQ_DEFAULT_MODEL,
+        "codegen": GROQ_CODEGEN_MODEL,
+        "critique": GROQ_CRITIQUE_MODEL,
+        "observe": GROQ_DEFAULT_MODEL,
     }
 
     json_path = export_run_json(

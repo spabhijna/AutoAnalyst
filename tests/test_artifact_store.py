@@ -66,11 +66,13 @@ class TestRegister:
         assert a.type == "DataFrame"
 
     def test_artifact_rows_and_columns(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
-        store.register("quarter_df", small_df, producing_task_id="step_1")
+        store.register("quarter_df", small_df, producing_task_id="step_1", consumers=["step_2"], confidence="high")
         a = store._artifacts["quarter_df"]
         assert a.rows == 3
         assert list(a.value.columns) == ["region", "revenue", "date"]
         assert a.producer == "step_1"
+        assert a.consumers == ["step_2"]
+        assert a.confidence == "high"
 
     def test_dtypes_preserved(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
         store.register("quarter_df", small_df)
@@ -236,11 +238,12 @@ class TestDescribe:
 
     def test_describe_does_not_mention_producer(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
         """Typed describe() is self-contained — producer ID is internal metadata, not prompt content."""
-        store.register("quarter_df", small_df, producing_task_id="step_1")
+        store.register("quarter_df", small_df, producing_task_id="step_1", confidence="high")
         desc = store.describe()
         assert "step_1" not in desc
         assert "quarter_df" in desc
         assert "type=DataFrame" in desc
+        assert "confidence=high" in desc
 
     def test_describe_contains_usage_example(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
         store.register("quarter_df", small_df)

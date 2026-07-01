@@ -68,6 +68,11 @@ def main() -> None:
         default=None,
         help="Override max CODE-GEN retries per sub-question.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run without LLM API keys (uses canned responses).",
+    )
     args = parser.parse_args()
 
     print("Generating synthetic sales data …")
@@ -85,7 +90,7 @@ def main() -> None:
     if args.retries is not None:
         kwargs["max_retries_per_step"] = args.retries
 
-    state = run(args.goal, df, **kwargs)
+    state = run(args.goal, df, dry_run=args.dry_run, **kwargs)
 
     print(f"\nLog written to: runs/{state.run_id}.jsonl")
     print(f"Total steps executed: {len(state.history)}")

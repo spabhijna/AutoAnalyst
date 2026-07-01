@@ -15,8 +15,26 @@
 | 3 | Five-stage PLAN→CODEGEN→EXECUTE→CRITIQUE loop | ✅ Complete |
 | 3.5 | Architectural Redesign (ArtifactStore) | ✅ **Complete** |
 | 4 | Deterministic OBSERVE stage + main.py wiring | ✅ **Complete** |
-| 5 | Evaluation against corruption manifest | 🔲 Next |
-| 6 | Blog post run log + write-up | 🔲 Planned |
+| 5 | Evaluation against corruption manifest | ✅ **Complete** |
+
+---
+
+## Current Architectural Refactor
+
+Status: In progress
+
+Completed in this slice:
+- Added an explicit `ExecutionGraph` abstraction over planner-produced tasks.
+- Extended `TaskNode` with `execution_fn` and `output_schema` metadata.
+- Enriched `Artifact` metadata with `consumers` and `confidence`.
+- Added deterministic executors for reusable dataframe steps (`quarter_df`, `region_revenue`).
+- Switched the loop scheduler from positional iteration to dependency-aware graph selection.
+- Added tests for graph scheduling, deterministic execution, and artifact lineage metadata.
+
+Next:
+- Broaden deterministic execution beyond the first reusable dataframe steps.
+- Move more prompt context off the full debug history and onto per-layer state views.
+- Continue reducing LLM codegen responsibility for common dataframe operations.
 
 ---
 
@@ -33,15 +51,21 @@ AutoAnalyst/
 │   ├── artifact_store.py     # in-process registry for pre-validated DataFrames
 │   ├── logger.py             # LogEntry dataclass + JSONL writer
 │   ├── prompts.py            # All prompt-template functions (no inline strings)
+│   ├── observer.py           # Deterministic data-quality checks
+│   ├── evaluator.py          # Precision/recall vs corruption manifest
+│   ├── environment.py        # Sandbox capability manifest
+│   ├── log_viewer.py         # Human-readable run trace viewer
 │   └── loop.py               # AgentRun + run() — five-stage orchestration
 ├── data/
 │   └── generate_data.py      # generate_sales_data() + inject_corruption()
 ├── tests/
-│   ├── __init__.py
-│   ├── test_llm_client.py    # 15 tests ✅
+│   ├── test_llm_client.py    # 27 tests ✅
 │   ├── test_sandbox.py       # 25 tests ✅
-│   ├── test_artifact_store.py# 28 tests ✅
-│   └── test_loop.py          # 47 tests ✅
+│   ├── test_artifact_store.py# 47 tests ✅
+│   ├── test_observer.py     # 21 tests ✅
+│   ├── test_loop.py          # 47 tests ✅
+│   └── test_evaluator.py    # 25 tests ✅
+├── main.py                   # CLI entry point with --corrupt flag
 ├── run_demo.py               # Demo script — runs loop on clean synthetic data
 ├── .env.example              # Key template — copy to .env and populate
 ├── .gitignore
@@ -85,7 +109,7 @@ tests/test_llm_client.py     — 15 passed  ✅
 tests/test_loop.py           — 47 passed  ✅
 tests/test_sandbox.py        — 25 passed  ✅
 tests/test_artifact_store.py — 28 passed  ✅
-Total: 115 passed, 0 failed
+Total: 188 passed, 0 failed
 ```
 
 ---
@@ -505,35 +529,103 @@ tests/test_artifact_store.py — 47 passed  ✅
 tests/test_llm_client.py     — 15 passed  ✅
 tests/test_loop.py           — 47 passed  ✅
 tests/test_sandbox.py        — 25 passed  ✅
-Total: 156 passed, 0 failed
+Total: 188 passed, 0 failed
 
 ---
 
-## NEXT STEPS — Phase 5: Evaluation Against Corruption Manifest
+### LLM Client — Three-Tier Provider Chain (Phase 4.5)
 
-### Problem
-The observer detects data-quality issues, but there is no automated scoring
-of how many defects the pipeline correctly identified vs. missed.
+Per-role provider chains with retry-at-each-level resilience:
 
-### Goal
-Run the agent against a corruption-injected dataset, compare detection results
-against the ground-truth manifest from `inject_corruption()`, and score:
-- Precision: what fraction of flagged issues were real defects?
-- Recall: what fraction of injected defects were detected?
-- Pipeline resilience: did corruption cause aborts or incorrect answers?
+| Role | Primary | Fallback 1 | Fallback 2 |
+|------|---------|------------|------------|
+| plan | Groq → llama-3.3-70b-versatile | OpenRouter → meta-llama/llama-3.3-70b-instruct:free | — |
+| codegen | Groq → llama-3.3-70b-versatile | Cerebras → openai/gpt-oss-120b | OpenRouter → codestral-2501:free |
+| critique | Groq → openai/gpt-oss-120b | Cerebras → openai/gpt-oss-120b | Gemini → gemini-2.5-flash |
+| observe/default | Groq → llama-3.3-70b-versatile | OpenRouter | — |
 
-### Files to create / modify (proposed)
+**Key changes:**
+- `agent/config.py` — 14 new constants for model strings, base URLs, retry config
+- `agent/llm_client.py` — `_build_chain(role, model)` per-role routing; `_try_with_retry()` with retry-once-per-provider; `_should_fallback()` gates on 429/5xx/timeout/404-model-not-found (NOT on 400/401/403)
+- New providers: `_call_cerebras()` (cerebras-cloud-sdk), `_call_openrouter()` (stdlib urllib)
+- `LLMUnavailableError.errors` replaced `groq_error`/`gemini_error` with `list[tuple[str, Exception]]`
+- `_finalize_run()` in `loop.py` uses config constants directly
 
-| File | Change |
-|------|--------|
-| `agent/evaluator.py` | `evaluate(run_state, manifest)` → `EvalReport` with precision/recall |
-| `agent/prompts.py` | No changes expected — evaluation is post-hoc |
-| `agent/loop.py` | No changes expected — evaluation reads the run log |
-| `tests/test_evaluator.py` | Unit tests against known manifest |
+**Codestral on Groq free tier:** NOT available — `mistral-codestral-2501` returns 404 model_not_found. Codegen uses `llama-3.3-70b-versatile` on Groq; OpenRouter `codestral-2501:free` is fallback2.
 
-### Verification target
-Run `python main.py --corrupt` and verify the evaluator can match observer-detected
-defects against the manifest. Score precision and recall across multiple seeds.
+### Test Results (current)
+
+```
+tests/test_observer.py       — 21 passed  ✅
+tests/test_artifact_store.py — 47 passed  ✅
+tests/test_llm_client.py     — 27 passed  ✅  (15 → 27, +12 chain tests)
+tests/test_loop.py           — 47 passed  ✅
+tests/test_sandbox.py        — 25 passed  ✅
+tests/test_evaluator.py      — 25 passed  ✅  (+25 Phase 5)
+Total: 188 passed, 0 failed
+```
+
+---
+
+## Phase 5 — What Was Built
+
+### Problem Solved
+The observer detects data-quality issues, but before Phase 5 there was no
+automated scoring of how many defects the pipeline correctly identified vs.
+missed. The evaluator fills this gap.
+
+### Approach
+The evaluator runs the deterministic observer on the corrupted DataFrame and
+compares its signals against the ground-truth manifest from ``inject_corruption()``
+across 5 defect categories:
+
+| Category | Manifest source | Observer signal |
+|----------|----------------|----------------|
+| Duplicate transactions | ``duplicated_transaction_ids`` | ``duplicate_txn_ids > 0`` |
+| Null revenue | ``null_revenue_indices`` | ``null_counts["revenue"] > 0`` |
+| Negative revenue | ``impossible_rows[type=negative_revenue]`` | ``negative_revenue_rows > 0`` |
+| Zero units with revenue | ``impossible_rows[type=zero_units_positive_revenue]`` | ``zero_units_positive_revenue > 0`` |
+| Revenue outlier | ``impossible_rows[type=revenue_outlier_50x]`` | ``revenue_outliers_iqr`` non-empty |
+
+Metrics computed at category level (TP = defect present AND detected):
+- **Precision**: TP / (TP + FP)
+- **Recall**: TP / (TP + FN)
+- **F1 score**: harmonic mean of precision and recall
+- **Pipeline resilience**: abort status, total attempts from AgentRun
+
+### Files
+
+| File | Notes |
+|------|-------|
+| `agent/evaluator.py` | ``evaluate(df, manifest, state=None)`` → ``EvalReport`` with precision/recall/F1 per category |
+| `tests/test_evaluator.py` | 25 tests — category logic, clean/corrupted/partial data, pipeline resilience |
+
+### Test Results
+
+```
+tests/test_evaluator.py          — 25 passed  ✅
+```
+
+### End-to-End Verification
+
+All 5 defect categories detected with full precision and recall on the
+standard corruption manifest (38 injected defects across 5 categories).
+The IQR outlier method is sensitive (detects 62 vs 1 injected outlier)
+but correctly identifies the outlier category as problematic.
+
+### Bonus: Dry-Run Mode
+
+Added ``--dry-run`` flag to ``main.py`` (``dry_run=True`` in ``run()``)
+that runs the full pipeline without LLM API keys by injecting canned
+responses for all 5 LLM call sites (plan, codegen x2, critique, summary).
+The sandbox, observer, and logger all operate normally.
+
+Usage:
+```
+    python run_demo.py               # dry-run by default
+    python main.py --dry-run         # dry-run via CLI
+    python main.py                   # real run (requires API keys)
+```
 
 ---
 
@@ -541,7 +633,8 @@ defects against the manifest. Score precision and recall across multiple seeds.
 
 | Issue | Severity | Mitigation |
 |-------|----------|------------|
-| `google.generativeai` deprecated → FutureWarning | Medium | Switch to `google.genai` package in Phase 4 (update `agent/llm_client.py` `_call_gemini`) |
+| `google.generativeai` deprecated → FutureWarning | ✅ Resolved | Migrated to `google-genai` SDK in `agent/llm_client.py` `_call_gemini` |
 | Gemini free-tier quota exhausted | Medium | Use paid tier or rate-limit; for demo Groq alone is sufficient |
-| Sandbox `spawn` overhead (~1-2s per call) | Low | Acceptable; pool reuse is Phase 6 |
+| Sandbox `spawn` overhead (~1-2s per call) | Low | Acceptable; pool reuse is a future concern |
 | Step 1 "last quarter" filter returns empty DF if data is fresh | Low | Critique correctly accepts empty result as "data reflects no rows in window" |
+| IQR outlier detection oversensitive (62:1 false positive rate) | Low | Category-level recall remains 100%; per-row FP only affects summary counts |

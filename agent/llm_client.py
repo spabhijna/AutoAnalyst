@@ -3,45 +3,46 @@ LLM client — the single, authoritative gateway for all LLM calls.
 
 Architecture
 ------------
-Primary provider:  Groq
-  - role="plan"     → llama-3.3-70b-versatile  (or override via ``model`` arg)
-  - role="codegen"  → llama-3.3-70b-versatile  (or override via ``model`` arg)
-  - role="critique" → openai/gpt-oss-120b       (or override via ``model`` arg)
-  - role="observe"  → llama-3.3-70b-versatile  (or override via ``model`` arg)
+Three-tier provider chain with per-role routing::
 
-Fallback provider: Google Gemini (gemini-2.0-flash)
-  - Used automatically when Groq fails after one retry.
+    plan     : Groq → OpenRouter
+    codegen  : Groq (Codestral) → Cerebras → OpenRouter (Codestral)
+    critique : Groq (gpt-oss-120b) → Cerebras (same) → Gemini
+    default  : Groq → OpenRouter
 
-Retry / fallback sequence
---------------------------
-1. Call Groq.
-2. On failure → wait GROQ_RETRY_BACKOFF_SECONDS → retry Groq once.
-3. If retry also fails → fall back to Gemini.
-4. If Gemini also fails → raise LLMUnavailableError.
+Each provider in the chain is retried once (with backoff) before falling to
+the next.  Fallback is triggered on 429, 5xx, timeout, or general SDK error.
+400 and 401 are never retried — they surface immediately.
 
-The ``role`` parameter is used ONLY for structured logging — it does not
-change which provider is called; provider selection is always Groq-first.
-
-Usage
------
-    from agent.llm_client import call_llm
-    response = call_llm("Analyse these rows …", role="critique")
+The ``role`` parameter drives which chain is selected when *model* is None.
+When *model* is provided explicitly, the default chain is used.
 """
 
 from __future__ import annotations
 
+import json as _json
 import logging
 import os
 import time
-from typing import Literal
+import urllib.error
+import urllib.request
+from typing import Any, Callable, Literal
 
 from dotenv import load_dotenv
 
 from agent.config import (
+    CEREBRAS_BASE_URL,
+    CEREBRAS_CODEGEN_FALLBACK_MODEL,
+    CEREBRAS_CRITIQUE_FALLBACK_MODEL,
     GEMINI_FALLBACK_MODEL,
+    GROQ_CODEGEN_MODEL,
     GROQ_CRITIQUE_MODEL,
     GROQ_DEFAULT_MODEL,
-    GROQ_RETRY_BACKOFF_SECONDS,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_CODEGEN_FALLBACK_MODEL,
+    OPENROUTER_PLAN_FALLBACK_MODEL,
+    OPENROUTER_REFERER,
+    RETRY_BACKOFF_SECONDS,
     VALID_ROLES,
 )
 
@@ -58,43 +59,132 @@ Role = Literal["plan", "codegen", "critique", "observe"]
 
 class LLMUnavailableError(RuntimeError):
     """
-    Raised when both Groq and Gemini fail to return a response.
+    Raised when every provider in the chain fails.
 
     Attributes:
-        groq_error:   The exception raised by Groq (after retry).
-        gemini_error: The exception raised by Gemini.
+        errors: List of (provider_name, exception) tuples for each failed level.
     """
 
-    def __init__(
-        self,
-        message: str,
-        groq_error: Exception | None = None,
-        gemini_error: Exception | None = None,
-    ) -> None:
+    def __init__(self, message: str, errors: list[tuple[str, Exception]] | None = None) -> None:
         super().__init__(message)
-        self.groq_error = groq_error
-        self.gemini_error = gemini_error
+        self.errors = errors or []
 
 
 # ---------------------------------------------------------------------------
-# Default model selector
+# Chain builder — per-role routing
 # ---------------------------------------------------------------------------
 
+# A chain level: (provider_label, callable, model_string)
+ChainLevel = tuple[str, Callable[..., str], str]
 
-def _default_model_for_role(role: str) -> str:
+
+def _build_chain(role: str, model_override: str | None) -> list[ChainLevel]:
     """
-    Return the default Groq model identifier for *role*.
+    Build the provider chain for *role*.
 
-    Args:
-        role: One of the defined role constants (``"plan"``, ``"codegen"``,
-              ``"critique"``, ``"observe"``).
+    Each element is ``(provider_name, call_fn, model)``.  The chain runner
+    iterates through levels, retrying each once, until one succeeds.
+    """
+    if role == "plan":
+        return [
+            ("groq", _call_groq, model_override or GROQ_DEFAULT_MODEL),
+            ("openrouter", _call_openrouter, model_override or OPENROUTER_PLAN_FALLBACK_MODEL),
+        ]
+    if role == "codegen":
+        return [
+            ("groq", _call_groq, model_override or GROQ_CODEGEN_MODEL),
+            ("cerebras", _call_cerebras, model_override or CEREBRAS_CODEGEN_FALLBACK_MODEL),
+            ("openrouter", _call_openrouter, model_override or OPENROUTER_CODEGEN_FALLBACK_MODEL),
+        ]
+    if role == "critique":
+        return [
+            ("groq", _call_groq, model_override or GROQ_CRITIQUE_MODEL),
+            ("cerebras", _call_cerebras, model_override or CEREBRAS_CRITIQUE_FALLBACK_MODEL),
+            ("gemini", _call_gemini, model_override or GEMINI_FALLBACK_MODEL),
+        ]
+    # observe and any other role → Groq first, OpenRouter fallback
+    resolved = model_override or GROQ_DEFAULT_MODEL
+    return [
+        ("groq", _call_groq, resolved),
+        ("openrouter", _call_openrouter, resolved),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Retry / fallback logic
+# ---------------------------------------------------------------------------
+
+
+def _should_fallback(exc: Exception) -> bool:
+    """
+    Return True if the exception justifies a retry or provider fallback.
+
+    Falls back on: HTTP 429 (rate-limit), HTTP 5xx (server error),
+    connection timeouts, and generic SDK exceptions.
+    Does NOT fall back on: HTTP 400 (bad request) or HTTP 401/403 (auth).
+    """
+    msg = str(exc).lower()
+    # Catch HTTP errors via urllib
+    if isinstance(exc, urllib.error.HTTPError):
+        code = exc.code
+        return code >= 500 or code == 429
+    # Catch connection / timeout errors
+    if isinstance(exc, (urllib.error.URLError, TimeoutError, OSError)):
+        return True
+    # Groq SDK exceptions surface status codes in messages
+    if any(tag in msg for tag in ("rate limit", "rate_limit", "429", "server error", "503", "502", "500")):
+        return True
+    if any(tag in msg for tag in ("timeout", "timed out", "connection")):
+        return True
+    # 404 model_not_found — the model isn't available on this provider, try next
+    if "404" in msg and "model_not_found" in msg:
+        return True
+    # Other 404s (e.g. wrong endpoint) are config errors
+    if "404" in msg:
+        return False
+    # 400 / 401 / 403 are config/auth errors — do NOT fall back
+    if any(tag in msg for tag in ("400", "401", "403", "invalid api key", "unauthorized")):
+        return False
+    # Default: fall back for unknown errors (safer than silently accepting)
+    return True
+
+
+def _try_with_retry(
+    provider_name: str,
+    call_fn: Callable[..., str],
+    prompt: str,
+    model: str,
+) -> tuple[str | None, Exception | None]:
+    """
+    Call *call_fn* once; on fallback-worthy failure, retry after backoff.
 
     Returns:
-        Groq model identifier string.
+        (result, None) on success, or (None, last_error) on failure.
     """
-    if role == "critique":
-        return GROQ_CRITIQUE_MODEL
-    return GROQ_DEFAULT_MODEL
+    # ── Attempt 1 ──────────────────────────────────────────────────────────
+    try:
+        result = call_fn(prompt, model)
+        logger.info("[call_llm] served by %s model=%s", provider_name, model)
+        return result, None
+    except Exception as exc:  # noqa: BLE001
+        if not _should_fallback(exc):
+            # Auth / config error — surface immediately
+            logger.error("[call_llm] %s fatal error (not retrying): %s", provider_name, exc)
+            return None, exc
+        logger.warning(
+            "[call_llm] %s attempt 1 failed: %s — retrying in %.1fs",
+            provider_name, exc, RETRY_BACKOFF_SECONDS,
+        )
+
+    # ── Attempt 2 (retry) ──────────────────────────────────────────────────
+    time.sleep(RETRY_BACKOFF_SECONDS)
+    try:
+        result = call_fn(prompt, model)
+        logger.info("[call_llm] served by %s (retry) model=%s", provider_name, model)
+        return result, None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[call_llm] %s retry failed: %s", provider_name, exc)
+        return None, exc
 
 
 # ---------------------------------------------------------------------------
@@ -102,28 +192,27 @@ def _default_model_for_role(role: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _call_groq(prompt: str, model: str, api_key: str) -> str:
+def _call_groq(prompt: str, model: str) -> str:
     """
     Send *prompt* to Groq and return the assistant message content.
 
     Args:
-        prompt:  Full prompt string.
-        model:   Groq model identifier.
-        api_key: Groq API key.
+        prompt: Full prompt string.
+        model:  Groq model identifier.
 
     Returns:
         Assistant reply as a plain string.
 
     Raises:
-        Exception: Any Groq SDK or network exception (caller decides retry).
+        RuntimeError: If groq package is not installed.
+        Exception:    Any Groq SDK or network error.
     """
     try:
         from groq import Groq  # type: ignore[import-untyped]
     except ImportError as exc:
-        raise RuntimeError(
-            "groq package not installed. Run: uv add groq"
-        ) from exc
+        raise RuntimeError("groq package not installed. Run: uv add groq") from exc
 
+    api_key = os.environ.get("GROQ_API_KEY", "")
     client = Groq(api_key=api_key)
     response = client.chat.completions.create(
         model=model,
@@ -134,31 +223,109 @@ def _call_groq(prompt: str, model: str, api_key: str) -> str:
     return (content or "").strip()
 
 
-def _call_gemini(prompt: str, model: str, api_key: str) -> str:
+def _call_cerebras(prompt: str, model: str) -> str:
     """
-    Send *prompt* to Google Gemini and return the text response.
+    Send *prompt* to Cerebras (OpenAI-compatible) and return the response.
+
+    Uses the cerebras-cloud-sdk which is OpenAI-compatible.
 
     Args:
-        prompt:  Full prompt string.
-        model:   Gemini model identifier.
-        api_key: Google Gemini API key.
+        prompt: Full prompt string.
+        model:  Cerebras model identifier.
 
     Returns:
         Model reply as a plain string.
 
     Raises:
-        Exception: Any Gemini SDK or network exception.
+        RuntimeError: If cerebras-cloud-sdk is not installed.
+        Exception:    Any SDK or network error.
     """
     try:
-        import google.generativeai as genai  # type: ignore[import-untyped]
+        from cerebras.cloud.sdk import Cerebras  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise RuntimeError("cerebras-cloud-sdk not installed. Run: uv add cerebras-cloud-sdk") from exc
+
+    api_key = os.environ.get("CEREBRAS_API_KEY", "")
+    client = Cerebras(api_key=api_key)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    content = response.choices[0].message.content
+    return (content or "").strip()
+
+
+def _call_openrouter(prompt: str, model: str) -> str:
+    """
+    Send *prompt* to OpenRouter (OpenAI-compatible HTTP API) and return the response.
+
+    Uses stdlib urllib — no extra SDK required.
+
+    Args:
+        prompt: Full prompt string.
+        model:  OpenRouter model identifier (e.g. "mistralai/codestral-2501:free").
+
+    Returns:
+        Model reply as a plain string.
+
+    Raises:
+        RuntimeError: If OPENROUTER_API_KEY is not set.
+        urllib.error.HTTPError: On HTTP errors.
+        urllib.error.URLError:  On connection errors.
+    """
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY not set in environment")
+
+    payload = _json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{OPENROUTER_BASE_URL}/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": OPENROUTER_REFERER,
+        },
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        body = _json.loads(resp.read())
+        content = body["choices"][0]["message"]["content"]
+        return (content or "").strip()
+
+
+def _call_gemini(prompt: str, model: str) -> str:
+    """
+    Send *prompt* to Google Gemini and return the text response.
+
+    Args:
+        prompt: Full prompt string.
+        model:  Gemini model identifier.
+
+    Returns:
+        Model reply as a plain string.
+
+    Raises:
+        RuntimeError: If google-genai is not installed.
+        Exception:    Any Gemini SDK or network exception.
+    """
+    try:
+        from google import genai
     except ImportError as exc:
         raise RuntimeError(
-            "google-generativeai not installed. Run: uv add google-generativeai"
+            "google-genai not installed. Run: uv add google-genai"
         ) from exc
 
-    genai.configure(api_key=api_key)
-    model_client = genai.GenerativeModel(model)
-    response = model_client.generate_content(prompt)
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(model=model, contents=prompt)
     return (response.text or "").strip()
 
 
@@ -175,99 +342,54 @@ def call_llm(
     """
     Send *prompt* to the best-available LLM and return the response.
 
-    Provider selection follows the Groq-first, Gemini-fallback policy:
+    Provider chain depends on *role* (see module docstring).  Each level is
+    retried once with backoff before falling to the next level.  If every
+    provider in the chain fails, :class:`LLMUnavailableError` is raised.
 
-    1. Call Groq with the resolved model.
-    2. On any failure: wait :data:`~agent.config.GROQ_RETRY_BACKOFF_SECONDS`,
-       then retry Groq once.
-    3. If retry also fails: fall back to Gemini
-       (:data:`~agent.config.GEMINI_FALLBACK_MODEL`).
-    4. If Gemini also fails: raise :class:`LLMUnavailableError`.
-
-    The ``role`` parameter is used only for structured log output so that
-    log consumers can see which pipeline stage made each call. It does NOT
-    change which provider or model is selected (use ``model`` for that).
+    When *model* is provided, it overrides the default model for every level
+    in the chain.  The chain itself is determined by *role*.
 
     Args:
-        prompt: The complete prompt to send (caller builds the full message).
-        role:   Pipeline stage label for logging — one of ``"plan"``,
-                ``"codegen"``, ``"critique"``, ``"observe"``.
-        model:  Optional Groq model override. When ``None``, the default for
-                *role* is used (see :func:`_default_model_for_role`).
+        prompt: The complete prompt to send.
+        role:   Pipeline stage label — one of ``"plan"``, ``"codegen"``,
+                ``"critique"``, ``"observe"``.
+        model:  Optional model override for all chain levels.
 
     Returns:
         The LLM's response as a plain string.
 
     Raises:
-        ValueError: If *role* is not a recognised value.
-        LLMUnavailableError: If both Groq and Gemini fail.
+        ValueError:            If *role* is not a recognised value.
+        LLMUnavailableError:   If every provider in the chain fails.
     """
     if role not in VALID_ROLES:
         raise ValueError(
             f"role must be one of {sorted(VALID_ROLES)}, got {role!r}"
         )
 
-    groq_api_key = os.environ.get("GROQ_API_KEY", "")
-    gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
-    resolved_model = model or _default_model_for_role(role)
+    chain = _build_chain(role, model)
+    resolved_model = model or chain[0][2]
 
     logger.info(
-        "[call_llm] role=%s model=%s prompt_chars=%d",
+        "[call_llm] role=%s model=%s prompt_chars=%d providers=%s",
         role,
         resolved_model,
         len(prompt),
+        "→".join(name for name, _, _ in chain),
     )
 
-    # ── Groq attempt 1 ───────────────────────────────────────────────────────
-    groq_error: Exception | None = None
-    try:
-        result = _call_groq(prompt, resolved_model, groq_api_key)
-        logger.info("[call_llm] served by groq model=%s role=%s", resolved_model, role)
-        return result
-    except Exception as exc:  # noqa: BLE001
-        groq_error = exc
-        logger.warning(
-            "[call_llm] Groq attempt 1 failed (role=%s): %s — retrying in %.1fs",
-            role,
-            exc,
-            GROQ_RETRY_BACKOFF_SECONDS,
-        )
-
-    # ── Groq retry (attempt 2) ────────────────────────────────────────────────
-    time.sleep(GROQ_RETRY_BACKOFF_SECONDS)
-    try:
-        result = _call_groq(prompt, resolved_model, groq_api_key)
-        logger.info(
-            "[call_llm] served by groq (retry) model=%s role=%s", resolved_model, role
-        )
-        return result
-    except Exception as exc:  # noqa: BLE001
-        groq_error = exc
-        logger.warning(
-            "[call_llm] Groq retry failed (role=%s): %s — falling back to Gemini",
-            role,
-            exc,
-        )
-
-    # ── Gemini fallback ───────────────────────────────────────────────────────
-    gemini_error: Exception | None = None
-    try:
-        result = _call_gemini(prompt, GEMINI_FALLBACK_MODEL, gemini_api_key)
-        logger.info(
-            "[call_llm] served by gemini (fallback) model=%s role=%s",
-            GEMINI_FALLBACK_MODEL,
-            role,
-        )
-        return result
-    except Exception as exc:  # noqa: BLE001
-        gemini_error = exc
-        logger.error(
-            "[call_llm] Gemini fallback also failed (role=%s): %s", role, exc
-        )
+    errors: list[tuple[str, Exception]] = []
+    for provider_name, call_fn, provider_model in chain:
+        result, error = _try_with_retry(provider_name, call_fn, prompt, provider_model)
+        if result is not None:
+            return result
+        if error is not None:
+            errors.append((provider_name, error))
+        # If the error isn't fallback-worthy (auth), the helper returned it
+        # but we still try next providers in case one has valid credentials.
 
     raise LLMUnavailableError(
-        f"Both Groq and Gemini failed for role={role!r}. "
-        f"Groq: {groq_error}. Gemini: {gemini_error}.",
-        groq_error=groq_error,
-        gemini_error=gemini_error,
+        f"All providers failed for role={role!r}. "
+        + "; ".join(f"{n}: {e}" for n, e in errors),
+        errors=errors,
     )

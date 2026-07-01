@@ -22,18 +22,21 @@ the pipeline advances, catching errors that the generator would silently miss
 git clone <your-repo-url>
 cd AutoAnalyst
 
-# 2. Install dependencies
-uv add groq google-generativeai python-dotenv pandas numpy pytest pytest-mock
+# 2. Install dependencies (use your package manager of choice)
+pip install -r requirements.txt
 
-# 3. Set up your API keys
+# 3. Run the demo (requires API keys)
+python run_demo.py
+
+# 4. (Optional) Set up API keys for a live run
 cp .env.example .env
 # Edit .env and add your GROQ_API_KEY and GEMINI_API_KEY
 
-# 4. Generate synthetic data
-python data/generate_data.py
+# 5. Run the agent in dry-run mode (no API keys needed)
+python main.py --dry-run
 
-# 5. Run the agent (dry-run, no API keys needed)
-python main.py --dry-run --verbose
+# 6. Or use the demo script in dry-run mode
+python run_demo.py
 
 # 6. Run tests
 uv run pytest tests/ -v

@@ -62,13 +62,15 @@ Each task object must have these fields:
                        task returns only a scalar, string, or ranked list — not a DataFrame.
   "consumes_artifacts": A JSON array of artifact names from PRIOR tasks this task will
                         use (e.g. ["quarter_df"]). Empty array [] if none.
+      "output_schema":     A JSON array of expected output columns, or ["<scalar>"] for
+                            scalar answers.
 
 Return ONLY a JSON array of task objects. No explanation, no markdown fences.
 Example:
 [
-  {{"question": "Filter df to the last quarter and return the filtered DataFrame", "produces_artifact": "quarter_df", "consumes_artifacts": []}},
-  {{"question": "What is the total revenue by region in the last quarter?", "produces_artifact": "region_revenue", "consumes_artifacts": ["quarter_df"]}},
-  {{"question": "Which region has the highest total revenue?", "produces_artifact": null, "consumes_artifacts": ["region_revenue"]}}
+  {{"question": "Filter df to the last quarter and return the filtered DataFrame", "produces_artifact": "quarter_df", "consumes_artifacts": [], "output_schema": ["transaction_id", "date", "region", "product_category", "units_sold", "unit_price", "revenue"]}},
+  {{"question": "What is the total revenue by region in the last quarter?", "produces_artifact": "region_revenue", "consumes_artifacts": ["quarter_df"], "output_schema": ["region", "total_revenue"]}},
+  {{"question": "Which region has the highest total revenue?", "produces_artifact": null, "consumes_artifacts": ["region_revenue"], "output_schema": ["<scalar>"]}}
 ]
 
 JSON array:"""
