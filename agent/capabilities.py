@@ -74,24 +74,30 @@ class CapabilityRegistry:
         scored: list[tuple[int, Capability]] = []
         for capability in self._capabilities.values():
             score = 0
-            capability_text = " ".join(
-                (capability.capability_id, *capability.match_terms)
-            ).lower()
-            for term in capability_text.split():
-                if term and term in text:
-                    score += 1
+            
+            # Reject if the task does NOT expect an artifact, but the capability produces one
+            if not task.produces_artifact and capability.produced_artifacts:
+                continue
+
+            for term in capability.match_terms:
+                if term.lower() in text:
+                    score += 3
             if (
                 task.produces_artifact
                 and task.produces_artifact in capability.produced_artifacts
             ):
-                score += 3
+                score += 5
             if any(
                 required in task.consumes_artifacts
                 for required in capability.required_artifacts
             ):
                 score += 2
             if capability.capability_id.lower() in text:
-                score += 4
+                score += 10
+                
+            if task.output_schema and list(capability.output_schema) == task.output_schema:
+                score += 10
+
             if score > 0:
                 scored.append((score, capability))
         if not scored:
@@ -276,6 +282,53 @@ def execute_category_aggregation(
     )
 
 
+def execute_average_unit_price(
+    context: CapabilityExecutionContext,
+) -> DeterministicExecutionResult:
+    quarter_df = _determine_scope_df(context, "quarter_df")
+    avg_price = (
+        quarter_df.groupby("product_category", as_index=False)["unit_price"]
+        .mean()
+        .round(2)
+        .rename(columns={"unit_price": "average_price"})
+        .sort_values("average_price", ascending=False)
+        .reset_index(drop=True)
+    )
+    return DeterministicExecutionResult(
+        success=True,
+        result=avg_price.head().to_string(index=False),
+        stdout="",
+        error=None,
+        error_type=None,
+        error_category="none",
+        artifact=avg_price,
+        artifact_key=context.task.produces_artifact or "average_prices",
+    )
+
+
+def execute_top_selling_product_category(
+    context: CapabilityExecutionContext,
+) -> DeterministicExecutionResult:
+    quarter_df = _determine_scope_df(context, "quarter_df")
+    top_selling = (
+        quarter_df.groupby("product_category", as_index=False)["units_sold"]
+        .sum()
+        .rename(columns={"units_sold": "total_units_sold"})
+        .sort_values("total_units_sold", ascending=False)
+        .reset_index(drop=True)
+    )
+    return DeterministicExecutionResult(
+        success=True,
+        result=top_selling.head().to_string(index=False),
+        stdout="",
+        error=None,
+        error_type=None,
+        error_category="none",
+        artifact=top_selling,
+        artifact_key=context.task.produces_artifact or "top_selling_category",
+    )
+
+
 def build_default_capability_registry() -> CapabilityRegistry:
     registry = CapabilityRegistry()
     registry.register(
@@ -348,6 +401,30 @@ def build_default_capability_registry() -> CapabilityRegistry:
             output_schema=("product_category", "total_revenue"),
             executor=execute_category_aggregation,
             match_terms=("category", "product category", "category aggregation"),
+        )
+    )
+    registry.register(
+        Capability(
+            capability_id="AverageUnitPrice",
+            description="Compute the average unit price by product category.",
+            required_artifacts=("quarter_df",),
+            produced_artifacts=("average_prices",),
+            input_schema=("product_category", "unit_price"),
+            output_schema=("product_category", "average_price"),
+            executor=execute_average_unit_price,
+            match_terms=("average price", "unit price", "mean price"),
+        )
+    )
+    registry.register(
+        Capability(
+            capability_id="TopSellingProductCategory",
+            description="Find the product category with the highest units sold.",
+            required_artifacts=("quarter_df",),
+            produced_artifacts=("top_selling_category",),
+            input_schema=("product_category", "units_sold"),
+            output_schema=("product_category", "total_units_sold"),
+            executor=execute_top_selling_product_category,
+            match_terms=("top selling", "most units sold", "highest volume"),
         )
     )
     return registry

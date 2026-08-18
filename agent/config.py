@@ -8,11 +8,10 @@ Import from this module rather than hardcoding values elsewhere.
 # ── Groq models ───────────────────────────────────────────────────────────────
 
 # Default model for PLAN and OBSERVE stages
-GROQ_DEFAULT_MODEL: str = "llama-3.3-70b-versatile"
+GROQ_DEFAULT_MODEL: str = "openai/gpt-oss-120b"
 
-# Model for CODE-GEN stage — llama-3.3-70b-versatile (free tier)
-# Codestral is not available on Groq's free tier; use OpenRouter for Codestral.
-GROQ_CODEGEN_MODEL: str = "llama-3.3-70b-versatile"
+# Model for CODE-GEN stage
+GROQ_CODEGEN_MODEL: str = "openai/gpt-oss-120b"
 
 # Model for the CRITIQUE stage — a stronger model for independent auditing
 GROQ_CRITIQUE_MODEL: str = "openai/gpt-oss-120b"

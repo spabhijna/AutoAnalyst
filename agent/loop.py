@@ -37,6 +37,7 @@ import pandas as pd
 
 from agent import config
 from agent.artifact_store import ArtifactStore
+from agent.runtime import AnalysisRuntime
 from agent.capabilities import CapabilityRegistry
 from agent.execution_engine import ExecutionEngine
 from agent.execution_graph import ExecutionGraph
@@ -58,10 +59,12 @@ from agent.state import (
     ExecutionDifficulty,
     Finding,
     TaskNode,
+    TaskStatus,
     TaskMemory,
     WorkingMemory,
     utc_now_iso,
 )
+from agent.validator import CapabilityValidator
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +126,8 @@ class AgentRun:
         plan_revisions:       Count of plan revisions so far (capped at MAX_PLAN_REVISIONS).
         summary:              Final LLM-generated summary (populated at end of run).
         log_dir:              Directory where JSONL logs are written.
+        runtime:              Phase-1 persistent AnalysisRuntime (owns the
+                              ArtifactRegistry and the persistent namespace).
     """
 
     goal: str
@@ -145,6 +150,9 @@ class AgentRun:
         default_factory=EnvironmentManifest
     )
     task_memories: dict[str, TaskMemory] = field(default_factory=dict)
+    # Phase-1: AnalysisRuntime is now the primary artifact authority.
+    # artifact_store is kept as a backward-compat shim (populated from runtime).
+    runtime: AnalysisRuntime | None = None  # set in run() after df is known
     artifact_store: ArtifactStore = field(default_factory=ArtifactStore)
     capability_registry: CapabilityRegistry = field(
         default_factory=lambda: ExecutionEngine().registry
@@ -239,6 +247,9 @@ def run(
         log_dir=log_dir,
         max_retries_per_step=max_retries_per_step,
     )
+    # Phase-1: initialise the persistent runtime.  One runtime per run.
+    state.runtime = AnalysisRuntime(df)
+    logger.debug("AnalysisRuntime initialised for run_id=%s", state.run_id)
 
     logger.info("=== AgentRun start: run_id=%s ===", state.run_id)
     print(f"\n{'=' * 60}")
@@ -539,6 +550,23 @@ def _run_question(
             extracted_df = sandbox_result.get("artifact")
             if isinstance(extracted_df, pd.DataFrame):
                 finding.produced_artifact_name = task.produces_artifact
+                # Phase-1: capture into runtime registry under stable ID.
+                if state.runtime is not None:
+                    state.runtime.capture_result(
+                        task_id=task.task_id,
+                        value=extracted_df,
+                        variable_name=task.produces_artifact,
+                    )
+                    # Keep artifact_store in sync for backward compat.
+                    state.artifact_store.register(
+                        key=task.produces_artifact,
+                        df=extracted_df,
+                        producing_task_id=task.task_id,
+                        consumers=state.execution_graph.consumers_for(
+                            task.produces_artifact
+                        ),
+                        confidence="high",
+                    )
                 _sync_artifact_consumers(state)
         return False
 
@@ -580,6 +608,21 @@ def _run_question(
                 print(f"    | {ln}")
 
         error_category = sandbox_result.get("error_category", "none")
+
+        if sandbox_result["success"]:
+            semantic_validation = CapabilityValidator().validate_semantic_contract(
+                task.task_id, 
+                sandbox_result.get("artifact"), 
+                sandbox_result.get("result"), 
+                state.artifact_store.as_namespace()
+            )
+            if not semantic_validation.success:
+                sandbox_result["success"] = False
+                sandbox_result["error"] = "Semantic Validation Failed: " + "; ".join(semantic_validation.reasons)
+                sandbox_result["error_category"] = "logic_error"
+                error_category = "logic_error"
+                had_execution_errors = True
+                print(f"    ✗ Semantic error: {sandbox_result['error']}")
 
         # ── OBSERVE ───────────────────────────────────────────────────────────
         # Deterministic data-quality checks on the live DataFrame BEFORE critique.
@@ -679,6 +722,14 @@ def _run_question(
             if task.produces_artifact:
                 extracted_df = sandbox_result.get("artifact")
                 if isinstance(extracted_df, pd.DataFrame):
+                    # Phase-1: capture into runtime registry under stable ID.
+                    if state.runtime is not None:
+                        state.runtime.capture_result(
+                            task_id=task.task_id,
+                            value=extracted_df,
+                            variable_name=task.produces_artifact,
+                        )
+                    # Keep artifact_store in sync for backward compat.
                     registered = state.artifact_store.register(
                         key=task.produces_artifact,
                         df=extracted_df,
@@ -702,6 +753,13 @@ def _run_question(
                             task.task_id,
                             task.produces_artifact,
                         )
+
+            # Phase-1: merge sandbox-produced variables into runtime namespace
+            # so subsequent steps can access them naturally.
+            if state.runtime is not None:
+                new_vars = sandbox_result.get("new_variables") or {}
+                if new_vars:
+                    state.runtime.update_namespace(new_vars)
 
             return False  # move to next sub-question
 
@@ -743,7 +801,6 @@ def _do_codegen(
         state.goal,
         sub_question,
         state.schema_summary,
-        completed_findings=_build_working_memory_prompt(state),
         environment_manifest=state.environment_manifest.as_prompt_text(),
         task_constraints=task_memory.as_prompt_text(),
         available_artifacts=state.artifact_store.describe(),
@@ -764,7 +821,6 @@ def _do_repair(
         state.goal,
         sub_question,
         state.schema_summary,
-        completed_findings=_build_working_memory_prompt(state),
         environment_manifest=state.environment_manifest.as_prompt_text(),
         task_constraints=task_memory.as_prompt_text(),
         previous_code=previous_code,

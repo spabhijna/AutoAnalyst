@@ -256,6 +256,19 @@ def _worker(
                 except Exception:  # noqa: BLE001
                     pass  # silently skip oversized or un-picklable artifacts
 
+        # ── New variable capture (Phase-1) ────────────────────────────────────
+        # Collect every name that the executed code wrote into local_ns.
+        # Protected names (result, _*) and the sandbox globals are excluded.
+        # This dict is returned to the caller so the runtime can absorb new
+        # variables into its persistent namespace without relying on the LLM
+        # to use any particular variable name.
+        _protected = {"result", "pd", "np", "df", "artifacts", "__builtins__"}
+        new_variables: dict[str, Any] = {
+            k: v
+            for k, v in local_ns.items()
+            if k not in _protected and not k.startswith("_")
+        }
+
         result_queue.put(
             {
                 "success": True,
@@ -266,6 +279,7 @@ def _worker(
                 "error_category": "none",
                 "artifact": extracted_artifact,
                 "artifact_key": extract_artifact,
+                "new_variables": new_variables,
             }
         )
     except Exception as exc:  # noqa: BLE001
@@ -292,6 +306,7 @@ def _worker(
                 else "execution_error",
                 "artifact": None,
                 "artifact_key": extract_artifact,
+                "new_variables": {},
             }
         )
     finally:
@@ -402,6 +417,7 @@ def run_sandboxed(
             "error_category": "execution_error",
             "artifact": None,
             "artifact_key": extract_artifact,
+            "new_variables": {},
         }
 
     # Pickle the artifacts dict for inter-process transfer
@@ -442,6 +458,7 @@ def run_sandboxed(
             "error_category": "execution_error",
             "artifact": None,
             "artifact_key": extract_artifact,
+            "new_variables": {},
         }
 
     # Retrieve result from the queue
@@ -461,4 +478,5 @@ def run_sandboxed(
         "error_category": "execution_error",
         "artifact": None,
         "artifact_key": extract_artifact,
+        "new_variables": {},
     }

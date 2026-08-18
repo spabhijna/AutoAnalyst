@@ -56,34 +56,23 @@ class ExecutionEngine:
         )
         context_validation = self.validator.validate_context(capability, context)
         if not context_validation.success:
-            return {
-                "success": False,
-                "result": None,
-                "stdout": "",
-                "error": "; ".join(context_validation.reasons),
-                "error_type": "CapabilityValidationError",
-                "error_category": "logic_error",
-                "artifact": None,
-                "artifact_key": task.produces_artifact,
-            }
+            return None
+            
         result = capability.executor(context)
         if not result.success:
-            return result.to_sandbox_result()
+            return None
 
         output_validation = self.validator.validate_output(
             capability, task, context, result.artifact
         )
         if not output_validation.success:
-            return {
-                "success": False,
-                "result": None,
-                "stdout": result.stdout,
-                "error": "; ".join(output_validation.reasons),
-                "error_type": "CapabilityOutputValidationError",
-                "error_category": "logic_error",
-                "artifact": None,
-                "artifact_key": task.produces_artifact or result.artifact_key,
-            }
+            return None
+
+        semantic_validation = self.validator.validate_semantic_contract(
+            task.task_id, result.artifact, result.result, artifact_store.as_namespace()
+        )
+        if not semantic_validation.success:
+            return None
 
         if capability.produced_artifacts and result.artifact is not None:
             artifact_key = (

@@ -57,6 +57,7 @@ RESULT_KEYS = {
     "error_category",
     "artifact",
     "artifact_key",
+    "new_variables",
 }
 
 

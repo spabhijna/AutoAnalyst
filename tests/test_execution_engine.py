@@ -62,7 +62,7 @@ def test_engine_reuses_region_artifact() -> None:
         provenance=["seed"],
     )
     task = TaskNode(
-        task_id="step_2",
+        task_id="mock_step",
         question="What is the total revenue by region in the last quarter?",
         capability="GroupRevenueByRegion",
         produces_artifact="region_revenue",
@@ -154,7 +154,7 @@ def test_engine_rejects_output_schema_mismatch() -> None:
         )
     )
     task = TaskNode(
-        task_id="step_2",
+        task_id="mock_step_2",
         question="What is the total revenue by region in the last quarter?",
         capability="BadCapability",
         produces_artifact="region_revenue",
@@ -163,6 +163,4 @@ def test_engine_rejects_output_schema_mismatch() -> None:
 
     result = engine.execute(task, df, store)
 
-    assert result is not None
-    assert result["success"] is False
-    assert result["error_type"] == "CapabilityOutputValidationError"
+    assert result is None

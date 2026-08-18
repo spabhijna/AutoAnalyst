@@ -129,7 +129,6 @@ def codegen_prompt(
     goal: str,
     sub_question: str,
     schema_summary: str,
-    completed_findings: str = "",
     environment_manifest: str = "",
     task_constraints: str = "",
     available_artifacts: str = "",
@@ -141,7 +140,6 @@ def codegen_prompt(
         goal:               The original analytical goal.
         sub_question:       The specific sub-question to answer.
         schema_summary:     Dataset schema with pre-computed date constants.
-        completed_findings: High-confidence validated findings from prior steps.
         environment_manifest: Sandbox capabilities and constraints.
         task_constraints:   Accumulated per-task constraints from failed retries.
         available_artifacts: Human-readable description of pre-validated DataFrames
@@ -163,9 +161,6 @@ DATASET SCHEMA:
 {artifacts_section}
 ORIGINAL ANALYTICAL GOAL:
 {goal}
-
-PREVIOUSLY ACCEPTED FINDINGS:
-{completed_findings if completed_findings else "(none yet)"}
 
 CUMULATIVE TASK CONSTRAINTS (Do not violate these):
 {task_constraints}
@@ -210,7 +205,6 @@ def repair_prompt(
     goal: str,
     sub_question: str,
     schema_summary: str,
-    completed_findings: str,
     environment_manifest: str,
     task_constraints: str,
     previous_code: str,
@@ -224,7 +218,6 @@ def repair_prompt(
         goal:               The original analytical goal.
         sub_question:       The specific sub-question to answer.
         schema_summary:     Dataset schema with pre-computed date constants.
-        completed_findings: High-confidence validated findings from prior steps.
         environment_manifest: Sandbox capabilities and constraints.
         task_constraints:   Accumulated per-task constraints.
         previous_code:      The code from the last failed attempt.
@@ -247,9 +240,6 @@ DATASET SCHEMA:
 {artifacts_section}
 ORIGINAL ANALYTICAL GOAL:
 {goal}
-
-PREVIOUSLY ACCEPTED FINDINGS:
-{completed_findings if completed_findings else "(none yet)"}
 
 CUMULATIVE TASK CONSTRAINTS (Do not violate these):
 {task_constraints}
@@ -528,18 +518,12 @@ STRICT REPORTING RULES:
 7. GROUNDING REQUIREMENT: Every factual claim must be derivable from exactly one
    finding in the FINAL RESULTS JSON. Do not synthesise claims that combine multiple
    findings into a single assertion that none of them individually supports.
-8. RECOMMENDATION GROUNDING: Include an actionable recommendation only if a specific
-   finding's answer explicitly supports it. If no finding provides causal evidence for
-   a recommendation, omit the recommendation section entirely. Do not fabricate
-   generic business advice.
 
 Write a concise analytical summary (150-300 words) that:
 1. Directly answers the original goal using the findings above.
 2. Quantifies claims where possible (use the actual numbers from results).
 3. Explicitly flags findings whose trust field is exactly "low".
 4. Notes any gaps — sub-questions with no result.
-5. If and only if the data explicitly supports a causal conclusion, ends with one
-   actionable recommendation grounded in a specific finding.
 
 Do not hedge everything — be direct. If the data clearly shows X, say "The data shows X."
 

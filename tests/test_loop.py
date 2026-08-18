@@ -732,7 +732,6 @@ class TestPromptTemplates:
             "goal",
             "Q?",
             "schema",
-            completed_findings="",
             environment_manifest="",
             task_constraints="",
             previous_code="result = bad()",
@@ -741,16 +740,15 @@ class TestPromptTemplates:
         assert "nulls ignored" in p
         assert "result = bad()" in p
 
-    def test_codegen_prompt_includes_goal_scope_and_findings(self) -> None:
+    def test_codegen_prompt_includes_goal_scope_and_artifacts(self) -> None:
         p = codegen_prompt(
             "Explain revenue over the last quarter.",
             "Which region is top?",
             "schema",
-            completed_findings="• Revenue by region: {'West': 10, 'South': 9}",
+            available_artifacts="- quarter_df: 100 rows",
         )
         assert "last quarter" in p.lower()
-        assert "Previously accepted findings".lower() in p.lower()
-        assert "West" in p
+        assert "quarter_df" in p
 
     def test_critique_prompt_contains_checklist_items(self) -> None:
         sandbox_result = _ok_sandbox()
