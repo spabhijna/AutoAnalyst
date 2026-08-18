@@ -75,4 +75,6 @@ ROLE_CODEGEN: str = "codegen"
 ROLE_CRITIQUE: str = "critique"
 ROLE_OBSERVE: str = "observe"
 
-VALID_ROLES: frozenset[str] = frozenset({ROLE_PLAN, ROLE_CODEGEN, ROLE_CRITIQUE, ROLE_OBSERVE})
+VALID_ROLES: frozenset[str] = frozenset(
+    {ROLE_PLAN, ROLE_CODEGEN, ROLE_CRITIQUE, ROLE_OBSERVE}
+)

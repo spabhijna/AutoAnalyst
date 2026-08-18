@@ -57,7 +57,9 @@ class ExecutionGraph:
         return ready[0] if ready else None
 
     def all_completed(self) -> bool:
-        return all(task.status in {"accepted", "failed", "skipped"} for task in self.tasks)
+        return all(
+            task.status in {"accepted", "failed", "skipped"} for task in self.tasks
+        )
 
     def artifact_consumers(self) -> dict[str, list[str]]:
         """Return artifact name → downstream task IDs that consume it."""

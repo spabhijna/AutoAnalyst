@@ -145,9 +145,16 @@ class EvalReport:
         lines.append("")
         lines.append("  ── Per-Category Details ──")
         for name, cat in sorted(self.categories.items()):
-            status = "✅" if cat.is_true_positive else (
-                "⚠️ FP" if cat.is_false_positive else
-                "❌ FN" if cat.is_false_negative else "—"
+            status = (
+                "✅"
+                if cat.is_true_positive
+                else (
+                    "⚠️ FP"
+                    if cat.is_false_positive
+                    else "❌ FN"
+                    if cat.is_false_negative
+                    else "—"
+                )
             )
             lines.append(
                 f"  {status} {name}: "
@@ -164,9 +171,7 @@ class EvalReport:
 # ---------------------------------------------------------------------------
 
 
-def _check_duplicates(
-    report, manifest: dict[str, Any]
-) -> CategoryResult:
+def _check_duplicates(report, manifest: dict[str, Any]) -> CategoryResult:
     """Check duplicate transaction ID detection against manifest."""
     dupes_manifest = manifest.get("duplicated_transaction_ids", {})
     n_injected = len(dupes_manifest)
@@ -180,9 +185,7 @@ def _check_duplicates(
     )
 
 
-def _check_nulls(
-    report, manifest: dict[str, Any]
-) -> CategoryResult:
+def _check_nulls(report, manifest: dict[str, Any]) -> CategoryResult:
     """Check null revenue detection against manifest."""
     null_manifest = manifest.get("null_revenue_indices", [])
     n_injected = len(null_manifest)
@@ -196,14 +199,10 @@ def _check_nulls(
     )
 
 
-def _check_negative_revenue(
-    report, manifest: dict[str, Any]
-) -> CategoryResult:
+def _check_negative_revenue(report, manifest: dict[str, Any]) -> CategoryResult:
     """Check negative revenue detection against manifest."""
     impossible = manifest.get("impossible_rows", [])
-    n_injected = sum(
-        1 for r in impossible if r.get("type") == "negative_revenue"
-    )
+    n_injected = sum(1 for r in impossible if r.get("type") == "negative_revenue")
     n_detected = report.negative_revenue_rows
     return CategoryResult(
         name="negative_revenue",
@@ -232,14 +231,10 @@ def _check_zero_units_positive_revenue(
     )
 
 
-def _check_outliers(
-    report, manifest: dict[str, Any]
-) -> CategoryResult:
+def _check_outliers(report, manifest: dict[str, Any]) -> CategoryResult:
     """Check IQR outlier detection against manifest."""
     impossible = manifest.get("impossible_rows", [])
-    n_injected = sum(
-        1 for r in impossible if r.get("type") == "revenue_outlier_50x"
-    )
+    n_injected = sum(1 for r in impossible if r.get("type") == "revenue_outlier_50x")
     n_detected = len(report.revenue_outliers_iqr)
     return CategoryResult(
         name="revenue_outlier",
@@ -309,12 +304,8 @@ def evaluate(
         else 0.0
     )
 
-    total_manifest = sum(
-        c.manifest_count for c in categories.values()
-    )
-    total_detected = sum(
-        c.observer_count for c in categories.values()
-    )
+    total_manifest = sum(c.manifest_count for c in categories.values())
+    total_detected = sum(c.observer_count for c in categories.values())
 
     # Pipeline resilience from AgentRun state
     pipeline_aborted = False

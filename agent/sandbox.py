@@ -83,24 +83,72 @@ _SAFE_BUILTINS: dict[str, Any] = {
     )
     for name in (
         # numeric / math
-        "abs", "divmod", "max", "min", "pow", "round", "sum",
+        "abs",
+        "divmod",
+        "max",
+        "min",
+        "pow",
+        "round",
+        "sum",
         # type constructors
-        "bool", "bytes", "complex", "dict", "float", "frozenset",
-        "int", "list", "set", "str", "tuple",
+        "bool",
+        "bytes",
+        "complex",
+        "dict",
+        "float",
+        "frozenset",
+        "int",
+        "list",
+        "set",
+        "str",
+        "tuple",
         # itertools-adjacent
-        "all", "any", "enumerate", "filter", "iter", "len",
-        "map", "next", "range", "reversed", "sorted", "zip",
+        "all",
+        "any",
+        "enumerate",
+        "filter",
+        "iter",
+        "len",
+        "map",
+        "next",
+        "range",
+        "reversed",
+        "sorted",
+        "zip",
         # inspection / formatting
-        "bin", "chr", "dir", "format", "getattr", "hasattr",
-        "hash", "hex", "id", "isinstance", "issubclass", "oct",
-        "ord", "repr", "type", "vars",
+        "bin",
+        "chr",
+        "dir",
+        "format",
+        "getattr",
+        "hasattr",
+        "hash",
+        "hex",
+        "id",
+        "isinstance",
+        "issubclass",
+        "oct",
+        "ord",
+        "repr",
+        "type",
+        "vars",
         # exceptions
-        "Exception", "ValueError", "TypeError", "KeyError",
-        "IndexError", "AttributeError", "RuntimeError",
-        "StopIteration", "NotImplementedError", "ArithmeticError",
-        "ZeroDivisionError", "OverflowError",
+        "Exception",
+        "ValueError",
+        "TypeError",
+        "KeyError",
+        "IndexError",
+        "AttributeError",
+        "RuntimeError",
+        "StopIteration",
+        "NotImplementedError",
+        "ArithmeticError",
+        "ZeroDivisionError",
+        "OverflowError",
         # constants
-        "True", "False", "None",
+        "True",
+        "False",
+        "None",
         # printing (output captured)
         "print",
     )
@@ -146,16 +194,18 @@ def _worker(
     try:
         df = pickle.loads(df_pickle)  # noqa: S301
     except Exception as exc:  # noqa: BLE001
-        result_queue.put({
-            "success": False,
-            "result": None,
-            "stdout": "",
-            "error": f"DataFrame deserialization failed: {exc}",
-            "error_type": type(exc).__name__,
-            "error_category": "execution_error",
-            "artifact": None,
-            "artifact_key": extract_artifact,
-        })
+        result_queue.put(
+            {
+                "success": False,
+                "result": None,
+                "stdout": "",
+                "error": f"DataFrame deserialization failed: {exc}",
+                "error_type": type(exc).__name__,
+                "error_category": "execution_error",
+                "artifact": None,
+                "artifact_key": extract_artifact,
+            }
+        )
         return
 
     # Reconstruct artifacts dict — empty dict if not provided
@@ -172,7 +222,7 @@ def _worker(
         "df": df,
         "pd": pd,
         "np": np,
-        "artifacts": artifacts,   # pre-validated DataFrames from ArtifactStore
+        "artifacts": artifacts,  # pre-validated DataFrames from ArtifactStore
     }
     local_ns: dict[str, Any] = {}
 
@@ -198,43 +248,52 @@ def _worker(
                 candidate = global_ns.get(extract_artifact)
             if isinstance(candidate, pd.DataFrame) and not candidate.empty:
                 try:
-                    if len(pickle.dumps(candidate, protocol=4)) <= _ARTIFACT_SIZE_LIMIT_BYTES:
+                    if (
+                        len(pickle.dumps(candidate, protocol=4))
+                        <= _ARTIFACT_SIZE_LIMIT_BYTES
+                    ):
                         extracted_artifact = candidate
                 except Exception:  # noqa: BLE001
                     pass  # silently skip oversized or un-picklable artifacts
 
-        result_queue.put({
-            "success": True,
-            "result": result_repr,
-            "stdout": stdout_buf.getvalue(),
-            "error": None,
-            "error_type": None,
-            "error_category": "none",
-            "artifact": extracted_artifact,
-            "artifact_key": extract_artifact,
-        })
+        result_queue.put(
+            {
+                "success": True,
+                "result": result_repr,
+                "stdout": stdout_buf.getvalue(),
+                "error": None,
+                "error_type": None,
+                "error_category": "none",
+                "artifact": extracted_artifact,
+                "artifact_key": extract_artifact,
+            }
+        )
     except Exception as exc:  # noqa: BLE001
         tb = traceback.format_exc()
         # Extract the exception class name from the last line of the traceback
         last_line = tb.strip().splitlines()[-1]
         exc_type = type(exc).__name__
-        
+
         is_capability_error = False
         if exc_type in ("ImportError", "ModuleNotFoundError", "PermissionError"):
             is_capability_error = True
         elif exc_type == "NameError":
             is_capability_error = True
 
-        result_queue.put({
-            "success": False,
-            "result": None,
-            "stdout": stdout_buf.getvalue(),
-            "error": tb,
-            "error_type": exc_type,
-            "error_category": "capability_error" if is_capability_error else "execution_error",
-            "artifact": None,
-            "artifact_key": extract_artifact,
-        })
+        result_queue.put(
+            {
+                "success": False,
+                "result": None,
+                "stdout": stdout_buf.getvalue(),
+                "error": tb,
+                "error_type": exc_type,
+                "error_category": "capability_error"
+                if is_capability_error
+                else "execution_error",
+                "artifact": None,
+                "artifact_key": extract_artifact,
+            }
+        )
     finally:
         sys.stdout = old_stdout
 
@@ -257,7 +316,10 @@ def _safe_repr(value: Any) -> str | None:
     except Exception:  # noqa: BLE001
         r = f"<un-repr-able object of type {type(value).__name__}>"
     if len(r) > _RESULT_TRUNCATE_CHARS:
-        r = r[:_RESULT_TRUNCATE_CHARS] + f"… [truncated, full length={len(repr(value))}]"
+        r = (
+            r[:_RESULT_TRUNCATE_CHARS]
+            + f"… [truncated, full length={len(repr(value))}]"
+        )
     return r
 
 
@@ -388,15 +450,15 @@ def run_sandboxed(
 
     # Process exited without putting anything in the queue (e.g. OOM kill)
     return {
-            "success": False,
-            "result": None,
-            "stdout": "",
-            "error": (
-                f"Child process exited with code {process.exitcode} "
-                f"without returning a result."
-            ),
-            "error_type": "ProcessError",
-            "error_category": "execution_error",
-            "artifact": None,
-            "artifact_key": extract_artifact,
-        }
+        "success": False,
+        "result": None,
+        "stdout": "",
+        "error": (
+            f"Child process exited with code {process.exitcode} "
+            f"without returning a result."
+        ),
+        "error_type": "ProcessError",
+        "error_category": "execution_error",
+        "artifact": None,
+        "artifact_key": extract_artifact,
+    }

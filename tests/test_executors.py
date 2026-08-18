@@ -11,11 +11,13 @@ from agent.state import TaskNode
 
 
 def test_try_execute_filters_last_quarter() -> None:
-    df = pd.DataFrame({
-        "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
-        "region": ["North", "South", "East"],
-        "revenue": [10.0, 20.0, 30.0],
-    })
+    df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+            "region": ["North", "South", "East"],
+            "revenue": [10.0, 20.0, 30.0],
+        }
+    )
     task = TaskNode(
         task_id="step_1",
         question="Filter df to the last quarter and return quarter_df",
@@ -33,11 +35,13 @@ def test_try_execute_filters_last_quarter() -> None:
 
 
 def test_try_execute_uses_existing_quarter_artifact_for_region_revenue() -> None:
-    df = pd.DataFrame({
-        "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
-        "region": ["North", "South", "North"],
-        "revenue": [10.0, 20.0, 30.0],
-    })
+    df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+            "region": ["North", "South", "North"],
+            "revenue": [10.0, 20.0, 30.0],
+        }
+    )
     quarter_df = df.copy(deep=False)
     task = TaskNode(
         task_id="step_2",

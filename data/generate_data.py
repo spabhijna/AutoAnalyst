@@ -43,22 +43,22 @@ PRODUCT_CATEGORIES: list[str] = [
 
 # Realistic per-unit price ranges (min, max) for each category
 _PRICE_RANGES: dict[str, tuple[float, float]] = {
-    "Electronics":      (49.99,  899.99),
-    "Clothing":         (14.99,  149.99),
-    "Food & Beverage":  (3.99,    59.99),
-    "Home & Garden":    (9.99,   299.99),
-    "Sports & Outdoors":(19.99,  349.99),
-    "Beauty & Health":  (7.99,    89.99),
+    "Electronics": (49.99, 899.99),
+    "Clothing": (14.99, 149.99),
+    "Food & Beverage": (3.99, 59.99),
+    "Home & Garden": (9.99, 299.99),
+    "Sports & Outdoors": (19.99, 349.99),
+    "Beauty & Health": (7.99, 89.99),
 }
 
 # Typical units sold per transaction (mean, std)
 _UNITS_PARAMS: dict[str, tuple[float, float]] = {
-    "Electronics":      (1.5, 0.8),
-    "Clothing":         (2.5, 1.5),
-    "Food & Beverage":  (4.0, 2.0),
-    "Home & Garden":    (2.0, 1.2),
-    "Sports & Outdoors":(1.8, 1.0),
-    "Beauty & Health":  (3.0, 1.8),
+    "Electronics": (1.5, 0.8),
+    "Clothing": (2.5, 1.5),
+    "Food & Beverage": (4.0, 2.0),
+    "Home & Garden": (2.0, 1.2),
+    "Sports & Outdoors": (1.8, 1.0),
+    "Beauty & Health": (3.0, 1.8),
 }
 
 
@@ -129,13 +129,13 @@ def generate_sales_data(
 
     df = pd.DataFrame(
         {
-            "transaction_id":   transaction_ids,
-            "date":             dates,
-            "region":           regions,
+            "transaction_id": transaction_ids,
+            "date": dates,
+            "region": regions,
             "product_category": categories,
-            "units_sold":       units_sold,
-            "unit_price":       unit_prices,
-            "revenue":          revenues,
+            "units_sold": units_sold,
+            "unit_price": unit_prices,
+            "revenue": revenues,
         }
     )
 
@@ -254,18 +254,20 @@ def inject_corruption(
         "revenue": -999.99,
     }
     neg_idx = len(corrupt)
-    corrupt = pd.concat(
-        [corrupt, pd.DataFrame([neg_row])], ignore_index=True
+    corrupt = pd.concat([corrupt, pd.DataFrame([neg_row])], ignore_index=True)
+    impossible_rows.append(
+        {
+            "index": neg_idx,
+            "type": "negative_revenue",
+            "injected_values": {"revenue": -999.99, "product_category": neg_cat},
+        }
     )
-    impossible_rows.append({
-        "index": neg_idx,
-        "type": "negative_revenue",
-        "injected_values": {"revenue": -999.99, "product_category": neg_cat},
-    })
 
     # 3b. 50× revenue outlier (use median revenue for the category as baseline)
     outlier_cat = rng.choice(PRODUCT_CATEGORIES)
-    cat_median = float(df.loc[df["product_category"] == outlier_cat, "revenue"].median())
+    cat_median = float(
+        df.loc[df["product_category"] == outlier_cat, "revenue"].median()
+    )
     outlier_revenue = round(cat_median * 50, 2)
     outlier_row = {
         "transaction_id": "CORRUPT_OUT001",
@@ -277,18 +279,18 @@ def inject_corruption(
         "revenue": outlier_revenue,
     }
     out_idx = len(corrupt)
-    corrupt = pd.concat(
-        [corrupt, pd.DataFrame([outlier_row])], ignore_index=True
+    corrupt = pd.concat([corrupt, pd.DataFrame([outlier_row])], ignore_index=True)
+    impossible_rows.append(
+        {
+            "index": out_idx,
+            "type": "revenue_outlier_50x",
+            "injected_values": {
+                "revenue": outlier_revenue,
+                "category_median_revenue": cat_median,
+                "product_category": outlier_cat,
+            },
+        }
     )
-    impossible_rows.append({
-        "index": out_idx,
-        "type": "revenue_outlier_50x",
-        "injected_values": {
-            "revenue": outlier_revenue,
-            "category_median_revenue": cat_median,
-            "product_category": outlier_cat,
-        },
-    })
 
     # 3c. Zero units sold with positive revenue (logical inconsistency)
     logic_cat = rng.choice(PRODUCT_CATEGORIES)
@@ -299,24 +301,20 @@ def inject_corruption(
         "product_category": logic_cat,
         "units_sold": 0,
         "unit_price": 59.99,
-        "revenue": 59.99,   # should be 0 if units_sold == 0
+        "revenue": 59.99,  # should be 0 if units_sold == 0
     }
     log_idx = len(corrupt)
-    corrupt = pd.concat(
-        [corrupt, pd.DataFrame([logic_row])], ignore_index=True
+    corrupt = pd.concat([corrupt, pd.DataFrame([logic_row])], ignore_index=True)
+    impossible_rows.append(
+        {
+            "index": log_idx,
+            "type": "zero_units_positive_revenue",
+            "injected_values": {"units_sold": 0, "revenue": 59.99},
+        }
     )
-    impossible_rows.append({
-        "index": log_idx,
-        "type": "zero_units_positive_revenue",
-        "injected_values": {"units_sold": 0, "revenue": 59.99},
-    })
 
     manifest["impossible_rows"] = impossible_rows
-    manifest["total_defects"] = (
-        len(dupe_map)
-        + len(null_indices)
-        + len(impossible_rows)
-    )
+    manifest["total_defects"] = len(dupe_map) + len(null_indices) + len(impossible_rows)
 
     return corrupt, manifest
 
@@ -340,4 +338,6 @@ if __name__ == "__main__":
 
     with open("data/corruption_manifest.json", "w") as f:
         json.dump(mf, f, indent=2, default=str)
-    print(f"  Saved data/corruption_manifest.json  (total_defects={mf['total_defects']})")
+    print(
+        f"  Saved data/corruption_manifest.json  (total_defects={mf['total_defects']})"
+    )

@@ -19,7 +19,6 @@ TaskStatus = Literal["pending", "running", "accepted", "failed", "skipped"]
 ErrorCategory = Literal["execution_error", "capability_error", "logic_error", "none"]
 
 
-
 def utc_now_iso() -> str:
     """Return the current UTC timestamp in ISO 8601 format."""
     return datetime.now(timezone.utc).isoformat()
@@ -116,7 +115,9 @@ class Finding:
         """Return a compact line for CODE-GEN/CRITIQUE context."""
         artifact_hint = ""
         if self.produced_artifact_name:
-            artifact_hint = f" [artifact: artifacts[\"{self.produced_artifact_name}\"] available]"
+            artifact_hint = (
+                f' [artifact: artifacts["{self.produced_artifact_name}"] available]'
+            )
         return (
             f"• {self.artifact_key}: {self.question} → {self.answer} "
             f"(confidence={self.answer_confidence}){artifact_hint}"
@@ -151,8 +152,20 @@ class TaskNode:
     # Artifact lifecycle declarations (from structured plan)
     produces_artifact: str | None = None
     consumes_artifacts: list[str] = field(default_factory=list)
+    capability: str | None = None
+    capability_args: dict[str, Any] = field(default_factory=dict)
     execution_fn: str = "llm_codegen"
     output_schema: list[str] = field(default_factory=list)
+
+    @property
+    def requires(self) -> list[str]:
+        """Return the artifact requirements for graph-style scheduling."""
+        return list(self.depends_on)
+
+    @property
+    def produces(self) -> list[str]:
+        """Return the artifact outputs for graph-style scheduling."""
+        return [self.produces_artifact] if self.produces_artifact else []
 
 
 @dataclass
@@ -184,9 +197,7 @@ class WorkingMemory:
     def accepted_findings(self, plan_order: list[str]) -> list[Finding]:
         """Return accepted findings in plan order."""
         return [
-            self.findings[task_id]
-            for task_id in plan_order
-            if task_id in self.findings
+            self.findings[task_id] for task_id in plan_order if task_id in self.findings
         ]
 
     def as_prompt_text(self, plan_order: list[str]) -> str:
@@ -204,8 +215,7 @@ class WorkingMemory:
     def summary_payload(self, plan_order: list[str]) -> list[dict[str, str]]:
         """Return sanitized final evidence for the summary stage."""
         return [
-            finding.to_summary_dict()
-            for finding in self.accepted_findings(plan_order)
+            finding.to_summary_dict() for finding in self.accepted_findings(plan_order)
         ]
 
 
@@ -215,15 +225,15 @@ class TaskMemory:
     Cumulative constraints and learnings for a specific task.
     This ensures that retries do not forget past mistakes.
     """
+
     task_id: str
     constraints: list[str] = field(default_factory=list)
 
     def add_constraint(self, constraint: str) -> None:
         if constraint not in self.constraints:
             self.constraints.append(constraint)
-            
+
     def as_prompt_text(self) -> str:
         if not self.constraints:
             return "(No constraints discovered yet)"
         return "\n".join(f"- {c}" for c in self.constraints)
-

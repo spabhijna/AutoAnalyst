@@ -7,6 +7,7 @@ Tests cover:
 - Edge cases: empty DataFrame, missing columns, single row
 - IQR outlier detection correctness
 """
+
 from __future__ import annotations
 
 import pandas as pd
@@ -21,33 +22,55 @@ from agent.observer import ObservationReport, observe
 @pytest.fixture()
 def clean_df() -> pd.DataFrame:
     """Clean 5-row DataFrame with no corruption."""
-    return pd.DataFrame({
-        "transaction_id": ["A001", "A002", "A003", "A004", "A005"],
-        "region": ["North", "South", "East", "West", "North"],
-        "product_category": ["Electronics", "Clothing", "Food", "Home", "Sports"],
-        "units_sold": [2, 3, 5, 1, 4],
-        "unit_price": [99.99, 29.99, 9.99, 149.99, 79.99],
-        "revenue": [199.98, 89.97, 49.95, 149.99, 319.96],
-    })
+    return pd.DataFrame(
+        {
+            "transaction_id": ["A001", "A002", "A003", "A004", "A005"],
+            "region": ["North", "South", "East", "West", "North"],
+            "product_category": ["Electronics", "Clothing", "Food", "Home", "Sports"],
+            "units_sold": [2, 3, 5, 1, 4],
+            "unit_price": [99.99, 29.99, 9.99, 149.99, 79.99],
+            "revenue": [199.98, 89.97, 49.95, 149.99, 319.96],
+        }
+    )
 
 
 @pytest.fixture()
 def corrupted_df() -> pd.DataFrame:
     """DataFrame with known corruption: nulls, duplicates, negative revenue."""
-    return pd.DataFrame({
-        "transaction_id": ["A001", "A001", "A003", "A004", "A005"],  # A001 duplicated
-        "region": ["North", "South", "East", "West", "North"],
-        "product_category": ["Electronics", "Clothing", "Food", "Home", "Sports"],
-        "units_sold": [2, 3, 5, 0, 4],
-        "unit_price": [99.99, 29.99, 9.99, 149.99, 79.99],
-        "revenue": [199.98, None, 49.95, 59.99, -319.96],  # null, zero_units+revenue, negative
-    })
+    return pd.DataFrame(
+        {
+            "transaction_id": [
+                "A001",
+                "A001",
+                "A003",
+                "A004",
+                "A005",
+            ],  # A001 duplicated
+            "region": ["North", "South", "East", "West", "North"],
+            "product_category": ["Electronics", "Clothing", "Food", "Home", "Sports"],
+            "units_sold": [2, 3, 5, 0, 4],
+            "unit_price": [99.99, 29.99, 9.99, 149.99, 79.99],
+            "revenue": [
+                199.98,
+                None,
+                49.95,
+                59.99,
+                -319.96,
+            ],  # null, zero_units+revenue, negative
+        }
+    )
 
 
 @pytest.fixture()
 def empty_sandbox_result() -> dict:
     """Minimal sandbox result for a failed execution."""
-    return {"success": False, "result": None, "stdout": "", "error": "SyntaxError", "error_type": "SyntaxError"}
+    return {
+        "success": False,
+        "result": None,
+        "stdout": "",
+        "error": "SyntaxError",
+        "error_type": "SyntaxError",
+    }
 
 
 @pytest.fixture()
@@ -164,7 +187,9 @@ class TestObservationReportText:
 class TestObserve:
     """Integration tests for the observe() function."""
 
-    def test_clean_data_all_zeros(self, clean_df: pd.DataFrame, empty_sandbox_result: dict) -> None:
+    def test_clean_data_all_zeros(
+        self, clean_df: pd.DataFrame, empty_sandbox_result: dict
+    ) -> None:
         """Clean DataFrame produces a clean report with no flags."""
         report = observe(clean_df, empty_sandbox_result)
         assert report.total_rows == 5
@@ -174,38 +199,52 @@ class TestObserve:
         assert report.negative_revenue_rows == 0
         assert report.zero_units_positive_revenue == 0
 
-    def test_detects_duplicate_txn_ids(self, corrupted_df: pd.DataFrame, empty_sandbox_result: dict) -> None:
+    def test_detects_duplicate_txn_ids(
+        self, corrupted_df: pd.DataFrame, empty_sandbox_result: dict
+    ) -> None:
         """Detects duplicate transaction_id values."""
         report = observe(corrupted_df, empty_sandbox_result)
         assert report.duplicate_txn_ids == 1  # A001 appears twice
         assert "A001" in report.duplicate_txn_examples
 
-    def test_detects_null_revenue(self, corrupted_df: pd.DataFrame, empty_sandbox_result: dict) -> None:
+    def test_detects_null_revenue(
+        self, corrupted_df: pd.DataFrame, empty_sandbox_result: dict
+    ) -> None:
         """Detects null values in the revenue column."""
         report = observe(corrupted_df, empty_sandbox_result)
         assert report.null_counts["revenue"] == 1
 
-    def test_detects_negative_revenue(self, corrupted_df: pd.DataFrame, empty_sandbox_result: dict) -> None:
+    def test_detects_negative_revenue(
+        self, corrupted_df: pd.DataFrame, empty_sandbox_result: dict
+    ) -> None:
         """Detects negative revenue rows."""
         report = observe(corrupted_df, empty_sandbox_result)
         assert report.negative_revenue_rows == 1
 
-    def test_detects_zero_units_positive_revenue(self, corrupted_df: pd.DataFrame, empty_sandbox_result: dict) -> None:
+    def test_detects_zero_units_positive_revenue(
+        self, corrupted_df: pd.DataFrame, empty_sandbox_result: dict
+    ) -> None:
         """Detects zero units_sold with positive revenue."""
         report = observe(corrupted_df, empty_sandbox_result)
         assert report.zero_units_positive_revenue == 1
 
-    def test_iqr_outliers_on_uniform_data(self, clean_df: pd.DataFrame, empty_sandbox_result: dict) -> None:
+    def test_iqr_outliers_on_uniform_data(
+        self, clean_df: pd.DataFrame, empty_sandbox_result: dict
+    ) -> None:
         """Uniform-ish data produces no IQR outliers."""
         report = observe(clean_df, empty_sandbox_result)
         assert len(report.revenue_outliers_iqr) == 0
 
-    def test_stdout_lines_counted(self, clean_df: pd.DataFrame, sandbox_result_with_stdout: dict) -> None:
+    def test_stdout_lines_counted(
+        self, clean_df: pd.DataFrame, sandbox_result_with_stdout: dict
+    ) -> None:
         """Stdout lines are counted as a row-filtering heuristic."""
         report = observe(clean_df, sandbox_result_with_stdout)
         assert report.rows_after_code_filter > 0
 
-    def test_missing_transaction_id_column(self, clean_df: pd.DataFrame, empty_sandbox_result: dict) -> None:
+    def test_missing_transaction_id_column(
+        self, clean_df: pd.DataFrame, empty_sandbox_result: dict
+    ) -> None:
         """DataFrame without transaction_id column doesn't crash."""
         df = clean_df.drop(columns=["transaction_id"])
         report = observe(df, empty_sandbox_result)
@@ -225,13 +264,21 @@ class TestObserve:
         report = observe(df, empty_sandbox_result)
         assert len(report.revenue_outliers_iqr) == 0
 
-    def test_artifact_keys_in_notes(self, clean_df: pd.DataFrame, empty_sandbox_result: dict) -> None:
+    def test_artifact_keys_in_notes(
+        self, clean_df: pd.DataFrame, empty_sandbox_result: dict
+    ) -> None:
         """Available artifact keys appear in notes."""
-        report = observe(clean_df, empty_sandbox_result, artifact_store_available_keys=["quarter_df", "region_revenue"])
+        report = observe(
+            clean_df,
+            empty_sandbox_result,
+            artifact_store_available_keys=["quarter_df", "region_revenue"],
+        )
         assert any("quarter_df" in n for n in report.notes)
         assert any("region_revenue" in n for n in report.notes)
 
-    def test_no_artifact_keys(self, clean_df: pd.DataFrame, empty_sandbox_result: dict) -> None:
+    def test_no_artifact_keys(
+        self, clean_df: pd.DataFrame, empty_sandbox_result: dict
+    ) -> None:
         """No artifact keys means no artifact note."""
         report = observe(clean_df, empty_sandbox_result)
         assert not any("ArtifactStore" in n for n in report.notes)
@@ -243,7 +290,9 @@ class TestObserve:
 class TestReportCompleteness:
     """Ensure all fields are populated by observe()."""
 
-    def test_all_fields_populated(self, clean_df: pd.DataFrame, empty_sandbox_result: dict) -> None:
+    def test_all_fields_populated(
+        self, clean_df: pd.DataFrame, empty_sandbox_result: dict
+    ) -> None:
         """Every ObservationReport field is set after observe() returns."""
         report = observe(clean_df, empty_sandbox_result)
         assert isinstance(report.null_counts, dict)

@@ -35,19 +35,49 @@ from agent.observer import ObservationReport
 @pytest.fixture()
 def clean_df() -> pd.DataFrame:
     """Clean 10-row DataFrame with no corruption."""
-    return pd.DataFrame({
-        "transaction_id": [f"A{i:03d}" for i in range(1, 11)],
-        "region": ["North", "South", "East", "West"] * 2 + ["North", "South"],
-        "product_category": [
-            "Electronics", "Clothing", "Food", "Home", "Sports",
-            "Beauty", "Electronics", "Clothing", "Food", "Home",
-        ],
-        "units_sold": [2, 3, 5, 1, 4, 2, 3, 1, 2, 4],
-        "unit_price": [99.99, 29.99, 9.99, 149.99, 79.99,
-                        49.99, 199.99, 19.99, 7.99, 89.99],
-        "revenue": [199.98, 89.97, 49.95, 149.99, 319.96,
-                     99.98, 599.97, 19.99, 15.98, 359.96],
-    })
+    return pd.DataFrame(
+        {
+            "transaction_id": [f"A{i:03d}" for i in range(1, 11)],
+            "region": ["North", "South", "East", "West"] * 2 + ["North", "South"],
+            "product_category": [
+                "Electronics",
+                "Clothing",
+                "Food",
+                "Home",
+                "Sports",
+                "Beauty",
+                "Electronics",
+                "Clothing",
+                "Food",
+                "Home",
+            ],
+            "units_sold": [2, 3, 5, 1, 4, 2, 3, 1, 2, 4],
+            "unit_price": [
+                99.99,
+                29.99,
+                9.99,
+                149.99,
+                79.99,
+                49.99,
+                199.99,
+                19.99,
+                7.99,
+                89.99,
+            ],
+            "revenue": [
+                199.98,
+                89.97,
+                49.95,
+                149.99,
+                319.96,
+                99.98,
+                599.97,
+                19.99,
+                15.98,
+                359.96,
+            ],
+        }
+    )
 
 
 @pytest.fixture()
@@ -81,7 +111,9 @@ def manifest_corrupted() -> dict[str, Any]:
 
 
 @pytest.fixture()
-def corrupted_df(clean_df: pd.DataFrame, manifest_corrupted: dict[str, Any]) -> pd.DataFrame:
+def corrupted_df(
+    clean_df: pd.DataFrame, manifest_corrupted: dict[str, Any]
+) -> pd.DataFrame:
     """Corrupted DataFrame matching the manifest fixture."""
     df = clean_df.copy()
 
@@ -97,32 +129,34 @@ def corrupted_df(clean_df: pd.DataFrame, manifest_corrupted: dict[str, Any]) -> 
 
     # Add impossible rows (beyond the original 10 + 2 duplicates = 12 rows,
     # these become rows 12, 13, 14)
-    extra_rows = pd.DataFrame([
-        {
-            "transaction_id": "CORRUPT_NEG001",
-            "region": "North",
-            "product_category": "Electronics",
-            "units_sold": 5,
-            "unit_price": 199.99,
-            "revenue": -999.99,
-        },
-        {
-            "transaction_id": "CORRUPT_OUT001",
-            "region": "South",
-            "product_category": "Food",
-            "units_sold": 1,
-            "unit_price": 15000.0,
-            "revenue": 15000.0,
-        },
-        {
-            "transaction_id": "CORRUPT_LOG001",
-            "region": "East",
-            "product_category": "Clothing",
-            "units_sold": 0,
-            "unit_price": 59.99,
-            "revenue": 59.99,
-        },
-    ])
+    extra_rows = pd.DataFrame(
+        [
+            {
+                "transaction_id": "CORRUPT_NEG001",
+                "region": "North",
+                "product_category": "Electronics",
+                "units_sold": 5,
+                "unit_price": 199.99,
+                "revenue": -999.99,
+            },
+            {
+                "transaction_id": "CORRUPT_OUT001",
+                "region": "South",
+                "product_category": "Food",
+                "units_sold": 1,
+                "unit_price": 15000.0,
+                "revenue": 15000.0,
+            },
+            {
+                "transaction_id": "CORRUPT_LOG001",
+                "region": "East",
+                "product_category": "Clothing",
+                "units_sold": 0,
+                "unit_price": 59.99,
+                "revenue": 59.99,
+            },
+        ]
+    )
     df = pd.concat([df, extra_rows], ignore_index=True)
     return df
 
@@ -171,9 +205,27 @@ class TestEvalReport:
     def test_perfect_scores(self) -> None:
         """Perfect precision and recall when all 5 categories match."""
         cats = {
-            "a": CategoryResult(name="a", present_in_manifest=True, detected=True, manifest_count=2, observer_count=2),
-            "b": CategoryResult(name="b", present_in_manifest=True, detected=True, manifest_count=1, observer_count=1),
-            "c": CategoryResult(name="c", present_in_manifest=True, detected=True, manifest_count=3, observer_count=3),
+            "a": CategoryResult(
+                name="a",
+                present_in_manifest=True,
+                detected=True,
+                manifest_count=2,
+                observer_count=2,
+            ),
+            "b": CategoryResult(
+                name="b",
+                present_in_manifest=True,
+                detected=True,
+                manifest_count=1,
+                observer_count=1,
+            ),
+            "c": CategoryResult(
+                name="c",
+                present_in_manifest=True,
+                detected=True,
+                manifest_count=3,
+                observer_count=3,
+            ),
         }
         report = EvalReport(
             categories=cats,
@@ -237,8 +289,8 @@ class TestEvalReport:
         assert "false positives" in summary.lower()
         assert "false negatives" in summary.lower()
         assert "100.00%" in summary  # precision
-        assert "50.00%" in summary   # recall
-        assert "66.67%" in summary   # F1
+        assert "50.00%" in summary  # recall
+        assert "66.67%" in summary  # F1
 
     def test_summary_pipeline_not_aborted(self) -> None:
         """Summary shows "Pipeline completed" when not aborted."""
@@ -293,7 +345,9 @@ class TestEvaluateCleanData:
         }
         report = evaluate(clean_df, manifest)
         for cat in report.categories.values():
-            assert cat.detected is False, f"{cat.name} should not be detected in clean data"
+            assert cat.detected is False, (
+                f"{cat.name} should not be detected in clean data"
+            )
             assert cat.present_in_manifest is False
 
 
@@ -305,19 +359,25 @@ class TestEvaluateCleanData:
 class TestEvaluateCorruptedData:
     """evaluate() on fully-corrupted data — all 5 categories."""
 
-    def test_all_categories_detected(self, corrupted_df: pd.DataFrame, manifest_corrupted: dict[str, Any]) -> None:
+    def test_all_categories_detected(
+        self, corrupted_df: pd.DataFrame, manifest_corrupted: dict[str, Any]
+    ) -> None:
         """All 5 defect categories are detected by the observer."""
         report = evaluate(corrupted_df, manifest_corrupted)
         # All categories should be true positives
         for name, cat in report.categories.items():
-            assert cat.is_true_positive, f"{name}: TP expected but got present={cat.present_in_manifest} detected={cat.detected}"
+            assert cat.is_true_positive, (
+                f"{name}: TP expected but got present={cat.present_in_manifest} detected={cat.detected}"
+            )
         assert report.true_positives == 5
         assert report.false_positives == 0
         assert report.false_negatives == 0
         assert report.precision == 1.0
         assert report.recall == 1.0
 
-    def test_duplicate_count(self, corrupted_df: pd.DataFrame, manifest_corrupted: dict[str, Any]) -> None:
+    def test_duplicate_count(
+        self, corrupted_df: pd.DataFrame, manifest_corrupted: dict[str, Any]
+    ) -> None:
         """Duplicate detection count matches injection."""
         report = evaluate(corrupted_df, manifest_corrupted)
         cat = report.categories["duplicate_transactions"]
@@ -326,7 +386,9 @@ class TestEvaluateCorruptedData:
         assert cat.manifest_count == 2
         assert cat.observer_count == 2
 
-    def test_null_count(self, corrupted_df: pd.DataFrame, manifest_corrupted: dict[str, Any]) -> None:
+    def test_null_count(
+        self, corrupted_df: pd.DataFrame, manifest_corrupted: dict[str, Any]
+    ) -> None:
         """Null detection count matches injection."""
         report = evaluate(corrupted_df, manifest_corrupted)
         cat = report.categories["null_revenue"]
@@ -334,7 +396,9 @@ class TestEvaluateCorruptedData:
         assert cat.manifest_count == 2
         assert cat.observer_count == 2
 
-    def test_negative_revenue_count(self, corrupted_df: pd.DataFrame, manifest_corrupted: dict[str, Any]) -> None:
+    def test_negative_revenue_count(
+        self, corrupted_df: pd.DataFrame, manifest_corrupted: dict[str, Any]
+    ) -> None:
         """Negative revenue detection matches injection."""
         report = evaluate(corrupted_df, manifest_corrupted)
         cat = report.categories["negative_revenue"]
@@ -342,7 +406,9 @@ class TestEvaluateCorruptedData:
         assert cat.manifest_count == 1
         assert cat.observer_count == 1
 
-    def test_zero_units_count(self, corrupted_df: pd.DataFrame, manifest_corrupted: dict[str, Any]) -> None:
+    def test_zero_units_count(
+        self, corrupted_df: pd.DataFrame, manifest_corrupted: dict[str, Any]
+    ) -> None:
         """Zero-units-positive-revenue detection matches injection."""
         report = evaluate(corrupted_df, manifest_corrupted)
         cat = report.categories["zero_units_with_revenue"]
@@ -350,7 +416,9 @@ class TestEvaluateCorruptedData:
         assert cat.manifest_count == 1
         assert cat.observer_count == 1
 
-    def test_outlier_count(self, corrupted_df: pd.DataFrame, manifest_corrupted: dict[str, Any]) -> None:
+    def test_outlier_count(
+        self, corrupted_df: pd.DataFrame, manifest_corrupted: dict[str, Any]
+    ) -> None:
         """Revenue outlier detection matches injection."""
         report = evaluate(corrupted_df, manifest_corrupted)
         cat = report.categories["revenue_outlier"]
@@ -371,8 +439,18 @@ class TestEvaluatePartialCorruption:
         """Only duplicates injected — only that category should be TP."""
         df = clean_df.copy()
         # Use uniform revenue to avoid natural IQR outliers
-        df["revenue"] = [100.0, 110.0, 120.0, 130.0, 140.0,
-                          150.0, 160.0, 170.0, 180.0, 190.0]
+        df["revenue"] = [
+            100.0,
+            110.0,
+            120.0,
+            130.0,
+            140.0,
+            150.0,
+            160.0,
+            170.0,
+            180.0,
+            190.0,
+        ]
         # Add one duplicate (row 0 with revenue 100)
         dup = df.iloc[[0]].copy()
         dup.index = [len(df)]
@@ -380,7 +458,9 @@ class TestEvaluatePartialCorruption:
         df = df.reset_index(drop=True)
 
         manifest: dict[str, Any] = {
-            "duplicated_transaction_ids": {df.iloc[0]["transaction_id"]: [0, len(df) - 1]},
+            "duplicated_transaction_ids": {
+                df.iloc[0]["transaction_id"]: [0, len(df) - 1]
+            },
             "null_revenue_indices": [],
             "impossible_rows": [],
             "total_defects": 1,
@@ -516,10 +596,16 @@ class TestPipelineResilience:
         )
         # Simulate 3 attempts
         from agent.state import AttemptRecord
+
         state.debug_history = [
             AttemptRecord(
-                task_id="step_1", sub_question="Q1", iteration=0,
-                code="", sandbox_result={}, critique="", action="revise_code",
+                task_id="step_1",
+                sub_question="Q1",
+                iteration=0,
+                code="",
+                sandbox_result={},
+                critique="",
+                action="revise_code",
                 trust="low",
             )
             for _ in range(3)

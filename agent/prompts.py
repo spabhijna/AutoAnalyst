@@ -13,7 +13,7 @@ Phase 3 hard dependency from sandbox (Phase 2):
 """
 
 from __future__ import annotations
-
+ 
 
 # ---------------------------------------------------------------------------
 # PLAN
@@ -57,20 +57,21 @@ Decompose this goal into 3-6 ordered tasks. Design for MAXIMUM REUSE:
 
 Each task object must have these fields:
   "question":          A specific, concrete question answerable with one pandas snippet.
+  "capability":        A registered capability identifier to execute this node.
   "produces_artifact": A snake_case DataFrame variable name this task will create and
                        register (e.g. "quarter_df", "region_revenue"). Use null if the
                        task returns only a scalar, string, or ranked list — not a DataFrame.
   "consumes_artifacts": A JSON array of artifact names from PRIOR tasks this task will
                         use (e.g. ["quarter_df"]). Empty array [] if none.
-      "output_schema":     A JSON array of expected output columns, or ["<scalar>"] for
-                            scalar answers.
+  "output_schema":     A JSON array of expected output columns, or ["<scalar>"] for
+                       scalar answers.
 
 Return ONLY a JSON array of task objects. No explanation, no markdown fences.
 Example:
 [
-  {{"question": "Filter df to the last quarter and return the filtered DataFrame", "produces_artifact": "quarter_df", "consumes_artifacts": [], "output_schema": ["transaction_id", "date", "region", "product_category", "units_sold", "unit_price", "revenue"]}},
-  {{"question": "What is the total revenue by region in the last quarter?", "produces_artifact": "region_revenue", "consumes_artifacts": ["quarter_df"], "output_schema": ["region", "total_revenue"]}},
-  {{"question": "Which region has the highest total revenue?", "produces_artifact": null, "consumes_artifacts": ["region_revenue"], "output_schema": ["<scalar>"]}}
+  {{"question": "Filter df to the last quarter and return the filtered DataFrame", "capability": "FilterByDateRange", "produces_artifact": "quarter_df", "consumes_artifacts": [], "output_schema": ["transaction_id", "date", "region", "product_category", "units_sold", "unit_price", "revenue"]}},
+  {{"question": "What is the total revenue by region in the last quarter?", "capability": "GroupRevenueByRegion", "produces_artifact": "region_revenue", "consumes_artifacts": ["quarter_df"], "output_schema": ["region", "total_revenue"]}},
+  {{"question": "Which region has the highest total revenue?", "capability": "FindMaximumRevenueRegion", "produces_artifact": "top_region", "consumes_artifacts": ["region_revenue"], "output_schema": ["region", "total_revenue"]}}
 ]
 
 JSON array:"""
@@ -149,7 +150,8 @@ def codegen_prompt(
     """
     artifacts_section = (
         f"\n{available_artifacts}\n"
-        if available_artifacts and available_artifacts != "(no pre-computed artifacts available yet)"
+        if available_artifacts
+        and available_artifacts != "(no pre-computed artifacts available yet)"
         else ""
     )
     return f"""You are a senior data analyst writing Python/pandas code.
@@ -232,7 +234,8 @@ def repair_prompt(
     """
     artifacts_section = (
         f"\n{available_artifacts}\n"
-        if available_artifacts and available_artifacts != "(no pre-computed artifacts available yet)"
+        if available_artifacts
+        and available_artifacts != "(no pre-computed artifacts available yet)"
         else ""
     )
     return f"""You are a senior data analyst repairing a failing Python/pandas script.
@@ -495,12 +498,14 @@ def summary_prompt(goal: str, history_entries: list[dict]) -> str:
 
     findings_payload = []
     for entry in history_entries:
-        findings_payload.append({
-            "question": entry.get("question", ""),
-            "answer": entry.get("answer", "(no result)"),
-            "trust": entry.get("trust", "unknown"),
-            "artifact_key": entry.get("artifact_key", ""),
-        })
+        findings_payload.append(
+            {
+                "question": entry.get("question", ""),
+                "answer": entry.get("answer", "(no result)"),
+                "trust": entry.get("trust", "unknown"),
+                "artifact_key": entry.get("artifact_key", ""),
+            }
+        )
     findings_json = json.dumps(findings_payload, indent=2)
 
     return f"""You are a senior data analyst writing the conclusion of an investigation.

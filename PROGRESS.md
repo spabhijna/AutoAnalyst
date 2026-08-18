@@ -31,10 +31,144 @@ Completed in this slice:
 - Switched the loop scheduler from positional iteration to dependency-aware graph selection.
 - Added tests for graph scheduling, deterministic execution, and artifact lineage metadata.
 
+Completed in the next slice:
+- Added a `CapabilityRegistry` with reusable analytical capabilities.
+- Added a generic `ExecutionEngine` that resolves capabilities and registers produced artifacts.
+- Added capability metadata to `TaskNode` and threaded capability IDs through the plan parser.
+- Froze validated artifacts after registration and recorded provenance/creation metadata.
+- Updated the demo loop so registered capabilities execute deterministically before any LLM codegen.
+- Added tests for capability resolution, execution-engine dispatch, and artifact immutability.
+- Added a `CapabilityValidator` layer that checks dependency satisfaction and output schema contracts before artifact registration.
+- Added contract-failure tests to prove invalid capability outputs are rejected.
+- Verified the refactor with `100 passed` across the focused capability, execution-engine, artifact, and loop test slice.
+- Smoke-tested `python run_demo.py --dry-run` successfully after the validator and engine wiring.
+- Updated the dry-run demo planner output to emit capability-based task objects and capability-driven summary wording.
+
 Next:
 - Broaden deterministic execution beyond the first reusable dataframe steps.
 - Move more prompt context off the full debug history and onto per-layer state views.
-- Continue reducing LLM codegen responsibility for common dataframe operations.
+- Continue reducing LLM codegen responsibility for common dataframe operations and replace the remaining heuristic fallback path with capability-only routing where possible.
+
+---
+
+## Capability-Driven Refactor
+
+The project has moved from a primarily LLM-driven execution loop toward a hybrid execution model. Deterministic executors now handle several recurring analytical operations, intermediate results are persisted and reused through the artifact store, and the pipeline is more stable because common analytical steps no longer depend on code generation. Planning, execution, validation, and summarization are more clearly separated than in earlier iterations, and the overall reliability of the workflow is substantially higher than the original implementation.
+
+Key architectural decisions made during this evolution:
+
+- Prefer deterministic execution for repeatable dataframe operations, and reserve LLM use for planning, recovery, and narrative output.
+- Treat artifacts as reusable intermediate results rather than transient sandbox outputs.
+- Separate debug history, working memory, artifact storage, and final results so each layer has one responsibility.
+- Introduce graph-oriented execution so dependency ordering can be expressed explicitly rather than implied by a linear loop.
+- Keep the public `run(goal, df, ...)` interface stable while the internal architecture evolves.
+
+## Current Limitations
+
+The current framework is much more robust than the original implementation, but several architectural opportunities remain:
+
+- Artifacts are stored and reused, but their lifecycle and dependency management are still relatively simple.
+- Execution is deterministic for common tasks, but the framework is not yet a fully capability-driven execution engine.
+- Artifact contracts, schemas, provenance, and validation can still be strengthened.
+- Summary generation still blends analytical reporting with recommendations in some paths.
+- The planner can still drift semantically from the user's original goal on some replans.
+- Execution integrity and artifact wiring should be validated independently of the summary stage.
+
+These are not treated as bugs; they are the next architectural opportunities.
+
+## Next Milestones
+
+### Artifact Integrity Layer
+
+Introduce an integrity layer that validates:
+
+- artifact existence
+- dependency satisfaction
+- schema compatibility
+- producer/consumer relationships
+- artifact provenance
+- contract compliance
+
+Only validated artifacts should be passed to downstream components.
+
+### Capability Registry
+
+Replace ad-hoc deterministic functions with a registry of reusable analytical capabilities.
+
+Each capability should define:
+
+- identifier
+- description
+- required artifacts
+- produced artifacts
+- executor
+- input schema
+- output schema
+
+The execution engine should invoke capabilities instead of embedding analytical logic throughout the codebase.
+
+### Execution Graph Evolution
+
+Continue evolving the execution graph into a dependency-driven workflow.
+
+Execution nodes should declare explicit inputs and outputs, allowing the framework to resolve dependencies automatically without relying on sequential execution.
+
+### Typed Artifact System
+
+Expand artifacts into fully typed objects containing metadata such as:
+
+- identifier
+- type
+- schema
+- producer
+- consumers
+- confidence
+- provenance
+- creation metadata
+
+Artifacts should become immutable after validation.
+
+### Context Optimization
+
+Continue reducing LLM context usage by:
+
+- passing artifact references instead of regenerated context
+- separating working memory from debug history
+- keeping prompts focused on the current task and required artifacts only
+
+The amount of context sent to the LLM should continue decreasing as the framework matures.
+
+### Summary Refinement
+
+Separate analytical reporting from recommendations.
+
+The summary component should:
+
+- report validated findings
+- communicate confidence
+- identify missing information
+
+Recommendation generation should become an optional downstream capability rather than part of the default summarization process.
+
+## Long-Term Vision
+
+The long-term objective is to evolve AutoAnalyst from an agent that generates analytical code into a reusable analytical execution framework.
+
+The desired architecture is:
+
+```text
+User Goal
+→ Planner
+→ Execution Graph
+→ Capability Registry
+→ Deterministic Executors
+→ Artifact Store
+→ Artifact Integrity Layer
+→ Validated Artifacts
+→ Summary
+```
+
+The LLM should primarily orchestrate planning, recovery, and communication, while deterministic components perform the analytical computation whenever possible.
 
 ---
 

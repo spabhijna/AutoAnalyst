@@ -18,12 +18,18 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from agent.artifact_store import Artifact, ArtifactStore, classify_artifact, MAX_ARTIFACT_BYTES
+from agent.artifact_store import (
+    Artifact,
+    ArtifactStore,
+    classify_artifact,
+    MAX_ARTIFACT_BYTES,
+)
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture()
 def store() -> ArtifactStore:
@@ -32,54 +38,86 @@ def store() -> ArtifactStore:
 
 @pytest.fixture()
 def small_df() -> pd.DataFrame:
-    return pd.DataFrame({
-        "region": ["North", "South", "East"],
-        "revenue": [100.0, 200.0, 150.0],
-        "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
-    })
+    return pd.DataFrame(
+        {
+            "region": ["North", "South", "East"],
+            "revenue": [100.0, 200.0, 150.0],
+            "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+        }
+    )
 
 
 @pytest.fixture()
 def region_df() -> pd.DataFrame:
-    return pd.DataFrame({
-        "region": ["North", "South"],
-        "total": [500.0, 750.0],
-    })
+    return pd.DataFrame(
+        {
+            "region": ["North", "South"],
+            "total": [500.0, 750.0],
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # Registration — happy path
 # ---------------------------------------------------------------------------
 
+
 class TestRegister:
-    def test_register_returns_true(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_register_returns_true(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         assert store.register("quarter_df", small_df) is True
 
-    def test_registered_key_is_available(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_registered_key_is_available(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         store.register("quarter_df", small_df)
         assert "quarter_df" in store.available_keys()
 
-    def test_artifact_name_and_type(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_artifact_name_and_type(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         store.register("quarter_df", small_df, producing_task_id="step_1")
         a = store._artifacts["quarter_df"]
         assert a.name == "quarter_df"
         assert a.type == "DataFrame"
 
-    def test_artifact_rows_and_columns(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
-        store.register("quarter_df", small_df, producing_task_id="step_1", consumers=["step_2"], confidence="high")
+    def test_artifact_rows_and_columns(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
+        store.register(
+            "quarter_df",
+            small_df,
+            producing_task_id="step_1",
+            consumers=["step_2"],
+            confidence="high",
+        )
         a = store._artifacts["quarter_df"]
         assert a.rows == 3
         assert list(a.value.columns) == ["region", "revenue", "date"]
         assert a.producer == "step_1"
         assert a.consumers == ["step_2"]
         assert a.confidence == "high"
+        assert a.is_frozen is True
 
-    def test_dtypes_preserved(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_artifact_is_immutable_after_registration(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
+        store.register("quarter_df", small_df, producing_task_id="step_1")
+        artifact = store._artifacts["quarter_df"]
+        with pytest.raises(AttributeError):
+            artifact.confidence = "low"
+
+    def test_dtypes_preserved(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         store.register("quarter_df", small_df)
         a = store._artifacts["quarter_df"]
         assert "float64" in str(a.value["revenue"].dtype)
 
-    def test_register_overwrites_existing_key(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_register_overwrites_existing_key(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         """Registering the same key twice replaces the old entry."""
         store.register("key", small_df)
         new_df = pd.DataFrame({"x": [1, 2, 3, 4]})
@@ -87,7 +125,9 @@ class TestRegister:
         assert store._artifacts["key"].rows == 4
         assert store._artifacts["key"].name == "key"
 
-    def test_shallow_copy_semantics(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_shallow_copy_semantics(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         """The caller mutating the original DataFrame's index does not affect the stored copy."""
         store.register("df", small_df)
         small_df.index = [10, 20, 30]
@@ -98,6 +138,7 @@ class TestRegister:
 # ---------------------------------------------------------------------------
 # Registration — rejection cases
 # ---------------------------------------------------------------------------
+
 
 class TestRegisterRejection:
     def test_none_is_rejected(self, store: ArtifactStore) -> None:
@@ -113,10 +154,14 @@ class TestRegisterRejection:
         store.register("x", pd.DataFrame())
         assert "x" not in store.available_keys()
 
-    def test_oversized_dataframe_rejected(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_oversized_dataframe_rejected(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         """DataFrames whose pickled size exceeds MAX_ARTIFACT_BYTES are rejected."""
         oversized_bytes = MAX_ARTIFACT_BYTES + 1
-        with patch("agent.artifact_store.pickle.dumps", return_value=b"x" * oversized_bytes):
+        with patch(
+            "agent.artifact_store.pickle.dumps", return_value=b"x" * oversized_bytes
+        ):
             result = store.register("big_df", small_df)
         assert result is False
         assert "big_df" not in store.available_keys()
@@ -126,8 +171,11 @@ class TestRegisterRejection:
 # Read API
 # ---------------------------------------------------------------------------
 
+
 class TestGet:
-    def test_get_returns_registered_dataframe(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_get_returns_registered_dataframe(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         store.register("df", small_df)
         retrieved = store.get("df")
         assert retrieved is not None
@@ -137,7 +185,9 @@ class TestGet:
     def test_get_missing_key_returns_none(self, store: ArtifactStore) -> None:
         assert store.get("nonexistent") is None
 
-    def test_get_artifact_returns_full_object(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_get_artifact_returns_full_object(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         store.register("df", small_df, producing_task_id="step_1")
         a = store.get_artifact("df")
         assert a is not None
@@ -149,7 +199,9 @@ class TestGet:
     def test_get_artifact_missing_returns_none(self, store: ArtifactStore) -> None:
         assert store.get_artifact("x") is None
 
-    def test_contains_true_after_register(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_contains_true_after_register(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         store.register("df", small_df)
         assert "df" in store
 
@@ -171,6 +223,7 @@ class TestGet:
 # ---------------------------------------------------------------------------
 # Namespace export
 # ---------------------------------------------------------------------------
+
 
 class TestNamespace:
     def test_as_namespace_returns_all_keys(
@@ -207,7 +260,9 @@ class TestNamespace:
         assert "quarter_df" in ns
         assert "nonexistent" not in ns
 
-    def test_as_namespace_for_empty_list_returns_empty(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_as_namespace_for_empty_list_returns_empty(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         store.register("df", small_df)
         assert store.as_namespace_for([]) == {}
 
@@ -216,36 +271,49 @@ class TestNamespace:
 # describe() for prompt injection
 # ---------------------------------------------------------------------------
 
+
 class TestDescribe:
     def test_describe_empty_store(self, store: ArtifactStore) -> None:
         assert store.describe() == "(no pre-computed artifacts available yet)"
 
-    def test_describe_mentions_key(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_describe_mentions_key(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         store.register("quarter_df", small_df, producing_task_id="step_1")
         desc = store.describe()
         assert "quarter_df" in desc
 
-    def test_describe_mentions_row_count(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_describe_mentions_row_count(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         store.register("quarter_df", small_df)
         desc = store.describe()
         assert "3" in desc  # 3 rows
 
-    def test_describe_mentions_columns(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_describe_mentions_columns(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         store.register("quarter_df", small_df)
         desc = store.describe()
         assert "region" in desc
         assert "revenue" in desc
 
-    def test_describe_does_not_mention_producer(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_describe_does_not_mention_producer(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         """Typed describe() is self-contained — producer ID is internal metadata, not prompt content."""
-        store.register("quarter_df", small_df, producing_task_id="step_1", confidence="high")
+        store.register(
+            "quarter_df", small_df, producing_task_id="step_1", confidence="high"
+        )
         desc = store.describe()
         assert "step_1" not in desc
         assert "quarter_df" in desc
         assert "type=DataFrame" in desc
         assert "confidence=high" in desc
 
-    def test_describe_contains_usage_example(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_describe_contains_usage_example(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         store.register("quarter_df", small_df)
         desc = store.describe()
         assert 'artifacts["quarter_df"]' in desc
@@ -266,12 +334,16 @@ class TestDescribe:
         desc = store.describe()
         assert "…" in desc or "more" in desc
 
-    def test_describe_shows_type(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_describe_shows_type(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         store.register("quarter_df", small_df)
         desc = store.describe()
         assert "type=DataFrame" in desc
 
-    def test_describe_shows_schema(self, store: ArtifactStore, small_df: pd.DataFrame) -> None:
+    def test_describe_shows_schema(
+        self, store: ArtifactStore, small_df: pd.DataFrame
+    ) -> None:
         store.register("quarter_df", small_df)
         desc = store.describe()
         assert "schema=[" in desc
@@ -287,6 +359,7 @@ class TestDescribe:
 # ---------------------------------------------------------------------------
 # Artifact classification (DataFrame vs Series vs scalar)
 # ---------------------------------------------------------------------------
+
 
 class TestArtifactClassification:
     """Tests for classify_artifact, exercised through register()."""
@@ -328,6 +401,7 @@ class TestArtifactClassification:
 # classify_artifact() as a pure function
 # ---------------------------------------------------------------------------
 
+
 class TestClassifyArtifact:
     """Direct tests for the public classify_artifact() function."""
 
@@ -350,6 +424,7 @@ class TestClassifyArtifact:
 # ---------------------------------------------------------------------------
 # Artifact first-class object completeness
 # ---------------------------------------------------------------------------
+
 
 class TestArtifactCompleteness:
     """Verify the Artifact dataclass bundles name, type, schema, producer, and value."""

@@ -1,7 +1,9 @@
 """
 Explicit modeling of the execution environment capabilities and constraints.
 """
+
 from dataclasses import dataclass, field
+
 
 @dataclass
 class EnvironmentManifest:
@@ -9,19 +11,28 @@ class EnvironmentManifest:
     A definitive source of truth about what the sandbox environment supports.
     Passed to the generator LLM so it doesn't have to guess or assume.
     """
-    allowed_modules: list[str] = field(default_factory=lambda: ["pd (pandas)", "np (numpy)"])
-    disallowed_operations: list[str] = field(default_factory=lambda: [
-        "Network requests (e.g. requests, urllib)",
-        "File system I/O (e.g. open(), os, shutil)",
-        "Process execution (e.g. subprocess, sys)",
-        "Dynamic code execution (e.g. eval(), exec())",
-        "Importing any module not in allowed_modules"
-    ])
-    available_globals: list[str] = field(default_factory=lambda: ["df (the pandas DataFrame)", "pd", "np"])
-    required_conventions: list[str] = field(default_factory=lambda: [
-        "You MUST assign your final answer to a variable named `result`"
-    ])
-    
+
+    allowed_modules: list[str] = field(
+        default_factory=lambda: ["pd (pandas)", "np (numpy)"]
+    )
+    disallowed_operations: list[str] = field(
+        default_factory=lambda: [
+            "Network requests (e.g. requests, urllib)",
+            "File system I/O (e.g. open(), os, shutil)",
+            "Process execution (e.g. subprocess, sys)",
+            "Dynamic code execution (e.g. eval(), exec())",
+            "Importing any module not in allowed_modules",
+        ]
+    )
+    available_globals: list[str] = field(
+        default_factory=lambda: ["df (the pandas DataFrame)", "pd", "np"]
+    )
+    required_conventions: list[str] = field(
+        default_factory=lambda: [
+            "You MUST assign your final answer to a variable named `result`"
+        ]
+    )
+
     # Known capability limits that have been discovered during execution
     discovered_limitations: list[str] = field(default_factory=list)
 
@@ -41,7 +52,7 @@ class EnvironmentManifest:
         ]
         for conv in self.required_conventions:
             lines.append(f"  - {conv}")
-        
+
         lines.append("DISALLOWED OPERATIONS (DO NOT USE):")
         for dis in self.disallowed_operations:
             lines.append(f"  - {dis}")
@@ -50,7 +61,7 @@ class EnvironmentManifest:
             lines.append("KNOWN LIMITATIONS (AVOID THESE):")
             for lim in self.discovered_limitations:
                 lines.append(f"  - {lim}")
-        
+
         return "\n".join(lines)
 
 
@@ -59,4 +70,5 @@ class CapabilityError(Exception):
     Raised when the agent attempts an operation that the environment explicitly
     does not support (e.g., importing a blocked module).
     """
+
     pass

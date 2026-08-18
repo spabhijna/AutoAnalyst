@@ -11,8 +11,18 @@ from agent.state import TaskNode
 def test_ready_tasks_respect_dependencies() -> None:
     tasks = [
         TaskNode(task_id="step_1", question="filter", produces_artifact="quarter_df"),
-        TaskNode(task_id="step_2", question="aggregate", depends_on=["step_1"], consumes_artifacts=["quarter_df"]),
-        TaskNode(task_id="step_3", question="summarize", depends_on=["step_2"], consumes_artifacts=["quarter_df"]),
+        TaskNode(
+            task_id="step_2",
+            question="aggregate",
+            depends_on=["step_1"],
+            consumes_artifacts=["quarter_df"],
+        ),
+        TaskNode(
+            task_id="step_3",
+            question="summarize",
+            depends_on=["step_2"],
+            consumes_artifacts=["quarter_df"],
+        ),
     ]
     graph = ExecutionGraph.from_tasks(tasks)
 
@@ -24,8 +34,18 @@ def test_ready_tasks_respect_dependencies() -> None:
 def test_artifact_consumers_are_derived_from_tasks() -> None:
     tasks = [
         TaskNode(task_id="step_1", question="filter", produces_artifact="quarter_df"),
-        TaskNode(task_id="step_2", question="aggregate", depends_on=["step_1"], consumes_artifacts=["quarter_df"]),
-        TaskNode(task_id="step_3", question="other", depends_on=["step_1"], consumes_artifacts=["quarter_df"]),
+        TaskNode(
+            task_id="step_2",
+            question="aggregate",
+            depends_on=["step_1"],
+            consumes_artifacts=["quarter_df"],
+        ),
+        TaskNode(
+            task_id="step_3",
+            question="other",
+            depends_on=["step_1"],
+            consumes_artifacts=["quarter_df"],
+        ),
     ]
     graph = ExecutionGraph.from_tasks(tasks)
 

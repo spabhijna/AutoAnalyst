@@ -35,13 +35,16 @@ from agent.prompts import codegen_prompt, critique_prompt, plan_prompt
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture()
 def small_df() -> pd.DataFrame:
-    return pd.DataFrame({
-        "region": ["North", "South", "East"],
-        "revenue": [100.0, 200.0, 150.0],
-        "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
-    })
+    return pd.DataFrame(
+        {
+            "region": ["North", "South", "East"],
+            "revenue": [100.0, 200.0, 150.0],
+            "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+        }
+    )
 
 
 CALL_LLM = "agent.loop.call_llm"
@@ -50,24 +53,41 @@ WRITE_LOG = "agent.loop.write_log_entry"
 
 
 def _accept_critique() -> str:
-    return json.dumps({"trust": "high", "reason": "Result looks correct.", "action": "accept"})
+    return json.dumps(
+        {"trust": "high", "reason": "Result looks correct.", "action": "accept"}
+    )
 
 
 def _revise_critique() -> str:
-    return json.dumps({"trust": "low", "reason": "Nulls not handled.", "action": "revise_code"})
+    return json.dumps(
+        {"trust": "low", "reason": "Nulls not handled.", "action": "revise_code"}
+    )
 
 
 def _ok_sandbox() -> dict:
-    return {"success": True, "result": "100.0", "stdout": "", "error": None, "error_type": None}
+    return {
+        "success": True,
+        "result": "100.0",
+        "stdout": "",
+        "error": None,
+        "error_type": None,
+    }
 
 
 def _fail_sandbox() -> dict:
-    return {"success": False, "result": None, "stdout": "", "error": "NameError: x", "error_type": "NameError"}
+    return {
+        "success": False,
+        "result": None,
+        "stdout": "",
+        "error": "NameError: x",
+        "error_type": "NameError",
+    }
 
 
 # ---------------------------------------------------------------------------
 # Helper: run with controlled LLM responses
 # ---------------------------------------------------------------------------
+
 
 def _run_with_responses(
     small_df,
@@ -83,16 +103,23 @@ def _run_with_responses(
     max_retries_per_step: override so test sequences don't depend on config value.
     """
     all_llm = [plan_response] + llm_side_effects
-    with patch(CALL_LLM, side_effect=all_llm), \
-         patch(RUN_SANDBOXED, side_effect=sandbox_side_effects), \
-         patch(WRITE_LOG):
-        return run("test goal", small_df, log_dir="/tmp/test_runs",
-                   max_retries_per_step=max_retries_per_step)
+    with (
+        patch(CALL_LLM, side_effect=all_llm),
+        patch(RUN_SANDBOXED, side_effect=sandbox_side_effects),
+        patch(WRITE_LOG),
+    ):
+        return run(
+            "test goal",
+            small_df,
+            log_dir="/tmp/test_runs",
+            max_retries_per_step=max_retries_per_step,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Loop control — accept path
 # ---------------------------------------------------------------------------
+
 
 class TestAcceptPath:
     def test_single_question_accepted(self, small_df: pd.DataFrame) -> None:
@@ -102,12 +129,21 @@ class TestAcceptPath:
             plan_response='["What is total revenue?"]',
             llm_side_effects=[
                 "result = df['revenue'].sum()",  # codegen
-                _accept_critique(),              # critique
-                "Summary text.",                 # summary
+                _accept_critique(),  # critique
+                "Summary text.",  # summary
             ],
             sandbox_side_effects=[_ok_sandbox()],
         )
-        assert len([h for h in state.history if h["sub_question"] == "What is total revenue?"]) == 1
+        assert (
+            len(
+                [
+                    h
+                    for h in state.history
+                    if h["sub_question"] == "What is total revenue?"
+                ]
+            )
+            == 1
+        )
         assert state.history[0]["action"] == "accept"
         assert state.summary == "Summary text."
 
@@ -117,11 +153,11 @@ class TestAcceptPath:
             small_df,
             plan_response='["Q1?", "Q2?"]',
             llm_side_effects=[
-                "result = 1",   # codegen Q1
+                "result = 1",  # codegen Q1
                 _accept_critique(),  # critique Q1
-                "result = 2",   # codegen Q2
+                "result = 2",  # codegen Q2
                 _accept_critique(),  # critique Q2
-                "Summary.",     # summary
+                "Summary.",  # summary
             ],
             sandbox_side_effects=[_ok_sandbox(), _ok_sandbox()],
         )
@@ -133,6 +169,7 @@ class TestAcceptPath:
 # Loop control — revise_code path
 # ---------------------------------------------------------------------------
 
+
 class TestReviseCode:
     def test_retry_on_first_failure_then_accept(self, small_df: pd.DataFrame) -> None:
         """Critique says revise_code once, then accept on retry."""
@@ -140,15 +177,17 @@ class TestReviseCode:
             small_df,
             plan_response='["What is revenue?"]',
             llm_side_effects=[
-                "result = bad_code()",   # codegen attempt 0
-                _revise_critique(),      # critique → revise
+                "result = bad_code()",  # codegen attempt 0
+                _revise_critique(),  # critique → revise
                 "result = df['revenue'].sum()",  # codegen attempt 1
-                _accept_critique(),      # critique → accept
+                _accept_critique(),  # critique → accept
                 "Summary.",
             ],
             sandbox_side_effects=[_ok_sandbox(), _ok_sandbox()],
         )
-        q_entries = [h for h in state.history if h["sub_question"] == "What is revenue?"]
+        q_entries = [
+            h for h in state.history if h["sub_question"] == "What is revenue?"
+        ]
         assert len(q_entries) == 2
         assert q_entries[0]["action"] == "revise_code"
         assert q_entries[1]["action"] == "accept"
@@ -186,13 +225,21 @@ class TestReviseCode:
         for _ in range(max_r):
             interleaved.append("result = bad()")
             interleaved.append(_revise_critique())
-        with patch(CALL_LLM, side_effect=[
-            '["Q1 fails?", "Q2 never runs?"]',  # plan
-            *interleaved,
-            # Q2 and summary must NOT be reached
-        ]) as mock_llm, patch(RUN_SANDBOXED, return_value=_ok_sandbox()), \
-           patch(WRITE_LOG):
-            state = run("goal", small_df, log_dir="/tmp/test_runs", max_retries_per_step=max_r)
+        with (
+            patch(
+                CALL_LLM,
+                side_effect=[
+                    '["Q1 fails?", "Q2 never runs?"]',  # plan
+                    *interleaved,
+                    # Q2 and summary must NOT be reached
+                ],
+            ) as mock_llm,
+            patch(RUN_SANDBOXED, return_value=_ok_sandbox()),
+            patch(WRITE_LOG),
+        ):
+            state = run(
+                "goal", small_df, log_dir="/tmp/test_runs", max_retries_per_step=max_r
+            )
 
         assert state.aborted is True
         assert [task.status for task in state.tasks] == ["failed", "skipped"]
@@ -207,8 +254,8 @@ class TestReviseCode:
             plan_response='["Q?"]',
             llm_side_effects=[
                 "result = undefined_var",  # codegen
-                _revise_critique(),        # critique sees failure
-                "result = df.shape[0]",    # codegen retry
+                _revise_critique(),  # critique sees failure
+                "result = df.shape[0]",  # codegen retry
                 _accept_critique(),
                 "Summary.",
             ],
@@ -221,24 +268,33 @@ class TestReviseCode:
 # Loop control — revise_plan path
 # ---------------------------------------------------------------------------
 
+
 class TestRevisePlan:
     def test_revise_plan_replaces_tail(self, small_df: pd.DataFrame) -> None:
         """When critique returns revise_plan, remaining questions are replaced."""
-        revise_plan_critique = json.dumps({
-            "trust": "low",
-            "reason": "Wrong question framing.",
-            "action": "revise_plan",
-        })
-        with patch(CALL_LLM, side_effect=[
-            '["Q1?", "Q2_bad?"]',     # initial plan
-            "result = 1",             # codegen Q1
-            revise_plan_critique,     # critique Q1 → revise_plan
-            '["Q2_new?"]',            # replan
-            "result = 2",             # codegen Q2_new
-            _accept_critique(),       # critique Q2_new
-            "Summary.",
-        ]), patch(RUN_SANDBOXED, side_effect=[_ok_sandbox(), _ok_sandbox()]), \
-           patch(WRITE_LOG):
+        revise_plan_critique = json.dumps(
+            {
+                "trust": "low",
+                "reason": "Wrong question framing.",
+                "action": "revise_plan",
+            }
+        )
+        with (
+            patch(
+                CALL_LLM,
+                side_effect=[
+                    '["Q1?", "Q2_bad?"]',  # initial plan
+                    "result = 1",  # codegen Q1
+                    revise_plan_critique,  # critique Q1 → revise_plan
+                    '["Q2_new?"]',  # replan
+                    "result = 2",  # codegen Q2_new
+                    _accept_critique(),  # critique Q2_new
+                    "Summary.",
+                ],
+            ),
+            patch(RUN_SANDBOXED, side_effect=[_ok_sandbox(), _ok_sandbox()]),
+            patch(WRITE_LOG),
+        ):
             state = run("goal", small_df, log_dir="/tmp/test_runs")
 
         assert "Q2_bad?" not in [h["sub_question"] for h in state.history]
@@ -247,7 +303,10 @@ class TestRevisePlan:
     def test_plan_revision_cap(self, small_df: pd.DataFrame) -> None:
         """After MAX_PLAN_REVISIONS, revise_plan requests are ignored."""
         from agent.loop import MAX_PLAN_REVISIONS
-        revise_critique = json.dumps({"trust": "low", "reason": ".", "action": "revise_plan"})
+
+        revise_critique = json.dumps(
+            {"trust": "low", "reason": ".", "action": "revise_plan"}
+        )
 
         # Build enough responses to hit the cap
         llm_calls = ['["Q1?"]']
@@ -257,9 +316,11 @@ class TestRevisePlan:
             sandbox_calls.append(_ok_sandbox())
         llm_calls.append("Summary.")
 
-        with patch(CALL_LLM, side_effect=llm_calls), \
-             patch(RUN_SANDBOXED, side_effect=sandbox_calls), \
-             patch(WRITE_LOG):
+        with (
+            patch(CALL_LLM, side_effect=llm_calls),
+            patch(RUN_SANDBOXED, side_effect=sandbox_calls),
+            patch(WRITE_LOG),
+        ):
             state = run("goal", small_df, log_dir="/tmp/test_runs")
 
         assert state.plan_revisions <= MAX_PLAN_REVISIONS
@@ -269,16 +330,23 @@ class TestRevisePlan:
 # Logging
 # ---------------------------------------------------------------------------
 
+
 class TestLogging:
     def test_log_written_per_iteration(self, small_df: pd.DataFrame) -> None:
         """write_log_entry must be called for every iteration + plan + summary."""
-        with patch(CALL_LLM, side_effect=[
-            '["Q?"]',
-            "result = 1",
-            _accept_critique(),
-            "Summary.",
-        ]), patch(RUN_SANDBOXED, return_value=_ok_sandbox()), \
-           patch(WRITE_LOG) as mock_log:
+        with (
+            patch(
+                CALL_LLM,
+                side_effect=[
+                    '["Q?"]',
+                    "result = 1",
+                    _accept_critique(),
+                    "Summary.",
+                ],
+            ),
+            patch(RUN_SANDBOXED, return_value=_ok_sandbox()),
+            patch(WRITE_LOG) as mock_log,
+        ):
             run("goal", small_df, log_dir="/tmp/test_runs")
 
         # At minimum: plan entry + 1 codegen_execute_critique entry + summary entry
@@ -287,16 +355,24 @@ class TestLogging:
     def test_run_id_stable_across_entries(self, small_df: pd.DataFrame) -> None:
         """All log entries must share the same run_id."""
         logged_entries = []
-        with patch(CALL_LLM, side_effect=[
-            '["Q?"]', "result = 1", _accept_critique(), "Summary.",
-        ]), patch(RUN_SANDBOXED, return_value=_ok_sandbox()), \
-           patch(WRITE_LOG, side_effect=lambda e, *a, **k: logged_entries.append(e)):
+        with (
+            patch(
+                CALL_LLM,
+                side_effect=[
+                    '["Q?"]',
+                    "result = 1",
+                    _accept_critique(),
+                    "Summary.",
+                ],
+            ),
+            patch(RUN_SANDBOXED, return_value=_ok_sandbox()),
+            patch(WRITE_LOG, side_effect=lambda e, *a, **k: logged_entries.append(e)),
+        ):
             state = run("goal", small_df, log_dir="/tmp/test_runs")
 
         run_ids = {e.run_id for e in logged_entries}
         assert len(run_ids) == 1
         assert state.run_id in run_ids
-
 
 
 # ---------------------------------------------------------------------------
@@ -315,12 +391,27 @@ class TestSummaryWorkingMemory:
         """Intermediate revise_code entries must not appear in accepted_findings."""
         q = "What is total revenue?"
         history = [
-            {"sub_question": q, "iteration": 0, "action": "revise_code", "trust": "low",
-             "sandbox_result": {"result": None}},
-            {"sub_question": q, "iteration": 1, "action": "revise_code", "trust": "low",
-             "sandbox_result": {"result": None}},
-            {"sub_question": q, "iteration": 2, "action": "accept", "trust": "high",
-             "sandbox_result": {"result": "{'East': 100}"}},
+            {
+                "sub_question": q,
+                "iteration": 0,
+                "action": "revise_code",
+                "trust": "low",
+                "sandbox_result": {"result": None},
+            },
+            {
+                "sub_question": q,
+                "iteration": 1,
+                "action": "revise_code",
+                "trust": "low",
+                "sandbox_result": {"result": None},
+            },
+            {
+                "sub_question": q,
+                "iteration": 2,
+                "action": "accept",
+                "trust": "high",
+                "sandbox_result": {"result": "{'East': 100}"},
+            },
         ]
         state = self._make_state([q], history)
         findings = _accepted_findings(state)
@@ -333,10 +424,20 @@ class TestSummaryWorkingMemory:
         """Findings are returned in plan order, not history insertion order."""
         q1, q2 = "Q1?", "Q2?"
         history = [
-            {"sub_question": q1, "iteration": 0, "action": "accept", "trust": "high",
-             "sandbox_result": {"result": "A1"}},
-            {"sub_question": q2, "iteration": 0, "action": "accept", "trust": "high",
-             "sandbox_result": {"result": "A2"}},
+            {
+                "sub_question": q1,
+                "iteration": 0,
+                "action": "accept",
+                "trust": "high",
+                "sandbox_result": {"result": "A1"},
+            },
+            {
+                "sub_question": q2,
+                "iteration": 0,
+                "action": "accept",
+                "trust": "high",
+                "sandbox_result": {"result": "A2"},
+            },
         ]
         state = self._make_state([q1, q2], history)
         findings = _accepted_findings(state)
@@ -345,15 +446,21 @@ class TestSummaryWorkingMemory:
 
     def test_summary_llm_sees_only_accepted_entry(self, small_df: pd.DataFrame) -> None:
         """End-to-end: a step with 2 iterations should produce exactly 1 finding."""
-        with patch(CALL_LLM, side_effect=[
-            '[\"Q with retries?\"]',   # plan
-            "result = bad()",          # codegen iter 0
-            _revise_critique(),        # critique iter 0
-            "result = df.shape[0]",    # codegen iter 1
-            _accept_critique(),        # critique iter 1
-            "Summary.",                # summary
-        ]) as mock_llm, patch(RUN_SANDBOXED, side_effect=[_fail_sandbox(), _ok_sandbox()]), \
-           patch(WRITE_LOG):
+        with (
+            patch(
+                CALL_LLM,
+                side_effect=[
+                    '["Q with retries?"]',  # plan
+                    "result = bad()",  # codegen iter 0
+                    _revise_critique(),  # critique iter 0
+                    "result = df.shape[0]",  # codegen iter 1
+                    _accept_critique(),  # critique iter 1
+                    "Summary.",  # summary
+                ],
+            ) as mock_llm,
+            patch(RUN_SANDBOXED, side_effect=[_fail_sandbox(), _ok_sandbox()]),
+            patch(WRITE_LOG),
+        ):
             run("goal", small_df, log_dir="/tmp/test_runs")
 
         # The summary call is the last one. Extract its prompt.
@@ -416,23 +523,27 @@ class TestSummaryWorkingMemory:
                 "action": "accept",
                 "trust": "high",
                 "code": "result = 450",
-                "critique": json.dumps({
-                    "trust": "high",
-                    "reason": "accepted",
-                    "action": "accept",
-                }),
+                "critique": json.dumps(
+                    {
+                        "trust": "high",
+                        "reason": "accepted",
+                        "action": "accept",
+                    }
+                ),
                 "sandbox_result": {"result": "450"},
             },
         ]
         state = self._make_state([q], history)
 
         prompt_payload = _final_results(state)
-        assert prompt_payload == [{
-            "question": q,
-            "answer": "450",
-            "trust": "high",
-            "artifact_key": "step_1_what_is_total_revenue",
-        }]
+        assert prompt_payload == [
+            {
+                "question": q,
+                "answer": "450",
+                "trust": "high",
+                "artifact_key": "step_1_what_is_total_revenue",
+            }
+        ]
         assert all("NameError" not in str(row) for row in prompt_payload)
         assert all("broken" not in str(row) for row in prompt_payload)
 
@@ -441,14 +552,15 @@ class TestSummaryWorkingMemory:
 # _parse_plan_json — structured plan parser
 # ---------------------------------------------------------------------------
 
+
 class TestParsePlanJson:
     def test_parses_structured_format(self) -> None:
         """Structured task-spec JSON is correctly parsed."""
-        raw = '''[
+        raw = """[
           {"question": "Filter to last quarter", "produces_artifact": "quarter_df", "consumes_artifacts": []},
           {"question": "Revenue by region", "produces_artifact": "region_revenue", "consumes_artifacts": ["quarter_df"]},
           {"question": "Top region?", "produces_artifact": null, "consumes_artifacts": ["region_revenue"]}
-        ]'''
+        ]"""
         specs = _parse_plan_json(raw)
         assert len(specs) == 3
         assert specs[0]["question"] == "Filter to last quarter"
@@ -468,27 +580,47 @@ class TestParsePlanJson:
 
     def test_flat_format_works_in_run_loop(self, small_df: pd.DataFrame) -> None:
         """End-to-end: flat plan responses work identically to before."""
-        with patch(CALL_LLM, side_effect=[
-            '["Q1?", "Q2?"]',
-            "result = 1", _accept_critique(),
-            "result = 2", _accept_critique(),
-            "Summary.",
-        ]), patch(RUN_SANDBOXED, return_value=_ok_sandbox()), patch(WRITE_LOG):
+        with (
+            patch(
+                CALL_LLM,
+                side_effect=[
+                    '["Q1?", "Q2?"]',
+                    "result = 1",
+                    _accept_critique(),
+                    "result = 2",
+                    _accept_critique(),
+                    "Summary.",
+                ],
+            ),
+            patch(RUN_SANDBOXED, return_value=_ok_sandbox()),
+            patch(WRITE_LOG),
+        ):
             state = run("test goal", small_df, log_dir="/tmp/test_runs")
         assert len(state.history) == 2
 
-    def test_structured_format_populates_task_node(self, small_df: pd.DataFrame) -> None:
+    def test_structured_format_populates_task_node(
+        self, small_df: pd.DataFrame
+    ) -> None:
         """Structured plan correctly sets TaskNode.produces_artifact and consumes_artifacts."""
         structured_plan = (
             '[{"question": "Filter df to last quarter", "produces_artifact": "quarter_df", "consumes_artifacts": []},'  # noqa: E501
             ' {"question": "Revenue by region", "produces_artifact": null, "consumes_artifacts": ["quarter_df"]}]'
         )
-        with patch(CALL_LLM, side_effect=[
-            structured_plan,
-            "quarter_df = df.copy()\nresult = quarter_df", _accept_critique(),
-            "result = 42", _accept_critique(),
-            "Summary.",
-        ]), patch(RUN_SANDBOXED, return_value=_ok_sandbox()), patch(WRITE_LOG):
+        with (
+            patch(
+                CALL_LLM,
+                side_effect=[
+                    structured_plan,
+                    "quarter_df = df.copy()\nresult = quarter_df",
+                    _accept_critique(),
+                    "result = 42",
+                    _accept_critique(),
+                    "Summary.",
+                ],
+            ),
+            patch(RUN_SANDBOXED, return_value=_ok_sandbox()),
+            patch(WRITE_LOG),
+        ):
             state = run("test goal", small_df, log_dir="/tmp/test_runs")
         assert state.tasks[0].produces_artifact == "quarter_df"
         assert state.tasks[1].consumes_artifacts == ["quarter_df"]
@@ -496,7 +628,9 @@ class TestParsePlanJson:
 
     def test_null_produces_artifact_becomes_none(self) -> None:
         """JSON null in produces_artifact is coerced to Python None."""
-        raw = '[{"question": "Q?", "produces_artifact": null, "consumes_artifacts": []}]'
+        raw = (
+            '[{"question": "Q?", "produces_artifact": null, "consumes_artifacts": []}]'
+        )
         specs = _parse_plan_json(raw)
         assert specs[0]["produces_artifact"] is None
 
@@ -512,9 +646,11 @@ class TestParsePlanJson:
 # Helper function unit tests
 # ---------------------------------------------------------------------------
 
-class TestHelpers:
 
-    def test_build_schema_summary_contains_columns(self, small_df: pd.DataFrame) -> None:
+class TestHelpers:
+    def test_build_schema_summary_contains_columns(
+        self, small_df: pd.DataFrame
+    ) -> None:
         summary = _build_schema_summary(small_df)
         assert "region" in summary
         assert "revenue" in summary
@@ -543,7 +679,9 @@ class TestHelpers:
         assert parsed["action"] == "accept"
 
     def test_parse_critique_json_with_fences(self) -> None:
-        raw = '```json\n{"trust": "low", "reason": "Bad.", "action": "revise_code"}\n```'
+        raw = (
+            '```json\n{"trust": "low", "reason": "Bad.", "action": "revise_code"}\n```'
+        )
         parsed = _parse_critique_json(raw)
         assert parsed["action"] == "revise_code"
 
@@ -568,6 +706,7 @@ class TestHelpers:
 # Prompt template smoke tests
 # ---------------------------------------------------------------------------
 
+
 class TestPromptTemplates:
     def test_plan_prompt_contains_goal(self) -> None:
         p = plan_prompt("my special goal", "col1, col2")
@@ -576,12 +715,19 @@ class TestPromptTemplates:
 
     def test_codegen_prompt_contains_result_convention(self) -> None:
         from agent.environment import EnvironmentManifest
-        p = codegen_prompt("goal", "How much revenue?", "col1 (float)", environment_manifest=EnvironmentManifest().as_prompt_text())
+
+        p = codegen_prompt(
+            "goal",
+            "How much revenue?",
+            "col1 (float)",
+            environment_manifest=EnvironmentManifest().as_prompt_text(),
+        )
         assert "result" in p
         assert "import" in p.lower()  # warns against import
 
     def test_repair_prompt_includes_retry_context(self) -> None:
         from agent.prompts import repair_prompt
+
         p = repair_prompt(
             "goal",
             "Q?",
@@ -630,7 +776,10 @@ class TestPromptTemplates:
         )
         assert "last quarter" in p.lower()
         assert "revise_code" in p
-        assert "previous accepted finding" in p.lower() or "previously accepted" in p.lower()
+        assert (
+            "previous accepted finding" in p.lower()
+            or "previously accepted" in p.lower()
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -665,13 +814,19 @@ class TestMarkdownFenceStripping:
     def test_codegen_strips_fences_before_sandbox(self, small_df: pd.DataFrame) -> None:
         """End-to-end: even if LLM wraps code in fences, sandbox receives clean code."""
         fenced_code = "```python\nresult = df['revenue'].sum()\n```"
-        with patch(CALL_LLM, side_effect=[
-            '["Q?"]',
-            fenced_code,        # codegen returns fenced output
-            _accept_critique(),
-            "Summary.",
-        ]), patch(RUN_SANDBOXED, return_value=_ok_sandbox()) as mock_sandbox, \
-           patch(WRITE_LOG):
+        with (
+            patch(
+                CALL_LLM,
+                side_effect=[
+                    '["Q?"]',
+                    fenced_code,  # codegen returns fenced output
+                    _accept_critique(),
+                    "Summary.",
+                ],
+            ),
+            patch(RUN_SANDBOXED, return_value=_ok_sandbox()) as mock_sandbox,
+            patch(WRITE_LOG),
+        ):
             run("goal", small_df, log_dir="/tmp/test_runs")
 
         # Sandbox must receive the clean code, not the fenced version

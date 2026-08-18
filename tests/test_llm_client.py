@@ -57,15 +57,24 @@ SLEEP = "agent.llm_client.time.sleep"
 
 class TestGroqSuccessOnFirstAttempt:
     def test_returns_groq_response(self) -> None:
-        with patch(GROQ, return_value="groq answer"), \
-             patch(SLEEP), patch(CEREBRAS), patch(OPENROUTER), patch(GEMINI):
+        with (
+            patch(GROQ, return_value="groq answer"),
+            patch(SLEEP),
+            patch(CEREBRAS),
+            patch(OPENROUTER),
+            patch(GEMINI),
+        ):
             result = call_llm("prompt", role="plan")
         assert result == "groq answer"
 
     def test_no_sleep_on_success(self) -> None:
-        with patch(GROQ, return_value="ok"), \
-             patch(SLEEP) as mock_sleep, \
-             patch(CEREBRAS), patch(OPENROUTER), patch(GEMINI):
+        with (
+            patch(GROQ, return_value="ok"),
+            patch(SLEEP) as mock_sleep,
+            patch(CEREBRAS),
+            patch(OPENROUTER),
+            patch(GEMINI),
+        ):
             call_llm("prompt", role="codegen")
         mock_sleep.assert_not_called()
 
@@ -85,9 +94,13 @@ class TestRetry:
                 raise r
             return r
 
-        with patch(GROQ, side_effect=side) as mock_groq, \
-             patch(SLEEP) as mock_sleep, \
-             patch(CEREBRAS), patch(OPENROUTER), patch(GEMINI):
+        with (
+            patch(GROQ, side_effect=side) as mock_groq,
+            patch(SLEEP) as mock_sleep,
+            patch(CEREBRAS),
+            patch(OPENROUTER),
+            patch(GEMINI),
+        ):
             result = call_llm("prompt", role="plan")
 
         assert result == "groq retry answer"
@@ -103,9 +116,13 @@ class TestRetry:
                 raise r
             return r
 
-        with patch(GROQ, side_effect=side), \
-             patch(SLEEP) as mock_sleep, \
-             patch(CEREBRAS), patch(OPENROUTER), patch(GEMINI):
+        with (
+            patch(GROQ, side_effect=side),
+            patch(SLEEP) as mock_sleep,
+            patch(CEREBRAS),
+            patch(OPENROUTER),
+            patch(GEMINI),
+        ):
             call_llm("prompt", role="codegen")
 
         mock_sleep.assert_called_once_with(RETRY_BACKOFF_SECONDS)
@@ -118,18 +135,26 @@ class TestRetry:
 
 class TestPlanChain:
     def test_openrouter_called_after_groq_fails_twice(self) -> None:
-        with patch(GROQ, side_effect=Exception("groq down")), \
-             patch(OPENROUTER, return_value="or answer") as mock_or, \
-             patch(SLEEP), patch(CEREBRAS), patch(GEMINI):
+        with (
+            patch(GROQ, side_effect=Exception("groq down")),
+            patch(OPENROUTER, return_value="or answer") as mock_or,
+            patch(SLEEP),
+            patch(CEREBRAS),
+            patch(GEMINI),
+        ):
             result = call_llm("prompt", role="plan")
 
         assert result == "or answer"
         assert mock_or.called
 
     def test_plan_openrouter_uses_fallback_model(self) -> None:
-        with patch(GROQ, side_effect=Exception("down")), \
-             patch(OPENROUTER, return_value="ok") as mock_or, \
-             patch(SLEEP), patch(CEREBRAS), patch(GEMINI):
+        with (
+            patch(GROQ, side_effect=Exception("down")),
+            patch(OPENROUTER, return_value="ok") as mock_or,
+            patch(SLEEP),
+            patch(CEREBRAS),
+            patch(GEMINI),
+        ):
             call_llm("prompt", role="plan")
 
         _, called_model = mock_or.call_args[0]
@@ -143,36 +168,52 @@ class TestPlanChain:
 
 class TestCodegenChain:
     def test_cerebras_called_after_groq_fails(self) -> None:
-        with patch(GROQ, side_effect=Exception("groq down")), \
-             patch(CEREBRAS, return_value="cerebras answer") as mock_cb, \
-             patch(OPENROUTER), patch(GEMINI), patch(SLEEP):
+        with (
+            patch(GROQ, side_effect=Exception("groq down")),
+            patch(CEREBRAS, return_value="cerebras answer") as mock_cb,
+            patch(OPENROUTER),
+            patch(GEMINI),
+            patch(SLEEP),
+        ):
             result = call_llm("prompt", role="codegen")
 
         assert result == "cerebras answer"
         assert mock_cb.called
 
     def test_codegen_groq_uses_codestral(self) -> None:
-        with patch(GROQ, return_value="ok") as mock_groq, \
-             patch(SLEEP), patch(CEREBRAS), patch(OPENROUTER), patch(GEMINI):
+        with (
+            patch(GROQ, return_value="ok") as mock_groq,
+            patch(SLEEP),
+            patch(CEREBRAS),
+            patch(OPENROUTER),
+            patch(GEMINI),
+        ):
             call_llm("prompt", role="codegen")
 
         _, called_model = mock_groq.call_args[0]
         assert called_model == GROQ_CODEGEN_MODEL
 
     def test_codegen_cerebras_uses_correct_model(self) -> None:
-        with patch(GROQ, side_effect=Exception("down")), \
-             patch(CEREBRAS, return_value="ok") as mock_cb, \
-             patch(OPENROUTER), patch(GEMINI), patch(SLEEP):
+        with (
+            patch(GROQ, side_effect=Exception("down")),
+            patch(CEREBRAS, return_value="ok") as mock_cb,
+            patch(OPENROUTER),
+            patch(GEMINI),
+            patch(SLEEP),
+        ):
             call_llm("prompt", role="codegen")
 
         _, called_model = mock_cb.call_args[0]
         assert called_model == CEREBRAS_CODEGEN_FALLBACK_MODEL
 
     def test_openrouter_fallback_after_groq_and_cerebras_fail(self) -> None:
-        with patch(GROQ, side_effect=Exception("groq down")), \
-             patch(CEREBRAS, side_effect=Exception("cerebras down")), \
-             patch(OPENROUTER, return_value="or answer") as mock_or, \
-             patch(GEMINI), patch(SLEEP):
+        with (
+            patch(GROQ, side_effect=Exception("groq down")),
+            patch(CEREBRAS, side_effect=Exception("cerebras down")),
+            patch(OPENROUTER, return_value="or answer") as mock_or,
+            patch(GEMINI),
+            patch(SLEEP),
+        ):
             result = call_llm("prompt", role="codegen")
 
         assert result == "or answer"
@@ -186,46 +227,65 @@ class TestCodegenChain:
 
 class TestCritiqueChain:
     def test_groq_critique_uses_correct_model(self) -> None:
-        with patch(GROQ, return_value="ok") as mock_groq, \
-             patch(SLEEP), patch(CEREBRAS), patch(OPENROUTER), patch(GEMINI):
+        with (
+            patch(GROQ, return_value="ok") as mock_groq,
+            patch(SLEEP),
+            patch(CEREBRAS),
+            patch(OPENROUTER),
+            patch(GEMINI),
+        ):
             call_llm("prompt", role="critique")
 
         _, called_model = mock_groq.call_args[0]
         assert called_model == GROQ_CRITIQUE_MODEL
 
     def test_cerebras_called_after_groq_fails(self) -> None:
-        with patch(GROQ, side_effect=Exception("groq down")), \
-             patch(CEREBRAS, return_value="cerebras answer") as mock_cb, \
-             patch(OPENROUTER), patch(GEMINI), patch(SLEEP):
+        with (
+            patch(GROQ, side_effect=Exception("groq down")),
+            patch(CEREBRAS, return_value="cerebras answer") as mock_cb,
+            patch(OPENROUTER),
+            patch(GEMINI),
+            patch(SLEEP),
+        ):
             result = call_llm("prompt", role="critique")
 
         assert result == "cerebras answer"
         assert mock_cb.called
 
     def test_critique_cerebras_uses_correct_model(self) -> None:
-        with patch(GROQ, side_effect=Exception("down")), \
-             patch(CEREBRAS, return_value="ok") as mock_cb, \
-             patch(OPENROUTER), patch(GEMINI), patch(SLEEP):
+        with (
+            patch(GROQ, side_effect=Exception("down")),
+            patch(CEREBRAS, return_value="ok") as mock_cb,
+            patch(OPENROUTER),
+            patch(GEMINI),
+            patch(SLEEP),
+        ):
             call_llm("prompt", role="critique")
 
         _, called_model = mock_cb.call_args[0]
         assert called_model == CEREBRAS_CRITIQUE_FALLBACK_MODEL
 
     def test_gemini_after_groq_and_cerebras_fail(self) -> None:
-        with patch(GROQ, side_effect=Exception("groq down")), \
-             patch(CEREBRAS, side_effect=Exception("cerebras down")), \
-             patch(GEMINI, return_value="gemini answer") as mock_gm, \
-             patch(OPENROUTER), patch(SLEEP):
+        with (
+            patch(GROQ, side_effect=Exception("groq down")),
+            patch(CEREBRAS, side_effect=Exception("cerebras down")),
+            patch(GEMINI, return_value="gemini answer") as mock_gm,
+            patch(OPENROUTER),
+            patch(SLEEP),
+        ):
             result = call_llm("prompt", role="critique")
 
         assert result == "gemini answer"
         assert mock_gm.called
 
     def test_gemini_uses_fallback_model(self) -> None:
-        with patch(GROQ, side_effect=Exception("down")), \
-             patch(CEREBRAS, side_effect=Exception("down")), \
-             patch(GEMINI, return_value="ok") as mock_gm, \
-             patch(OPENROUTER), patch(SLEEP):
+        with (
+            patch(GROQ, side_effect=Exception("down")),
+            patch(CEREBRAS, side_effect=Exception("down")),
+            patch(GEMINI, return_value="ok") as mock_gm,
+            patch(OPENROUTER),
+            patch(SLEEP),
+        ):
             call_llm("prompt", role="critique")
 
         _, called_model = mock_gm.call_args[0]
@@ -239,10 +299,13 @@ class TestCritiqueChain:
 
 class TestTotalFailure:
     def test_raises_llm_unavailable_error(self) -> None:
-        with patch(GROQ, side_effect=Exception("groq dead")), \
-             patch(CEREBRAS, side_effect=Exception("cerebras dead")), \
-             patch(GEMINI, side_effect=Exception("gemini dead")), \
-             patch(OPENROUTER), patch(SLEEP):
+        with (
+            patch(GROQ, side_effect=Exception("groq dead")),
+            patch(CEREBRAS, side_effect=Exception("cerebras dead")),
+            patch(GEMINI, side_effect=Exception("gemini dead")),
+            patch(OPENROUTER),
+            patch(SLEEP),
+        ):
             with pytest.raises(LLMUnavailableError):
                 call_llm("prompt", role="critique")
 
@@ -251,10 +314,13 @@ class TestTotalFailure:
         cerebras_exc = RuntimeError("cerebras 429")
         gemini_exc = RuntimeError("gemini timeout")
 
-        with patch(GROQ, side_effect=groq_exc), \
-             patch(CEREBRAS, side_effect=cerebras_exc), \
-             patch(GEMINI, side_effect=gemini_exc), \
-             patch(OPENROUTER), patch(SLEEP):
+        with (
+            patch(GROQ, side_effect=groq_exc),
+            patch(CEREBRAS, side_effect=cerebras_exc),
+            patch(GEMINI, side_effect=gemini_exc),
+            patch(OPENROUTER),
+            patch(SLEEP),
+        ):
             with pytest.raises(LLMUnavailableError) as exc_info:
                 call_llm("prompt", role="critique")
 
@@ -265,9 +331,13 @@ class TestTotalFailure:
 
     def test_plain_chain_all_fail_raises(self) -> None:
         """Plan chain (Groq→OpenRouter) both failing raises LLMUnavailableError."""
-        with patch(GROQ, side_effect=Exception("dead")), \
-             patch(OPENROUTER, side_effect=Exception("dead")), \
-             patch(SLEEP), patch(CEREBRAS), patch(GEMINI):
+        with (
+            patch(GROQ, side_effect=Exception("dead")),
+            patch(OPENROUTER, side_effect=Exception("dead")),
+            patch(SLEEP),
+            patch(CEREBRAS),
+            patch(GEMINI),
+        ):
             with pytest.raises(LLMUnavailableError):
                 call_llm("prompt", role="plan")
 
@@ -279,29 +349,49 @@ class TestTotalFailure:
 
 class TestRoleModelRouting:
     def test_plan_uses_default_groq_model(self) -> None:
-        with patch(GROQ, return_value="ok") as mock_groq, \
-             patch(SLEEP), patch(CEREBRAS), patch(OPENROUTER), patch(GEMINI):
+        with (
+            patch(GROQ, return_value="ok") as mock_groq,
+            patch(SLEEP),
+            patch(CEREBRAS),
+            patch(OPENROUTER),
+            patch(GEMINI),
+        ):
             call_llm("p", role="plan")
         _, called_model = mock_groq.call_args[0]
         assert called_model == GROQ_DEFAULT_MODEL
 
     def test_codegen_uses_codestral_model(self) -> None:
-        with patch(GROQ, return_value="ok") as mock_groq, \
-             patch(SLEEP), patch(CEREBRAS), patch(OPENROUTER), patch(GEMINI):
+        with (
+            patch(GROQ, return_value="ok") as mock_groq,
+            patch(SLEEP),
+            patch(CEREBRAS),
+            patch(OPENROUTER),
+            patch(GEMINI),
+        ):
             call_llm("p", role="codegen")
         _, called_model = mock_groq.call_args[0]
         assert called_model == GROQ_CODEGEN_MODEL
 
     def test_critique_uses_critique_model(self) -> None:
-        with patch(GROQ, return_value="ok") as mock_groq, \
-             patch(SLEEP), patch(CEREBRAS), patch(OPENROUTER), patch(GEMINI):
+        with (
+            patch(GROQ, return_value="ok") as mock_groq,
+            patch(SLEEP),
+            patch(CEREBRAS),
+            patch(OPENROUTER),
+            patch(GEMINI),
+        ):
             call_llm("p", role="critique")
         _, called_model = mock_groq.call_args[0]
         assert called_model == GROQ_CRITIQUE_MODEL
 
     def test_observe_uses_default_groq_model(self) -> None:
-        with patch(GROQ, return_value="ok") as mock_groq, \
-             patch(SLEEP), patch(CEREBRAS), patch(OPENROUTER), patch(GEMINI):
+        with (
+            patch(GROQ, return_value="ok") as mock_groq,
+            patch(SLEEP),
+            patch(CEREBRAS),
+            patch(OPENROUTER),
+            patch(GEMINI),
+        ):
             call_llm("p", role="observe")
         _, called_model = mock_groq.call_args[0]
         assert called_model == GROQ_DEFAULT_MODEL
@@ -314,17 +404,26 @@ class TestRoleModelRouting:
 
 class TestModelOverride:
     def test_codegen_override_passed_to_all_providers(self) -> None:
-        with patch(GROQ, return_value="ok") as mock_groq, \
-             patch(CEREBRAS), patch(OPENROUTER), patch(GEMINI), patch(SLEEP):
+        with (
+            patch(GROQ, return_value="ok") as mock_groq,
+            patch(CEREBRAS),
+            patch(OPENROUTER),
+            patch(GEMINI),
+            patch(SLEEP),
+        ):
             call_llm("p", role="codegen", model="custom-model")
         _, called_model = mock_groq.call_args[0]
         assert called_model == "custom-model"
 
     def test_critique_override_flows_to_chain(self) -> None:
         """model= override replaces the model at every chain level."""
-        with patch(GROQ, side_effect=Exception("down")), \
-             patch(CEREBRAS, return_value="ok") as mock_cb, \
-             patch(OPENROUTER), patch(GEMINI), patch(SLEEP):
+        with (
+            patch(GROQ, side_effect=Exception("down")),
+            patch(CEREBRAS, return_value="ok") as mock_cb,
+            patch(OPENROUTER),
+            patch(GEMINI),
+            patch(SLEEP),
+        ):
             call_llm("p", role="critique", model="my-model")
 
         _, called_model = mock_cb.call_args[0]
@@ -342,10 +441,12 @@ class TestInvalidRole:
             call_llm("prompt", role="invent")  # type: ignore[arg-type]
 
     def test_no_provider_called_on_bad_role(self) -> None:
-        with patch(GROQ) as mock_groq, \
-             patch(CEREBRAS) as mock_cb, \
-             patch(GEMINI) as mock_gm, \
-             patch(OPENROUTER) as mock_or:
+        with (
+            patch(GROQ) as mock_groq,
+            patch(CEREBRAS) as mock_cb,
+            patch(GEMINI) as mock_gm,
+            patch(OPENROUTER) as mock_or,
+        ):
             with pytest.raises(ValueError):
                 call_llm("prompt", role="badvalue")  # type: ignore[arg-type]
         mock_groq.assert_not_called()

@@ -48,3 +48,5 @@ coverage.xml
 *.log
 
 .vscode
+
+master_prompt.md

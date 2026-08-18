@@ -65,7 +65,9 @@ class LLMUnavailableError(RuntimeError):
         errors: List of (provider_name, exception) tuples for each failed level.
     """
 
-    def __init__(self, message: str, errors: list[tuple[str, Exception]] | None = None) -> None:
+    def __init__(
+        self, message: str, errors: list[tuple[str, Exception]] | None = None
+    ) -> None:
         super().__init__(message)
         self.errors = errors or []
 
@@ -88,18 +90,34 @@ def _build_chain(role: str, model_override: str | None) -> list[ChainLevel]:
     if role == "plan":
         return [
             ("groq", _call_groq, model_override or GROQ_DEFAULT_MODEL),
-            ("openrouter", _call_openrouter, model_override or OPENROUTER_PLAN_FALLBACK_MODEL),
+            (
+                "openrouter",
+                _call_openrouter,
+                model_override or OPENROUTER_PLAN_FALLBACK_MODEL,
+            ),
         ]
     if role == "codegen":
         return [
             ("groq", _call_groq, model_override or GROQ_CODEGEN_MODEL),
-            ("cerebras", _call_cerebras, model_override or CEREBRAS_CODEGEN_FALLBACK_MODEL),
-            ("openrouter", _call_openrouter, model_override or OPENROUTER_CODEGEN_FALLBACK_MODEL),
+            (
+                "cerebras",
+                _call_cerebras,
+                model_override or CEREBRAS_CODEGEN_FALLBACK_MODEL,
+            ),
+            (
+                "openrouter",
+                _call_openrouter,
+                model_override or OPENROUTER_CODEGEN_FALLBACK_MODEL,
+            ),
         ]
     if role == "critique":
         return [
             ("groq", _call_groq, model_override or GROQ_CRITIQUE_MODEL),
-            ("cerebras", _call_cerebras, model_override or CEREBRAS_CRITIQUE_FALLBACK_MODEL),
+            (
+                "cerebras",
+                _call_cerebras,
+                model_override or CEREBRAS_CRITIQUE_FALLBACK_MODEL,
+            ),
             ("gemini", _call_gemini, model_override or GEMINI_FALLBACK_MODEL),
         ]
     # observe and any other role → Groq first, OpenRouter fallback
@@ -132,7 +150,18 @@ def _should_fallback(exc: Exception) -> bool:
     if isinstance(exc, (urllib.error.URLError, TimeoutError, OSError)):
         return True
     # Groq SDK exceptions surface status codes in messages
-    if any(tag in msg for tag in ("rate limit", "rate_limit", "429", "server error", "503", "502", "500")):
+    if any(
+        tag in msg
+        for tag in (
+            "rate limit",
+            "rate_limit",
+            "429",
+            "server error",
+            "503",
+            "502",
+            "500",
+        )
+    ):
         return True
     if any(tag in msg for tag in ("timeout", "timed out", "connection")):
         return True
@@ -143,7 +172,9 @@ def _should_fallback(exc: Exception) -> bool:
     if "404" in msg:
         return False
     # 400 / 401 / 403 are config/auth errors — do NOT fall back
-    if any(tag in msg for tag in ("400", "401", "403", "invalid api key", "unauthorized")):
+    if any(
+        tag in msg for tag in ("400", "401", "403", "invalid api key", "unauthorized")
+    ):
         return False
     # Default: fall back for unknown errors (safer than silently accepting)
     return True
@@ -169,11 +200,15 @@ def _try_with_retry(
     except Exception as exc:  # noqa: BLE001
         if not _should_fallback(exc):
             # Auth / config error — surface immediately
-            logger.error("[call_llm] %s fatal error (not retrying): %s", provider_name, exc)
+            logger.error(
+                "[call_llm] %s fatal error (not retrying): %s", provider_name, exc
+            )
             return None, exc
         logger.warning(
             "[call_llm] %s attempt 1 failed: %s — retrying in %.1fs",
-            provider_name, exc, RETRY_BACKOFF_SECONDS,
+            provider_name,
+            exc,
+            RETRY_BACKOFF_SECONDS,
         )
 
     # ── Attempt 2 (retry) ──────────────────────────────────────────────────
@@ -243,7 +278,9 @@ def _call_cerebras(prompt: str, model: str) -> str:
     try:
         from cerebras.cloud.sdk import Cerebras  # type: ignore[import-untyped]
     except ImportError as exc:
-        raise RuntimeError("cerebras-cloud-sdk not installed. Run: uv add cerebras-cloud-sdk") from exc
+        raise RuntimeError(
+            "cerebras-cloud-sdk not installed. Run: uv add cerebras-cloud-sdk"
+        ) from exc
 
     api_key = os.environ.get("CEREBRAS_API_KEY", "")
     client = Cerebras(api_key=api_key)
@@ -278,11 +315,13 @@ def _call_openrouter(prompt: str, model: str) -> str:
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY not set in environment")
 
-    payload = _json.dumps({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-    }).encode("utf-8")
+    payload = _json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+        }
+    ).encode("utf-8")
 
     req = urllib.request.Request(
         f"{OPENROUTER_BASE_URL}/chat/completions",
@@ -363,9 +402,7 @@ def call_llm(
         LLMUnavailableError:   If every provider in the chain fails.
     """
     if role not in VALID_ROLES:
-        raise ValueError(
-            f"role must be one of {sorted(VALID_ROLES)}, got {role!r}"
-        )
+        raise ValueError(f"role must be one of {sorted(VALID_ROLES)}, got {role!r}")
 
     chain = _build_chain(role, model)
     resolved_model = model or chain[0][2]

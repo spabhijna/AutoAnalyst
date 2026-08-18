@@ -37,8 +37,9 @@ import pandas as pd
 
 from agent import config
 from agent.artifact_store import ArtifactStore
+from agent.capabilities import CapabilityRegistry
+from agent.execution_engine import ExecutionEngine
 from agent.execution_graph import ExecutionGraph
-from agent.executors import try_execute as try_deterministic_execute
 from agent.llm_client import call_llm
 from agent.observer import observe
 from agent.logger import LogEntry, export_run_json, new_run_id, write_log_entry
@@ -140,9 +141,15 @@ class AgentRun:
     aborted: bool = False
     abort_reason: str = ""
     llm_call_count: int = 0
-    environment_manifest: EnvironmentManifest = field(default_factory=EnvironmentManifest)
+    environment_manifest: EnvironmentManifest = field(
+        default_factory=EnvironmentManifest
+    )
     task_memories: dict[str, TaskMemory] = field(default_factory=dict)
     artifact_store: ArtifactStore = field(default_factory=ArtifactStore)
+    capability_registry: CapabilityRegistry = field(
+        default_factory=lambda: ExecutionEngine().registry
+    )
+    execution_engine: ExecutionEngine = field(default_factory=ExecutionEngine)
     execution_graph: ExecutionGraph = field(default_factory=ExecutionGraph)
 
     @property
@@ -190,7 +197,9 @@ class AgentRun:
                     reason=_parse_critique_json(attempt.critique).get("reason", ""),
                 )
                 self.working_memory.add_finding(finding)
-        self.final_results = self.working_memory.accepted_findings(_task_order(self.tasks))
+        self.final_results = self.working_memory.accepted_findings(
+            _task_order(self.tasks)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -232,30 +241,33 @@ def run(
     )
 
     logger.info("=== AgentRun start: run_id=%s ===", state.run_id)
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  run_id : {state.run_id}")
     print(f"  goal   : {goal}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     # ── Inject dry-run mode ─────────────────────────────────────────────────
     if dry_run:
         import sys as _sys
+
         _m = _sys.modules[__name__]
 
         def _dry_call(prompt: str, role: str, model: str | None = None) -> str:
             plan_json = (
-                '["Filter to last quarter and return quarter_df", '
-                '"What is total revenue by region in the last quarter?", '
-                '"Which region had highest revenue and which category drove it?", '
-                '"Check if top region performance was consistent month-over-month", '
-                '"What was the overall revenue trend by region over the quarter?"]'
+                '[{"question": "Filter to last quarter and return quarter_df", "capability": "FilterByDateRange", "produces_artifact": "quarter_df", "consumes_artifacts": [], "output_schema": ["transaction_id", "date", "region", "product_category", "units_sold", "unit_price", "revenue"]}, '
+                '{"question": "What is total revenue by region in the last quarter?", "capability": "GroupRevenueByRegion", "produces_artifact": "region_revenue", "consumes_artifacts": ["quarter_df"], "output_schema": ["region", "total_revenue"]}, '
+                '{"question": "Which region had highest revenue and which category drove it?", "capability": "FindMaximumRevenueRegion", "produces_artifact": "top_region", "consumes_artifacts": ["region_revenue"], "output_schema": ["region", "total_revenue"]}, '
+                '{"question": "Check if top region performance was consistent month-over-month", "capability": "MonthlyRevenueTrend", "produces_artifact": "monthly_trend", "consumes_artifacts": ["quarter_df"], "output_schema": ["month", "total_revenue"]}, '
+                '{"question": "What was the overall revenue trend by region over the quarter?", "capability": "RevenueShare", "produces_artifact": "revenue_share", "consumes_artifacts": ["region_revenue"], "output_schema": ["region", "total_revenue", "revenue_share"]}]'
             )
             code = 'result = df.describe() if len(df) > 0 else "(empty DataFrame)"'
-            critique = '{"trust": "high", "action": "accept", "reason": "Dry-run: verified."}'
+            critique = (
+                '{"trust": "high", "action": "accept", "reason": "Dry-run: verified."}'
+            )
             summary = (
-                'Dry-run summary: The pipeline executed successfully without LLM API keys. '
-                'The plan generated 5 sub-questions, each was answered with sandbox code '
-                'and accepted by the independent critique stage.'
+                "Dry-run summary: The pipeline executed successfully without LLM API keys. "
+                "The planner produced a capability-based execution graph, and all five "
+                "steps were resolved deterministically through registered capabilities."
             )
             if role == "plan":
                 return plan_json
@@ -319,17 +331,20 @@ def run(
         state.abort_reason = str(exc)
         _mark_failed_and_skipped(state, exc.sub_question, exc.last_reason)
         logger.error("Pipeline aborted: %s", exc)
-        _log(state, LogEntry(
-            run_id=state.run_id,
-            sub_question=exc.sub_question,
-            iteration=state.max_retries_per_step,
-            stage="codegen_execute_critique",
-            action="pipeline_aborted",
-            extra={"abort_reason": exc.last_reason},
-        ))
-        print(f"\n{'='*60}")
+        _log(
+            state,
+            LogEntry(
+                run_id=state.run_id,
+                sub_question=exc.sub_question,
+                iteration=state.max_retries_per_step,
+                stage="codegen_execute_critique",
+                action="pipeline_aborted",
+                extra={"abort_reason": exc.last_reason},
+            ),
+        )
+        print(f"\n{'=' * 60}")
         print("  ✖  PIPELINE ABORTED")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"  Step {state.current_step + 1}/{len(state.plan)} could not produce a")
         print(f"  trustworthy answer after {state.max_retries_per_step} attempts.")
         print(f"  Sub-question: {exc.sub_question}")
@@ -346,9 +361,9 @@ def run(
     state.summary = _do_summary(state)
 
     logger.info("=== AgentRun complete: run_id=%s ===", state.run_id)
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("  FINAL SUMMARY")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(state.summary)
 
     # ── Write structured run JSON ─────────────────────────────────────────────
@@ -371,26 +386,30 @@ def _do_plan(state: AgentRun, df: pd.DataFrame) -> list[str]:
     state.plan = questions
     state.tasks = _build_tasks(questions, task_specs)
     state.execution_graph = ExecutionGraph.from_tasks(state.tasks)
+    _sync_task_capabilities(state)
     _sync_artifact_consumers(state)
     print(f"  → {len(questions)} sub-questions generated")
     for i, q in enumerate(questions, 1):
         print(f"     {i}. {q}")
     print()
 
-    _log(state, LogEntry(
-        run_id=state.run_id,
-        sub_question=state.goal,
-        iteration=0,
-        stage="plan",
-        action="plan_generated",
-        extra={"plan": questions},
-    ))
+    _log(
+        state,
+        LogEntry(
+            run_id=state.run_id,
+            sub_question=state.goal,
+            iteration=0,
+            stage="plan",
+            action="plan_generated",
+            extra={"plan": questions},
+        ),
+    )
     return questions
 
 
 def _do_replan(state: AgentRun, df: pd.DataFrame) -> list[str]:
     """Re-plan from the current step forward, carrying completed findings.
-    
+
     Replanning emits a flat string array (no artifact declarations) since the
     LLM doesn't know which artifacts have already been registered. Replanned
     tasks will still have access to the ArtifactStore via the `artifacts` sandbox
@@ -453,14 +472,23 @@ def _run_question(
     # If the task has explicit consumes_artifacts, fetch only those.
     # Otherwise, expose the full ArtifactStore so any prior artifact is reachable.
     if task.consumes_artifacts:
-        artifact_namespace = state.artifact_store.as_namespace_for(task.consumes_artifacts)
+        artifact_namespace = state.artifact_store.as_namespace_for(
+            task.consumes_artifacts
+        )
     else:
         artifact_namespace = state.artifact_store.as_namespace()
 
-    deterministic_result = try_deterministic_execute(task, df, artifact_namespace)
+    deterministic_result = state.execution_engine.execute(
+        task,
+        df,
+        state.artifact_store,
+        consumers=state.execution_graph.consumers_for(task.produces_artifact)
+        if task.produces_artifact
+        else [],
+    )
     if deterministic_result is not None:
         print("  ► DETERMINISTIC EXECUTE …")
-        sandbox_result = deterministic_result.to_sandbox_result()
+        sandbox_result = deterministic_result
         print("    ✓ OK (deterministic)")
         obs_report = observe(
             df,
@@ -481,17 +509,20 @@ def _run_question(
             error_category="none",
         )
         state.debug_history.append(attempt)
-        _log(state, LogEntry(
-            run_id=state.run_id,
-            sub_question=sub_question,
-            iteration=0,
-            stage="deterministic_execute",
-            action="accept",
-            code=attempt.code,
-            sandbox_result=sandbox_result,
-            critique=reason,
-            trust=trust,
-        ))
+        _log(
+            state,
+            LogEntry(
+                run_id=state.run_id,
+                sub_question=sub_question,
+                iteration=0,
+                stage="deterministic_execute",
+                action="accept",
+                code=attempt.code,
+                sandbox_result=sandbox_result,
+                critique=reason,
+                trust=trust,
+            ),
+        )
         task.status = "accepted"
         finding = _finding_from_attempt(
             attempt=attempt,
@@ -501,20 +532,14 @@ def _run_question(
             reason=reason,
         )
         state.working_memory.add_finding(finding)
-        state.final_results = state.working_memory.accepted_findings(_task_order(state.tasks))
+        state.final_results = state.working_memory.accepted_findings(
+            _task_order(state.tasks)
+        )
         if task.produces_artifact:
             extracted_df = sandbox_result.get("artifact")
             if isinstance(extracted_df, pd.DataFrame):
-                registered = state.artifact_store.register(
-                    key=task.produces_artifact,
-                    df=extracted_df,
-                    producing_task_id=task.task_id,
-                    consumers=state.execution_graph.consumers_for(task.produces_artifact),
-                    confidence=trust,
-                )
-                if registered:
-                    finding.produced_artifact_name = task.produces_artifact
-                    _sync_artifact_consumers(state)
+                finding.produced_artifact_name = task.produces_artifact
+                _sync_artifact_consumers(state)
         return False
 
     for iteration in range(state.max_retries_per_step):
@@ -523,7 +548,13 @@ def _run_question(
         if iteration == 0:
             code = _do_codegen(state, sub_question, task_memory)
         else:
-            code = _do_repair(state, sub_question, previous_code or "", previous_critique_reason or "", task_memory)
+            code = _do_repair(
+                state,
+                sub_question,
+                previous_code or "",
+                previous_critique_reason or "",
+                task_memory,
+            )
         print(f"    {len(code)} chars generated")
 
         # ── EXECUTE ───────────────────────────────────────────────────────────
@@ -536,7 +567,11 @@ def _run_question(
             timeout_seconds=SANDBOX_TIMEOUT,
         )
         had_execution_errors = had_execution_errors or not sandbox_result["success"]
-        status = "✓ OK" if sandbox_result["success"] else f"✗ {sandbox_result.get('error_type', 'ERROR')}"
+        status = (
+            "✓ OK"
+            if sandbox_result["success"]
+            else f"✗ {sandbox_result.get('error_type', 'ERROR')}"
+        )
         print(f"    {status}")
         if sandbox_result.get("stdout"):
             # Print first 3 lines of stdout for visibility
@@ -556,15 +591,21 @@ def _run_question(
             sandbox_result,
             artifact_store_available_keys=state.artifact_store.available_keys(),
         )
-        print(f"    ✓ nulls={obs_report.null_counts}, dupes={obs_report.duplicate_txn_ids}, "
-              f"neg_rev={obs_report.negative_revenue_rows}, "
-              f"outliers={len(obs_report.revenue_outliers_iqr)}")
+        print(
+            f"    ✓ nulls={obs_report.null_counts}, dupes={obs_report.duplicate_txn_ids}, "
+            f"neg_rev={obs_report.negative_revenue_rows}, "
+            f"outliers={len(obs_report.revenue_outliers_iqr)}"
+        )
 
         # ── CRITIQUE ──────────────────────────────────────────────────────────
         print("  ► CRITIQUE …")
         history_summary = _build_history_summary(state)
         critique_raw, critique_parsed = _do_critique(
-            state, sub_question, code, sandbox_result, history_summary,
+            state,
+            sub_question,
+            code,
+            sandbox_result,
+            history_summary,
             observation_text=obs_report.as_critique_text(),
         )
         trust = critique_parsed.get("trust", "low")
@@ -602,17 +643,20 @@ def _run_question(
         )
         state.debug_history.append(attempt)
 
-        _log(state, LogEntry(
-            run_id=state.run_id,
-            sub_question=sub_question,
-            iteration=iteration,
-            stage="codegen_execute_critique",
-            action=action,
-            code=code,
-            sandbox_result=sandbox_result,
-            critique=critique_raw,
-            trust=trust,
-        ))
+        _log(
+            state,
+            LogEntry(
+                run_id=state.run_id,
+                sub_question=sub_question,
+                iteration=iteration,
+                stage="codegen_execute_critique",
+                action=action,
+                code=code,
+                sandbox_result=sandbox_result,
+                critique=critique_raw,
+                trust=trust,
+            ),
+        )
 
         # ── ROUTING ───────────────────────────────────────────────────────────
         if action == "accept":
@@ -639,20 +683,24 @@ def _run_question(
                         key=task.produces_artifact,
                         df=extracted_df,
                         producing_task_id=task.task_id,
-                        consumers=state.execution_graph.consumers_for(task.produces_artifact),
+                        consumers=state.execution_graph.consumers_for(
+                            task.produces_artifact
+                        ),
                         confidence=trust,
                     )
                     if registered:
                         finding.produced_artifact_name = task.produces_artifact
-                        _sync_artifact_consumers(state)
                         logger.info(
                             "Artifact %r registered from %s (%d rows)",
-                            task.produces_artifact, task.task_id, len(extracted_df),
+                            task.produces_artifact,
+                            task.task_id,
+                            len(extracted_df),
                         )
                     else:
                         logger.warning(
                             "Task %s declared produces_artifact=%r but registration failed",
-                            task.task_id, task.produces_artifact,
+                            task.task_id,
+                            task.produces_artifact,
                         )
 
             return False  # move to next sub-question
@@ -675,7 +723,9 @@ def _run_question(
         state.max_retries_per_step,
         sub_question[:60],
     )
-    print(f"  ✖ max_retries_exceeded after {state.max_retries_per_step} attempts — aborting\n")
+    print(
+        f"  ✖ max_retries_exceeded after {state.max_retries_per_step} attempts — aborting\n"
+    )
     raise PipelineAbortedError(
         sub_question=sub_question,
         last_reason=last_reason,
@@ -791,14 +841,17 @@ def _do_summary(state: AgentRun) -> str:
     prompt = summary_prompt(state.goal, findings)
     summary = call_llm(prompt, role="observe")
 
-    _log(state, LogEntry(
-        run_id=state.run_id,
-        sub_question=state.goal,
-        iteration=0,
-        stage="summary",
-        action="summary_generated",
-        extra={"summary": summary, "finding_count": len(findings)},
-    ))
+    _log(
+        state,
+        LogEntry(
+            run_id=state.run_id,
+            sub_question=state.goal,
+            iteration=0,
+            stage="summary",
+            action="summary_generated",
+            extra={"summary": summary, "finding_count": len(findings)},
+        ),
+    )
     return summary
 
 
@@ -870,7 +923,7 @@ def _build_schema_summary(df: pd.DataFrame) -> str:
         )
     else:
         lines.append(
-            "Time range note: \"last quarter\" means the most recent 3 calendar\n"
+            'Time range note: "last quarter" means the most recent 3 calendar\n'
             "months in the data. Use df['date'].max() as reference, filter back\n"
             "2 full months to the first of that month, and do not use today's date."
         )
@@ -939,7 +992,9 @@ def _task_order(tasks: list[TaskNode]) -> list[str]:
     return [task.task_id for task in tasks]
 
 
-def _build_tasks(plan: list[str], task_specs: list[dict] | None = None) -> list[TaskNode]:
+def _build_tasks(
+    plan: list[str], task_specs: list[dict] | None = None
+) -> list[TaskNode]:
     """
     Build task nodes from the ordered plan.
 
@@ -954,7 +1009,7 @@ def _build_tasks(plan: list[str], task_specs: list[dict] | None = None) -> list[
     """
     tasks: list[TaskNode] = []
     for index, question in enumerate(plan):
-        spec = (task_specs[index] if task_specs and index < len(task_specs) else {})
+        spec = task_specs[index] if task_specs and index < len(task_specs) else {}
         produces = spec.get("produces_artifact") or None
         consumes = spec.get("consumes_artifacts") or []
         output_schema = spec.get("output_schema") or []
@@ -963,11 +1018,7 @@ def _build_tasks(plan: list[str], task_specs: list[dict] | None = None) -> list[
         if isinstance(output_schema, str):
             output_schema = [output_schema]
         execution_fn = "llm_codegen"
-        q_lower = question.lower()
-        if produces == "quarter_df" and "last quarter" in q_lower:
-            execution_fn = "deterministic"
-        elif produces == "region_revenue" and "region" in q_lower and "revenue" in q_lower:
-            execution_fn = "deterministic"
+        capability = spec.get("capability") or None
         tasks.append(
             TaskNode(
                 task_id=_task_id(index),
@@ -975,6 +1026,7 @@ def _build_tasks(plan: list[str], task_specs: list[dict] | None = None) -> list[
                 depends_on=[_task_id(i) for i in range(index)],
                 produces_artifact=produces,
                 consumes_artifacts=list(consumes),
+                capability=capability,
                 execution_fn=execution_fn,
                 output_schema=list(output_schema),
             )
@@ -982,17 +1034,32 @@ def _build_tasks(plan: list[str], task_specs: list[dict] | None = None) -> list[
     return tasks
 
 
+def _sync_task_capabilities(state: AgentRun) -> None:
+    """Resolve missing capability IDs using the registered capability set."""
+    for task in state.tasks:
+        if task.capability:
+            continue
+        capability = state.execution_engine.registry.resolve(task)
+        if capability is not None:
+            task.capability = capability.capability_id
+
+
 def _sync_artifact_consumers(state: AgentRun) -> None:
-    """Annotate artifact metadata with downstream consumer task IDs."""
+    """Validate downstream artifact lineage without mutating frozen artifacts."""
     for task in state.tasks:
         if not task.produces_artifact:
             continue
         artifact = state.artifact_store.get_artifact(task.produces_artifact)
         if artifact is None:
             continue
-        artifact.consumers = state.execution_graph.consumers_for(task.produces_artifact)
-        if task.output_schema:
-            artifact.schema = list(task.output_schema)
+        expected_consumers = state.execution_graph.consumers_for(task.produces_artifact)
+        if artifact.consumers != expected_consumers:
+            logger.debug(
+                "Artifact %r consumers differ from graph lineage: store=%s graph=%s",
+                task.produces_artifact,
+                artifact.consumers,
+                expected_consumers,
+            )
 
 
 def _task_for_attempt(tasks: list[TaskNode], attempt: AttemptRecord) -> TaskNode:
@@ -1040,7 +1107,7 @@ def _mark_failed_and_skipped(
             break
     if failed_index is None:
         return
-    for task in state.tasks[failed_index + 1:]:
+    for task in state.tasks[failed_index + 1 :]:
         task.status = "skipped"
         task.failure_reason = f"Upstream dependency failed: {failed_question}"
 
@@ -1154,12 +1221,18 @@ def _parse_plan_json(raw: str) -> list[dict]:
             parsed = json.loads(match.group(0))
             if isinstance(parsed, list) and parsed:
                 # Structured format: list of dicts with "question" key
-                if all(isinstance(item, dict) and "question" in item for item in parsed):
+                if all(
+                    isinstance(item, dict) and "question" in item for item in parsed
+                ):
                     return [
                         {
                             "question": str(item["question"]).strip(),
+                            "capability": str(item.get("capability") or "").strip()
+                            or None,
                             "produces_artifact": item.get("produces_artifact") or None,
-                            "consumes_artifacts": list(item.get("consumes_artifacts") or []),
+                            "consumes_artifacts": list(
+                                item.get("consumes_artifacts") or []
+                            ),
                             "output_schema": list(item.get("output_schema") or []),
                         }
                         for item in parsed
@@ -1168,7 +1241,11 @@ def _parse_plan_json(raw: str) -> list[dict]:
                 # Legacy flat format: list of strings
                 if all(isinstance(item, str) for item in parsed):
                     return [
-                        {"question": q.strip(), "produces_artifact": None, "consumes_artifacts": []}
+                        {
+                            "question": q.strip(),
+                            "produces_artifact": None,
+                            "consumes_artifacts": [],
+                        }
                         for q in parsed
                         if q.strip()
                     ]
@@ -1176,14 +1253,29 @@ def _parse_plan_json(raw: str) -> list[dict]:
                 result = []
                 for item in parsed:
                     if isinstance(item, dict) and item.get("question"):
-                        result.append({
-                            "question": str(item["question"]).strip(),
-                            "produces_artifact": item.get("produces_artifact") or None,
-                            "consumes_artifacts": list(item.get("consumes_artifacts") or []),
-                            "output_schema": list(item.get("output_schema") or []),
-                        })
+                        result.append(
+                            {
+                                "question": str(item["question"]).strip(),
+                                "capability": str(item.get("capability") or "").strip()
+                                or None,
+                                "produces_artifact": item.get("produces_artifact")
+                                or None,
+                                "consumes_artifacts": list(
+                                    item.get("consumes_artifacts") or []
+                                ),
+                                "output_schema": list(item.get("output_schema") or []),
+                            }
+                        )
                     elif isinstance(item, str) and item.strip():
-                        result.append({"question": item.strip(), "produces_artifact": None, "consumes_artifacts": [], "output_schema": []})
+                        result.append(
+                            {
+                                "question": item.strip(),
+                                "capability": None,
+                                "produces_artifact": None,
+                                "consumes_artifacts": [],
+                                "output_schema": [],
+                            }
+                        )
                 if result:
                     return result
         except json.JSONDecodeError:
@@ -1194,10 +1286,26 @@ def _parse_plan_json(raw: str) -> list[dict]:
     for line in raw.splitlines():
         line = re.sub(r"^\d+[\.)\-]\s*", "", line.strip())
         if line and not line.startswith("{") and not line.startswith("["):
-            lines.append({"question": line, "produces_artifact": None, "consumes_artifacts": [], "output_schema": []})
+            lines.append(
+                {
+                    "question": line,
+                    "capability": None,
+                    "produces_artifact": None,
+                    "consumes_artifacts": [],
+                    "output_schema": [],
+                }
+            )
     if lines:
         return lines
-    return [{"question": raw.strip(), "produces_artifact": None, "consumes_artifacts": [], "output_schema": []}]
+    return [
+        {
+            "question": raw.strip(),
+            "capability": None,
+            "produces_artifact": None,
+            "consumes_artifacts": [],
+            "output_schema": [],
+        }
+    ]
 
 
 def _parse_json_list(raw: str) -> list[str]:
@@ -1230,7 +1338,6 @@ def _parse_json_list(raw: str) -> list[str]:
         if line:
             lines.append(line)
     return lines or [raw.strip()]
-
 
 
 def _parse_critique_json(raw: str) -> dict[str, Any]:
@@ -1300,9 +1407,9 @@ def _strip_markdown_fences(code: str) -> str:
     """
     stripped = code.strip()
     # Remove leading ```python or ``` fence
-    stripped = re.sub(r'^```(?:python|py)?\s*\n?', '', stripped)
+    stripped = re.sub(r"^```(?:python|py)?\s*\n?", "", stripped)
     # Remove trailing ``` fence
-    stripped = re.sub(r'\n?```\s*$', '', stripped)
+    stripped = re.sub(r"\n?```\s*$", "", stripped)
     return stripped.strip()
 
 
@@ -1316,9 +1423,9 @@ def _log(state: AgentRun, entry: LogEntry) -> None:
 
 def _print_step_header(step_idx: int, total: int, sub_question: str) -> None:
     """Print a visible step header for console output."""
-    print(f"┌─ Step {step_idx + 1}/{total} {'─'*50}")
+    print(f"┌─ Step {step_idx + 1}/{total} {'─' * 50}")
     print(f"│  {sub_question}")
-    print(f"└{'─'*58}")
+    print(f"└{'─' * 58}")
 
 
 def _finalize_run(state: AgentRun, t_start: float) -> None:

@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import pickle
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -50,6 +51,10 @@ logger = logging.getLogger(__name__)
 # Refuse artifacts larger than this to keep sandbox IPC safe.
 # 50 MB is generous for typical analytical DataFrames (100 k–1 M rows).
 MAX_ARTIFACT_BYTES: int = 50 * 1024 * 1024  # 50 MB
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -103,13 +108,17 @@ class Artifact:
     cross-reference the producing task's scope or filter.
     """
 
-    name: str               # planner-declared snake_case key (e.g. "quarter_df")
-    type: str               # "DataFrame" | "Series" | "scalar"
-    schema: list[str]       # column names (DataFrame/Series), ["<scalar>"] for scalar
-    producer: str           # producing_task_id
-    value: pd.DataFrame     # the actual data (shallow-copied on registration)
+    name: str  # planner-declared snake_case key (e.g. "quarter_df")
+    type: str  # "DataFrame" | "Series" | "scalar"
+    schema: list[str]  # column names (DataFrame/Series), ["<scalar>"] for scalar
+    producer: str  # producing_task_id
+    value: pd.DataFrame  # the actual data (shallow-copied on registration)
     consumers: list[str] = field(default_factory=list)
     confidence: str = "unknown"
+    provenance: list[str] = field(default_factory=list)
+    created_at: str = field(default_factory=_utc_now_iso)
+    validated_at: str | None = None
+    is_frozen: bool = False
 
     # ── Derived accessors ─────────────────────────────────────────────────────
 
@@ -121,13 +130,32 @@ class Artifact:
     def column_summary(self, max_cols: int = 8) -> str:
         """Return a compact column list, truncated for prompt embedding."""
         cols = list(self.value.columns)[:max_cols]
-        suffix = f", … (+{len(self.value.columns) - max_cols} more)" if len(self.value.columns) > max_cols else ""
+        suffix = (
+            f", … (+{len(self.value.columns) - max_cols} more)"
+            if len(self.value.columns) > max_cols
+            else ""
+        )
         return ", ".join(cols) + suffix
 
     def add_consumer(self, task_id: str) -> None:
         """Record a downstream task that consumes this artifact."""
         if task_id and task_id not in self.consumers:
             self.consumers.append(task_id)
+
+    def freeze(self) -> None:
+        """Mark the artifact immutable after validation."""
+        object.__setattr__(self, "validated_at", _utc_now_iso())
+        object.__setattr__(self, "is_frozen", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "is_frozen", False) and name not in {
+            "validated_at",
+            "is_frozen",
+        }:
+            raise AttributeError(
+                f"Artifact {self.name!r} is frozen and cannot be modified"
+            )
+        object.__setattr__(self, name, value)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +188,7 @@ class ArtifactStore:
         producing_task_id: str = "",
         consumers: list[str] | None = None,
         confidence: str = "unknown",
+        provenance: list[str] | None = None,
     ) -> bool:
         """
         Register *df* under *key* as an :class:`Artifact`.
@@ -181,17 +210,25 @@ class ArtifactStore:
             True if the artifact was registered, False if rejected.
         """
         if not isinstance(df, pd.DataFrame):
-            logger.warning("ArtifactStore.register(%r): value is not a DataFrame — skipping", key)
+            logger.warning(
+                "ArtifactStore.register(%r): value is not a DataFrame — skipping", key
+            )
             return False
 
         if df.empty:
-            logger.warning("ArtifactStore.register(%r): DataFrame is empty — skipping", key)
+            logger.warning(
+                "ArtifactStore.register(%r): DataFrame is empty — skipping", key
+            )
             return False
 
         try:
             size_bytes = len(pickle.dumps(df, protocol=4))
         except Exception as exc:  # noqa: BLE001
-            logger.warning("ArtifactStore.register(%r): could not estimate size (%s) — accepting anyway", key, exc)
+            logger.warning(
+                "ArtifactStore.register(%r): could not estimate size (%s) — accepting anyway",
+                key,
+                exc,
+            )
             size_bytes = 0
 
         if size_bytes > MAX_ARTIFACT_BYTES:
@@ -213,11 +250,19 @@ class ArtifactStore:
             producer=producing_task_id,
             consumers=list(consumers or []),
             confidence=confidence,
+            provenance=list(
+                provenance or [producing_task_id] if producing_task_id else []
+            ),
             value=df.copy(deep=False),
         )
+        self._artifacts[key].freeze()
         logger.debug(
             "ArtifactStore: registered %r (type=%s, %d rows, %d cols, producer=%s)",
-            key, artifact_type, len(df), len(df.columns), producing_task_id,
+            key,
+            artifact_type,
+            len(df),
+            len(df.columns),
+            producing_task_id,
         )
         return True
 
@@ -291,7 +336,9 @@ class ArtifactStore:
             "AVAILABLE ARTIFACTS (pre-validated — use these instead of re-deriving):",
         ]
         for key, a in self._artifacts.items():
-            type_line = f'  artifacts["{key}"]  type={a.type}  confidence={a.confidence}'
+            type_line = (
+                f'  artifacts["{key}"]  type={a.type}  confidence={a.confidence}'
+            )
             if a.schema and a.schema != ["<scalar>"]:
                 schema_str = ", ".join(a.schema[:8])
                 if len(a.schema) > 8:
@@ -306,6 +353,6 @@ class ArtifactStore:
             lines.append(type_line)
 
         lines.append(
-            "\nUSAGE: val = artifacts.get(\"key\"); if val is None: val = df[mask]"
+            '\nUSAGE: val = artifacts.get("key"); if val is None: val = df[mask]'
         )
         return "\n".join(lines)

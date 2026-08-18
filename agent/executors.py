@@ -74,7 +74,9 @@ def _region_revenue(df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
-def try_execute(task: TaskNode, df: pd.DataFrame, artifacts: dict[str, pd.DataFrame]) -> DeterministicExecutionResult | None:
+def try_execute(
+    task: TaskNode, df: pd.DataFrame, artifacts: dict[str, pd.DataFrame]
+) -> DeterministicExecutionResult | None:
     """Return a deterministic execution result when a task matches a known pattern."""
     q = task.question.lower()
 

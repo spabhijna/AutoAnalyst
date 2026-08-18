@@ -48,7 +48,16 @@ from agent.sandbox import run_sandboxed
 # Fixtures
 # ---------------------------------------------------------------------------
 
-RESULT_KEYS = {"success", "result", "stdout", "error", "error_type", "error_category", "artifact", "artifact_key"}
+RESULT_KEYS = {
+    "success",
+    "result",
+    "stdout",
+    "error",
+    "error_type",
+    "error_category",
+    "artifact",
+    "artifact_key",
+}
 
 
 @pytest.fixture()
@@ -66,7 +75,9 @@ def sales_df() -> pd.DataFrame:
 def _run(code: str, df: pd.DataFrame, timeout: int = 10) -> dict:
     """Helper to run sandboxed code and assert the result dict has all keys."""
     out = run_sandboxed(code, df, timeout_seconds=timeout)
-    assert set(out.keys()) == RESULT_KEYS, f"Missing keys: {RESULT_KEYS - set(out.keys())}"
+    assert set(out.keys()) == RESULT_KEYS, (
+        f"Missing keys: {RESULT_KEYS - set(out.keys())}"
+    )
     return out
 
 
