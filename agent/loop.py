@@ -61,6 +61,7 @@ from agent.prompts import (
 from agent.environment import EnvironmentManifest
 from agent.sandbox import run_sandboxed
 from agent.state import (
+    SCHEMA_PLACEHOLDERS,
     AttemptRecord,
     ExecutionDifficulty,
     Finding,
@@ -733,11 +734,11 @@ def _artifact_contract_text(task: TaskNode) -> str:
         f"Assign your final DataFrame to a variable named `{task.produces_artifact}`"
     )
     schema = list(task.output_schema)
-    if schema and schema not in (["same_as_input"], ["<scalar>"]):
+    if schema and schema not in SCHEMA_PLACEHOLDERS:
         text += f"\nwith columns: {', '.join(schema)} (any order)."
     else:
         text += "."
-    return text
+    return text + f"\nThen also set `result = {task.produces_artifact}`."
 
 
 def _do_codegen(

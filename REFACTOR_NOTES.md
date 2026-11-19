@@ -188,6 +188,8 @@ None. Only import lines and the names used in call sites changed in `test_loop.p
 - **Results after the fix:** `pytest tests/ -q`: `253 passed`; both dry-runs finish with 5 deterministic steps.
 - Note: §1.D item 9 of `REFACTOR_PLAN.md` was not present in the copy I could read on disk, so this entry follows the review message.
 
+- **D9 follow-up (`fix(phase-4)`, "clarify contract vs result, share schema placeholders"):** the contract block now ends with "Then also set `result = <name>`." (so a model that only assigns `result` still satisfies the contract), and the placeholder list lives once in `agent/state.py` as `SCHEMA_PLACEHOLDERS`, used by `validate_semantic_contract` and `_artifact_contract_text`. Test changes: `tests/test_codegen_contract.py` asserts the new last line (contract-text unit tests and the reviewer scenario); additions only, no assertion removed. (`validate_output`'s `same_as_input` handling and `artifact_store`'s `<scalar>` schema are different concerns and were left alone.)
+
 ### 4. Results
 - `pytest tests/ -q`: `243 passed` (no xfail left).
 - `python main.py --dry-run` and `--dry-run --corrupt`: 5 steps, all deterministic. Run JSON: `dataset` is `clean` / `corrupted`, `total_llm_calls` 2 (plan + summary). The dry-run summary text claiming five deterministic steps is now true.

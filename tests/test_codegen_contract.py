@@ -72,6 +72,7 @@ def test_column_order_is_irrelevant_and_prompt_has_contract(df, tmp_path) -> Non
     assert "OUTPUT CONTRACT" in codegen_prompt_text
     assert "units_by_region" in codegen_prompt_text
     assert "avg_units" in codegen_prompt_text
+    assert "Then also set `result = units_by_region`." in codegen_prompt_text
 
 
 def test_missing_variable_is_still_rejected_and_repair_prompt_has_contract(
@@ -122,6 +123,7 @@ class TestArtifactContractText:
         assert text.startswith("OUTPUT CONTRACT:")
         assert "`units_by_region`" in text
         assert "with columns: region, avg_units (any order)." in text
+        assert text.endswith("Then also set `result = units_by_region`.")
 
     @pytest.mark.parametrize("schema", [[], ["same_as_input"], ["<scalar>"]])
     def test_no_columns_line_for_empty_or_placeholder_schema(self, schema) -> None:
@@ -134,6 +136,7 @@ class TestArtifactContractText:
         text = _artifact_contract_text(task)
         assert "`out_df`" in text
         assert "columns" not in text
+        assert text.endswith("Then also set `result = out_df`.")
 
 
 def test_prompts_unchanged_without_contract() -> None:

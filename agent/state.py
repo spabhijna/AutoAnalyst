@@ -24,6 +24,12 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Output-schema values that are placeholders rather than real column lists:
+# "same as the input frame" and "a scalar result". Shared by the validator and
+# the codegen output-contract text so the two cannot drift apart.
+SCHEMA_PLACEHOLDERS: tuple[list[str], ...] = (["same_as_input"], ["<scalar>"])
+
+
 @dataclass
 class ExecutionDifficulty:
     """

@@ -14,7 +14,7 @@ from typing import Any
 import pandas as pd
 
 from agent.capabilities import Capability, CapabilityExecutionContext
-from agent.state import TaskNode
+from agent.state import SCHEMA_PLACEHOLDERS, TaskNode
 
 
 @dataclass
@@ -116,7 +116,7 @@ class CapabilityValidator:
           * the artifact must be a non-empty DataFrame;
           * its columns must match ``task.output_schema`` as a set (order-insensitive)
             when one is declared
-            (``["same_as_input"]`` / ``["<scalar>"]`` placeholders are skipped).
+            (``SCHEMA_PLACEHOLDERS`` are skipped).
 
         Nothing here depends on the task's position or ID in the plan.
         """
@@ -134,7 +134,7 @@ class CapabilityValidator:
             else:
                 expected = list(task.output_schema)
                 actual = list(artifact.columns)
-                if expected and expected not in (["same_as_input"], ["<scalar>"]):
+                if expected and expected not in SCHEMA_PLACEHOLDERS:
                     missing = [c for c in expected if c not in actual]
                     extra = [c for c in actual if c not in expected]
                     if missing or extra:
