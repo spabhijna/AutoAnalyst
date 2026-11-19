@@ -1,8 +1,9 @@
 """
 Phase-0 safety net for the cleanup refactor (see REFACTOR_PLAN.md).
 
-Tests marked ``xfail(strict=True)`` document known bugs.  The phase that fixes a
-bug removes its marker; strict mode makes an accidental fix fail loudly.
+These tests were added in Phase 0 as ``xfail(strict=True)`` regressions for the
+bugs found in the audit (D1, D2, D3, D5, D6, D8); each fixing phase removed its
+marker, and they now guard against the bugs coming back.
 """
 
 from __future__ import annotations
@@ -48,7 +49,6 @@ def test_dry_run_smoke(sales_df, tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="bug D1: unterminated character set in regex")
 def test_parse_json_list_numbered_fallback() -> None:
     result = parse_json_list("1. First question\n2) Second question")
     assert result == ["First question", "Second question"]
@@ -91,9 +91,6 @@ def test_dry_run_does_not_leak(sales_df, tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True, reason="bug D5: hitting the revision cap neither aborts nor completes"
-)
 @pytest.mark.parametrize("plan", ['["Q1?"]', '["Q1?", "Q2?", "Q3?"]'])
 def test_plan_revision_cap_aborts(sales_df, tmp_path, plan) -> None:
     revise = json.dumps({"trust": "low", "reason": ".", "action": "revise_plan"})
@@ -129,10 +126,6 @@ def test_plan_revision_cap_aborts(sales_df, tmp_path, plan) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="bug D6: step-specific semantic checks reject capability outputs",
-)
 def test_dry_run_is_fully_deterministic(sales_df, tmp_path) -> None:
     state = run("any goal", sales_df, dry_run=True, log_dir=str(tmp_path))
 
@@ -151,7 +144,6 @@ def test_dry_run_is_fully_deterministic(sales_df, tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="bug D8: obs_block not interpolated")
 def test_critique_prompt_includes_observation_text() -> None:
     from agent.prompts import critique_prompt
 

@@ -148,3 +148,42 @@ None. Only import lines and the names used in call sites changed in `test_loop.p
 - New `tests/test_accept.py`: `_accept` registration metadata (producer, consumers `["step_2"]`, frozen, confidence, provenance, `validated_at`, `produced_artifact_name`, status, working memory), no-artifact case, and provenance for `_try_deterministic` with a declared and an undeclared `task.capability`. This replaces the metadata coverage removed from `test_execution_engine.py`.
 - `ExecutionEngine.execute` now returns `capability_id` (the resolved capability) in its result dict; `_try_deterministic` builds provenance `[capability_id, task_id]` from it, so replanned tasks (no `task.capability`) keep provenance. `test_engine_executes_registered_capability_without_registering` also asserts `capability_id`.
 - Assertion changes: none (only additions).
+
+## Phase 3 review follow-up #2
+- Commit `fix(phase-3)` (05d7c48) added `tests/test_accept.py` and the resolved `capability_id` in the engine result (see "Phase 3 review follow-up" above). Phase 5 scope per the updated plan (shims, `findings.py`, `run_export`/`logger` move, splitting `_run_codegen_loop` and `run()`, ≤600 lines, no function >80 lines) was re-read; nothing done early.
+
+## Phase 4 — Remaining behaviour fixes (D1, D4, D5, D6, D7, D8)
+
+### 1. What changed
+- **D1** `agent/parsing.py`: regex `r"^\d+[\.)\]]\s*"` (was an unterminated character set).
+- **D8** `agent/prompts.py`: `{obs_block}` is now interpolated in `critique_prompt`, right after the "PREVIOUSLY ACCEPTED FINDINGS" block and before the audit steps, where STEP 3 refers to it ("a DATA-QUALITY OBSERVATION block is present above"). No other wording touched.
+- **D4** replan keeps structure:
+  - `replan_prompt` now asks for the same JSON task shape as `plan_prompt` (new optional `available_artifacts` argument, listing the registered artifacts). This is the one allowed prompt rewrite.
+  - `planning.do_replan` returns structured specs (via `parse_plan_json`); new `planning.apply_replan(state, specs)` keeps the completed tasks as the same `TaskNode` objects, drops the failed task and everything after it, and appends new tasks whose IDs continue after the highest existing `step_N` (`next_task_index`) and which depend on every kept task. `build_tasks` gained keyword-only `first_index` / `depends_on_prefix`. `sync_task_capabilities` runs after a replan, so new tasks get capabilities too.
+- **D5** `loop.run`: when a revise_plan request arrives with the cap reached, it raises `PipelineAbortedError(kind="plan revision cap reached")` with a clear reason instead of advancing past the unfinished task. `PipelineAbortedError` gained a `kind` (default `"max retries exhausted"`, so existing messages are unchanged); the scheduler abort now says `"scheduling failure"`; `reporting.abort_banner` takes `kind` and only prints the "after N attempts" text for retry exhaustion.
+- **D6** `CapabilityValidator.validate_semantic_contract(task, artifact)` is now generic: only when `task.produces_artifact` is declared, the artifact must be a non-empty DataFrame whose columns equal `task.output_schema` (placeholders `["same_as_input"]` / `["<scalar>"]` skipped). All `step_2/4/5/6` branches, the `quarter_df` top-revenue computation and the numpy import are gone. Callers (`ExecutionEngine.execute`, the CODE-GEN path in the loop) updated. `grep -rn 'step_[0-9]' agent/` finds nothing.
+- **D7** `config.py` reads `MAX_RETRIES`, `SANDBOX_TIMEOUT_SECONDS`, `LOG_DIR` from the environment (after `load_dotenv()`; blank = default; an invalid number raises `ValueError` naming the variable). `loop.SANDBOX_TIMEOUT` is deleted; the loop passes `config.SANDBOX_TIMEOUT_SECONDS`; `run_sandboxed`'s default timeout is `config.SANDBOX_TIMEOUT_SECONDS`. `run(..., dataset_label="clean")` feeds `_finalize_run` (`"<label> (aborted)"` on abort); `main.py` passes `"corrupted"` with `--corrupt`.
+- Tests: all four Phase 0 xfail markers (D1, D5 ×2, D6, D8) removed from `tests/test_regressions.py`, now plain passing tests. New: `tests/test_replan.py` (D4), `tests/test_validator_semantic.py` (D6), `tests/test_config.py` (D7 and the dataset label).
+
+### 2. Deviations from the plan
+- `validate_semantic_contract` lost its `task_id`, `result_str` and `artifacts` arguments (all only fed the step checks); it takes the `TaskNode`.
+- The effective sandbox timeout in the loop goes 10 s → 30 s (`config.SANDBOX_TIMEOUT_SECONDS`), and the bare `run_sandboxed` default 5 s → 30 s; both are what D7 prescribes. Every sandbox test passes an explicit timeout, so none depends on the old defaults.
+- On the CODE-GEN path the new semantic check can now fail a task that declares `produces_artifact` but whose code produced no DataFrame. As before, a semantic failure only marks the sandbox result failed and the critique still decides the action.
+- D5's abort message uses the existing exception class with a `kind` instead of a new exception type.
+
+### 3. Test assertions changed
+- `tests/test_loop.py::TestRevisePlan::test_plan_revision_cap`: docstring "revise_plan requests are ignored" → "another revise_plan request aborts the run". Assertion was `state.plan_revisions <= MAX_PLAN_REVISIONS`; now `== MAX_PLAN_REVISIONS`, plus `state.aborted` and `"revision cap" in state.abort_reason`. Reason: D5 deliberately changes the old "ignore and carry on" behaviour.
+- `tests/test_regressions.py`: only the four `xfail` decorators (and the module docstring describing them) removed; no assertion changed. (`test_plan_revision_cap_aborts` keeps `plan_revisions == MAX_PLAN_REVISIONS`, `aborted`, and "revision" in the reason for both plans.)
+- No existing test depended on the step-specific semantic checks (they were only exercised through the xfail test), so none had to change for D6.
+- `test_revise_plan_replaces_tail` (flat `["Q2_new?"]` replan response) passes unchanged: `parse_plan_json` still accepts the legacy flat format.
+
+### 4. Results
+- `pytest tests/ -q`: `243 passed` (no xfail left).
+- `python main.py --dry-run` and `--dry-run --corrupt`: 5 steps, all deterministic. Run JSON: `dataset` is `clean` / `corrupted`, `total_llm_calls` 2 (plan + summary). The dry-run summary text claiming five deterministic steps is now true.
+- `agent/loop.py`: 1061 lines.
+
+### 5. Noticed, left alone
+- `parsing.parse_json_list` is now unused outside its tests (the replan was its only caller). Kept because D1 is a fix to it; Phase 5/6 can drop it.
+- `ruff` F841 for `last_line` in `agent/sandbox.py` (out of scope: sandbox).
+- `.env.example` already documents the three variables; no change needed. `README`/`ARCHITECTURE` text is Phase 6.
+- A replan that still returns the same questions will loop until the cap and then abort cleanly (covered by the D5 test).

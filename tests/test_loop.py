@@ -303,7 +303,7 @@ class TestRevisePlan:
         assert state.plan_revisions == 1
 
     def test_plan_revision_cap(self, small_df: pd.DataFrame) -> None:
-        """After MAX_PLAN_REVISIONS, revise_plan requests are ignored."""
+        """After MAX_PLAN_REVISIONS, another revise_plan request aborts the run."""
         from agent.loop import MAX_PLAN_REVISIONS
 
         revise_critique = json.dumps(
@@ -325,7 +325,9 @@ class TestRevisePlan:
         ):
             state = run("goal", small_df, log_dir="/tmp/test_runs")
 
-        assert state.plan_revisions <= MAX_PLAN_REVISIONS
+        assert state.plan_revisions == MAX_PLAN_REVISIONS
+        assert state.aborted
+        assert "revision cap" in state.abort_reason
 
 
 # ---------------------------------------------------------------------------

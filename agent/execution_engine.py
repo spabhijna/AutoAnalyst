@@ -70,7 +70,7 @@ class ExecutionEngine:
             return None
 
         semantic_validation = self.validator.validate_semantic_contract(
-            task.task_id, result.artifact, result.result, artifact_store.as_namespace()
+            task, result.artifact
         )
         if not semantic_validation.success:
             return None

@@ -43,8 +43,9 @@ from agent.llm_client import call_llm
 from agent.observer import observe
 from agent.parsing import parse_critique_json, strip_markdown_fences
 from agent.planning import (
-    build_tasks,
+    apply_replan,
     do_plan,
+    build_tasks,
     do_replan,
     task_id,
     task_order,
@@ -73,7 +74,6 @@ from agent.validator import CapabilityValidator
 logger = logging.getLogger(__name__)
 
 MAX_PLAN_REVISIONS: int = 2
-SANDBOX_TIMEOUT: int = 10  # seconds per execution
 
 
 # ---------------------------------------------------------------------------
@@ -83,8 +83,9 @@ SANDBOX_TIMEOUT: int = 10  # seconds per execution
 
 class PipelineAbortedError(RuntimeError):
     """
-    Raised when a sub-question exhausts all CODE-GEN retries without producing
-    a trustworthy result.
+    Raised when the run cannot continue: a sub-question exhausted all CODE-GEN
+    retries without a trustworthy result, the plan-revision cap was hit, or the
+    scheduler found no ready task.
 
     Continuing past this point would cascade an unverified (possibly wrong)
     finding into all downstream sub-questions, making the entire run
@@ -94,14 +95,25 @@ class PipelineAbortedError(RuntimeError):
         sub_question: The question that could not be answered.
         last_reason:  The critique's reason from the final attempt.
         run_id:       The run identifier for log correlation.
+        kind:         Short description of why the run stopped (used in the
+                      message and the console banner).
     """
 
-    def __init__(self, sub_question: str, last_reason: str, run_id: str) -> None:
+    RETRIES_EXHAUSTED = "max retries exhausted"
+
+    def __init__(
+        self,
+        sub_question: str,
+        last_reason: str,
+        run_id: str,
+        kind: str = RETRIES_EXHAUSTED,
+    ) -> None:
+        self.kind = kind
         self.sub_question = sub_question
         self.last_reason = last_reason
         self.run_id = run_id
         super().__init__(
-            f"Pipeline aborted (run_id={run_id}): max retries exhausted on "
+            f"Pipeline aborted (run_id={run_id}): {kind} on "
             f"sub_question={sub_question!r}. Last critique: {last_reason}"
         )
 
@@ -230,6 +242,7 @@ def run(
     max_retries_per_step: int = config.MAX_PIPELINE_RETRIES,
     dry_run: bool = False,
     llm: Callable[..., str] | None = None,
+    dataset_label: str = "clean",
 ) -> AgentRun:
     """
     Execute the full five-stage loop for *goal* against *df*.
@@ -244,6 +257,8 @@ def run(
         max_retries_per_step: Hard cap on CODE-GEN retries per sub-question.
         dry_run:            When True, uses canned LLM responses so the
                             pipeline runs without API keys.  Defaults to False.
+        dataset_label:      Label recorded in the run JSON (e.g. "clean" or
+                            "corrupted"); " (aborted)" is appended on abort.
         llm:                Callable ``(prompt, role) -> str`` used for every LLM
                             call. Defaults to :func:`agent.llm_client.call_llm`
                             (or :func:`agent.dry_run.dry_run_llm` when
@@ -285,6 +300,7 @@ def run(
                     sub_question="(scheduler)",
                     last_reason="No ready task was available before the graph completed.",
                     run_id=state.run_id,
+                    kind="scheduling failure",
                 )
             state.current_step = state.execution_graph.task_index(task.task_id)
             sub_question = task.question
@@ -296,25 +312,28 @@ def run(
 
             if revise_plan_requested:
                 if state.plan_revisions >= MAX_PLAN_REVISIONS:
-                    logger.warning(
-                        "Plan revision requested but cap (%d) reached — accepting current plan",
-                        MAX_PLAN_REVISIONS,
+                    # Never advance past a task that did not complete: abort.
+                    raise PipelineAbortedError(
+                        sub_question=sub_question,
+                        last_reason=(
+                            f"Plan revision cap ({MAX_PLAN_REVISIONS}) reached and "
+                            f"the critique still requested a plan revision: "
+                            f"{task.failure_reason}"
+                        ),
+                        run_id=state.run_id,
+                        kind="plan revision cap reached",
                     )
-                    state.current_step += 1
-                else:
-                    new_plan_tail = do_replan(
-                        state, df, state.llm, _build_working_memory_prompt(state)
-                    )
-                    state.plan = state.plan[: state.current_step] + new_plan_tail
-                    state.tasks = build_tasks(state.plan)
-                    state.execution_graph = ExecutionGraph.from_tasks(state.tasks)
-                    state.plan_revisions += 1
-                    logger.info(
-                        "Plan revised (revision %d/%d): %d new questions",
-                        state.plan_revisions,
-                        MAX_PLAN_REVISIONS,
-                        len(new_plan_tail),
-                    )
+                new_specs = do_replan(
+                    state, df, state.llm, _build_working_memory_prompt(state)
+                )
+                new_tasks = apply_replan(state, new_specs)
+                state.plan_revisions += 1
+                logger.info(
+                    "Plan revised (revision %d/%d): %d new tasks",
+                    state.plan_revisions,
+                    MAX_PLAN_REVISIONS,
+                    len(new_tasks),
+                )
             else:
                 state.current_step += 1
 
@@ -335,6 +354,7 @@ def run(
             ),
         )
         reporting.abort_banner(
+            exc.kind,
             state.current_step + 1,
             len(state.plan),
             state.max_retries_per_step,
@@ -343,7 +363,7 @@ def run(
             state.run_id,
         )
         # ── Write structured run JSON even on abort ───────────────────────────
-        _finalize_run(state, t_start)
+        _finalize_run(state, t_start, dataset_label)
         return state
 
     # ── SUMMARY ───────────────────────────────────────────────────────────────
@@ -353,7 +373,7 @@ def run(
     reporting.final_summary(state.summary)
 
     # ── Write structured run JSON ─────────────────────────────────────────────
-    _finalize_run(state, t_start)
+    _finalize_run(state, t_start, dataset_label)
     return state
 
 
@@ -563,7 +583,7 @@ def _run_codegen_loop(state: AgentRun, task: TaskNode, df: pd.DataFrame) -> bool
             df,
             artifacts=artifact_namespace,
             extract_artifact=task.produces_artifact,
-            timeout_seconds=SANDBOX_TIMEOUT,
+            timeout_seconds=config.SANDBOX_TIMEOUT_SECONDS,
         )
         had_execution_errors = had_execution_errors or not sandbox_result["success"]
         status = (
@@ -577,10 +597,7 @@ def _run_codegen_loop(state: AgentRun, task: TaskNode, df: pd.DataFrame) -> bool
 
         if sandbox_result["success"]:
             semantic_validation = CapabilityValidator().validate_semantic_contract(
-                task.task_id, 
-                sandbox_result.get("artifact"), 
-                sandbox_result.get("result"), 
-                state.artifact_store.as_namespace()
+                task, sandbox_result.get("artifact")
             )
             if not semantic_validation.success:
                 sandbox_result["success"] = False
@@ -1000,7 +1017,9 @@ def _log(state: AgentRun, entry: LogEntry) -> None:
         logger.error("Failed to write log entry for run_id=%s: %s", state.run_id, exc)
 
 
-def _finalize_run(state: AgentRun, t_start: float) -> None:
+def _finalize_run(
+    state: AgentRun, t_start: float, dataset_label: str = "clean"
+) -> None:
     """
     Write the structured run JSON summary at the end of a run.
 
@@ -1028,7 +1047,9 @@ def _finalize_run(state: AgentRun, t_start: float) -> None:
     json_path = export_run_json(
         run_id=state.run_id,
         goal=state.goal,
-        dataset_label="clean" if not state.aborted else "clean (aborted)",
+        dataset_label=dataset_label
+        if not state.aborted
+        else f"{dataset_label} (aborted)",
         model_versions=model_versions,
         debug_entries=debug_entries,
         final_summary=state.summary if not state.aborted else "",

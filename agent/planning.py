@@ -7,14 +7,15 @@ time) so tests and dry-run can swap them without this module importing the loop.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+import re
+from typing import TYPE_CHECKING, Callable, Sequence
 
 import pandas as pd
 
 from agent import reporting
 from agent.execution_graph import ExecutionGraph
 from agent.logger import LogEntry
-from agent.parsing import parse_json_list, parse_plan_json
+from agent.parsing import parse_plan_json
 from agent.prompts import plan_prompt, replan_prompt
 from agent.state import TaskNode
 
@@ -34,8 +35,21 @@ def task_order(tasks: list[TaskNode]) -> list[str]:
     return [task.task_id for task in tasks]
 
 
+def next_task_index(tasks: list[TaskNode]) -> int:
+    """Return the 0-based plan index for the next new task: one past the highest
+    existing ``step_N`` number, so a new ID never reuses an existing one."""
+    numbers = [
+        int(m.group(1)) for t in tasks if (m := re.fullmatch(r"step_(\d+)", t.task_id))
+    ]
+    return max(numbers, default=0)
+
+
 def build_tasks(
-    plan: list[str], task_specs: list[dict] | None = None
+    plan: list[str],
+    task_specs: list[dict] | None = None,
+    *,
+    first_index: int = 0,
+    depends_on_prefix: Sequence[str] = (),
 ) -> list[TaskNode]:
     """
     Build task nodes from the ordered plan.
@@ -48,6 +62,10 @@ def build_tasks(
 
     The dependency graph (``depends_on``) still chains all prior tasks for
     safety, regardless of artifact declarations.
+
+    ``first_index`` / ``depends_on_prefix`` let a replan append new tasks after
+    existing ones: IDs start at ``task_id(first_index)`` and every new task also
+    depends on the IDs in ``depends_on_prefix``.
     """
     tasks: list[TaskNode] = []
     for index, question in enumerate(plan):
@@ -63,9 +81,10 @@ def build_tasks(
         capability = spec.get("capability") or None
         tasks.append(
             TaskNode(
-                task_id=task_id(index),
+                task_id=task_id(first_index + index),
                 question=question,
-                depends_on=[task_id(i) for i in range(index)],
+                depends_on=list(depends_on_prefix)
+                + [task_id(first_index + i) for i in range(index)],
                 produces_artifact=produces,
                 consumes_artifacts=list(consumes),
                 capability=capability,
@@ -115,16 +134,12 @@ def do_plan(
     return questions
 
 
-def do_replan(
-    state: "AgentRun", df: pd.DataFrame, llm: LLM, completed: str
-) -> list[str]:
-    """Re-plan from the current step forward, carrying completed findings.
+def do_replan(state: "AgentRun", df: pd.DataFrame, llm: LLM, completed: str) -> list[dict]:
+    """Re-plan from the current step forward and return structured task specs.
 
-    Replanning emits a flat string array (no artifact declarations) since the
-    LLM doesn't know which artifacts have already been registered. Replanned
-    tasks will still have access to the ArtifactStore via the `artifacts` sandbox
-    global — the code-gen prompt lists all available artifacts regardless of
-    whether the task declared explicit consumes_artifacts.
+    The replan prompt asks for the same JSON task shape as the initial plan
+    (question, capability, produces/consumes artifacts, output_schema), parsed
+    with :func:`parse_plan_json`. Use :func:`apply_replan` to rebuild the tasks.
     """
     reporting.replan_stage_start()
     # Get the critique reason from the most recent debug attempt.
@@ -137,9 +152,35 @@ def do_replan(
         state.schema_summary,
         completed,
         last_reason,
+        available_artifacts=state.artifact_store.describe(),
     )
     raw = llm(prompt, role="plan")
-    # Replan uses flat string array for simplicity
-    questions = parse_json_list(raw)
-    reporting.replan_generated(questions)
-    return questions
+    specs = parse_plan_json(raw)
+    reporting.replan_generated([spec["question"] for spec in specs])
+    return specs
+
+
+def apply_replan(state: "AgentRun", specs: list[dict]) -> list[TaskNode]:
+    """
+    Rebuild ``state.tasks`` / ``plan`` / ``execution_graph`` after a replan.
+
+    Completed tasks (those with a finding in working memory) are kept exactly as
+    they are (same TaskNode objects, so their capability, artifact and schema
+    metadata survive). Only the tail is new: the failed task and anything after
+    it are dropped, and the new tasks get IDs that continue after the current
+    highest ``step_N`` and depend on every kept task.
+
+    Returns the new tail tasks.
+    """
+    kept = [t for t in state.tasks if t.task_id in state.working_memory.findings]
+    new_tasks = build_tasks(
+        [spec["question"] for spec in specs],
+        specs,
+        first_index=next_task_index(state.tasks),
+        depends_on_prefix=[t.task_id for t in kept],
+    )
+    state.tasks = kept + new_tasks
+    state.plan = [t.question for t in state.tasks]
+    state.execution_graph = ExecutionGraph.from_tasks(state.tasks)
+    sync_task_capabilities(state)
+    return new_tasks

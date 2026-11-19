@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 from agent.capabilities import Capability, CapabilityExecutionContext
@@ -107,65 +106,45 @@ class CapabilityValidator:
 
     def validate_semantic_contract(
         self,
-        task_id: str,
+        task: TaskNode,
         artifact: Any,
-        result_str: Any,
-        artifacts: dict[str, pd.DataFrame],
     ) -> ValidationResult:
+        """
+        Generic, plan-independent contract checks for a task's artifact.
+
+        Applies only when the task declares ``produces_artifact``:
+          * the artifact must be a non-empty DataFrame;
+          * its columns must equal ``task.output_schema`` when one is declared
+            (``["same_as_input"]`` / ``["<scalar>"]`` placeholders are skipped).
+
+        Nothing here depends on the task's position or ID in the plan.
+        """
         reasons: list[str] = []
-        quarter_df = artifacts.get("quarter_df")
-        
-        # Calculate expected top region revenue if quarter_df is available
-        expected_top_revenue = None
-        if quarter_df is not None and "region" in quarter_df.columns and "revenue" in quarter_df.columns:
-            region_totals = quarter_df.groupby("region")["revenue"].sum()
-            if not region_totals.empty:
-                expected_top_revenue = float(region_totals.max())
-
-        if task_id == "step_2":
+        if task.produces_artifact:
             if not isinstance(artifact, pd.DataFrame):
-                reasons.append("Step 2 requires a DataFrame artifact.")
+                reasons.append(
+                    f"Task {task.task_id} declares produces_artifact="
+                    f"{task.produces_artifact!r} but no DataFrame artifact was produced."
+                )
+            elif artifact.empty:
+                reasons.append(
+                    f"Artifact {task.produces_artifact!r} is an empty DataFrame."
+                )
             else:
-                missing = [c for c in ["month", "region"] if c not in artifact.columns]
-                has_rev = "revenue" in artifact.columns or "total_revenue" in artifact.columns
-                if missing or not has_rev:
-                    reasons.append(f"Step 2 missing dimensions (month, region, revenue). Got: {list(artifact.columns)}")
-
-        elif task_id == "step_4":
-            if not isinstance(artifact, pd.DataFrame):
-                reasons.append("Step 4 requires a DataFrame artifact.")
-            else:
-                missing = [c for c in ["month"] if c not in artifact.columns]
-                has_rev = "revenue" in artifact.columns or "total_revenue" in artifact.columns
-                if missing or not has_rev:
-                    reasons.append(f"Step 4 missing dimensions (month, revenue). Got: {list(artifact.columns)}")
-                
-                if has_rev and expected_top_revenue is not None:
-                    rev_col = "total_revenue" if "total_revenue" in artifact.columns else "revenue"
-                    actual_total = float(artifact[rev_col].sum())
-                    if abs(actual_total - expected_top_revenue) > 0.01:
-                        reasons.append(f"Step 4 artifact must represent ONLY the top region. Expected total revenue ~{expected_top_revenue:.2f}, got ~{actual_total:.2f}")
-
-        elif task_id == "step_5":
-            str_val = str(result_str).lower().strip()
-            is_bool = str_val in ["true", "false", "np.true_", "np.false_"] or isinstance(result_str, (bool, np.bool_))
-            if not is_bool:
-                reasons.append(f"Step 5 requires a Boolean result. Got: {result_str}")
-
-        elif task_id == "step_6":
-            if not isinstance(artifact, pd.DataFrame):
-                reasons.append("Step 6 requires a DataFrame artifact.")
-            else:
-                has_rev = "revenue" in artifact.columns or "total_revenue" in artifact.columns
-                if has_rev and expected_top_revenue is not None:
-                    rev_col = "total_revenue" if "total_revenue" in artifact.columns else "revenue"
-                    actual_total = float(artifact[rev_col].sum())
-                    if abs(actual_total - expected_top_revenue) > 0.01:
-                        reasons.append(f"Step 6 aggregation must be restricted to the top region and last-quarter data. Expected total revenue ~{expected_top_revenue:.2f}, got ~{actual_total:.2f}")
+                expected = list(task.output_schema)
+                actual = list(artifact.columns)
+                if (
+                    expected
+                    and expected not in (["same_as_input"], ["<scalar>"])
+                    and actual != expected
+                ):
+                    reasons.append(
+                        f"Artifact {task.produces_artifact!r} columns {actual} "
+                        f"do not match the declared output_schema {expected}."
+                    )
 
         return ValidationResult(
             success=not reasons,
             reasons=reasons,
-            metadata={"task_id": task_id}
+            metadata={"task_id": task.task_id},
         )
-

@@ -124,7 +124,7 @@ def parse_json_list(raw: str) -> list[str]:
     # Fallback: numbered lines
     lines = []
     for line in raw.splitlines():
-        line = re.sub(r"^\d+[\.)\]\s*", "", line.strip())
+        line = re.sub(r"^\d+[\.)\]]\s*", "", line.strip())
         if line:
             lines.append(line)
     return lines or [raw.strip()]

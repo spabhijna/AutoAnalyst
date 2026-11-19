@@ -3,7 +3,28 @@ Configuration constants for the AutoAnalyst agent.
 
 All tunables live here — no magic strings scattered across the codebase.
 Import from this module rather than hardcoding values elsewhere.
+
+``MAX_RETRIES``, ``SANDBOX_TIMEOUT_SECONDS`` and ``LOG_DIR`` can be overridden
+through environment variables (or a ``.env`` file); see ``.env.example``.
 """
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _env_number(name: str, default, cast):
+    """Read *name* from the environment as *cast*; unset/blank → *default*."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return cast(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid value for {name}: {raw!r}") from exc
+
 
 # ── Groq models ───────────────────────────────────────────────────────────────
 
@@ -57,15 +78,15 @@ GROQ_RETRY_BACKOFF_SECONDS: float = RETRY_BACKOFF_SECONDS
 
 # Hard cap on PLAN → CODEGEN → EXECUTE → OBSERVE → CRITIQUE iterations
 # per sub-question (default; can be overridden via env MAX_RETRIES)
-MAX_PIPELINE_RETRIES: int = 5
+MAX_PIPELINE_RETRIES: int = _env_number("MAX_RETRIES", 5, int)
 
 # Wall-clock timeout (seconds) for sandbox code execution
-SANDBOX_TIMEOUT_SECONDS: float = 30.0
+SANDBOX_TIMEOUT_SECONDS: float = _env_number("SANDBOX_TIMEOUT_SECONDS", 30.0, float)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 # Directory where JSONL run logs are written
-LOG_DIR: str = "runs"
+LOG_DIR: str = os.environ.get("LOG_DIR", "").strip() or "runs"
 
 # ── Roles (informational — used for logging, not provider routing) ────────────
 

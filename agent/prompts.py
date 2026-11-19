@@ -82,6 +82,7 @@ def replan_prompt(
     schema_summary: str,
     completed_findings: str,
     critique_reason: str,
+    available_artifacts: str = "",
 ) -> str:
     """
     Build the RE-PLAN prompt when critique returns ``"revise_plan"``.
@@ -94,10 +95,20 @@ def replan_prompt(
         schema_summary:     Dataset schema.
         completed_findings: Summary of high-trust steps completed so far.
         critique_reason:    The critique's reason for requesting a plan revision.
+        available_artifacts: Description of the DataFrame artifacts already
+                            registered (``ArtifactStore.describe()``); new tasks
+                            may consume them by name.
 
     Returns:
         Complete prompt string.
     """
+    artifacts_section = (
+        f"\nARTIFACTS ALREADY AVAILABLE (consume these by name, do not recreate them):\n"
+        f"{available_artifacts}\n"
+        if available_artifacts
+        and available_artifacts != "(no pre-computed artifacts available yet)"
+        else ""
+    )
     return f"""You are a senior data analyst revising an investigation plan mid-stream.
 
 DATASET SCHEMA:
@@ -107,15 +118,30 @@ ORIGINAL GOAL: {goal}
 
 FINDINGS ALREADY ESTABLISHED (high-trust, do not re-investigate):
 {completed_findings}
-
+{artifacts_section}
 REASON THE PREVIOUS PLAN NEEDS REVISION:
 {critique_reason}
 
-Generate a new list of 2-5 sub-questions to complete the investigation.
+Generate a new list of 2-5 tasks to complete the investigation.
 These must address the gap identified in the critique reason.
 Do NOT repeat questions whose findings are already established above.
 
-Return ONLY a JSON array of strings. No explanation, no markdown fences.
+Each task object must have these fields:
+  "question":          A specific, concrete question answerable with one pandas snippet.
+  "capability":        A registered capability identifier to execute this node, or null.
+  "produces_artifact": A snake_case DataFrame variable name this task will create and
+                       register, or null if it returns only a scalar, string, or list.
+  "consumes_artifacts": A JSON array of artifact names this task will use (from the
+                        available artifacts above or earlier tasks in this list).
+                        Empty array [] if none.
+  "output_schema":     A JSON array of expected output columns, or ["<scalar>"] for
+                       scalar answers.
+
+Return ONLY a JSON array of task objects. No explanation, no markdown fences.
+Example:
+[
+  {{"question": "Which region has the highest total revenue?", "capability": "FindMaximumRevenueRegion", "produces_artifact": "top_region", "consumes_artifacts": ["region_revenue"], "output_schema": ["region", "total_revenue"]}}
+]
 
 JSON array:"""
 
@@ -362,7 +388,7 @@ STDOUT OUTPUT: {exec_stdout}{error_block}
 
 PREVIOUSLY ACCEPTED FINDINGS (for contradiction detection only — see Step 4):
 {history_summary if history_summary else "(none yet — this is the first step)"}
-
+{obs_block}
 ══════════════════════════════════════════════════════════════
 AUDIT PROCESS — follow this order exactly:
 ══════════════════════════════════════════════════════════════

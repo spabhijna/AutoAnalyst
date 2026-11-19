@@ -113,6 +113,7 @@ def max_retries_exceeded(max_retries: int) -> None:
 
 
 def abort_banner(
+    kind: str,
     step_number: int,
     total_steps: int,
     max_retries: int,
@@ -123,8 +124,11 @@ def abort_banner(
     print(f"\n{_RULE}")
     print("  ✖  PIPELINE ABORTED")
     print(f"{_RULE}")
-    print(f"  Step {step_number}/{total_steps} could not produce a")
-    print(f"  trustworthy answer after {max_retries} attempts.")
+    if kind == "max retries exhausted":
+        print(f"  Step {step_number}/{total_steps} could not produce a")
+        print(f"  trustworthy answer after {max_retries} attempts.")
+    else:
+        print(f"  Step {step_number}/{total_steps}: {kind}.")
     print(f"  Sub-question: {sub_question}")
     print(f"  Last critique: {last_reason}")
     print()
