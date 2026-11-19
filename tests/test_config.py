@@ -78,7 +78,7 @@ def test_loop_passes_config_timeout_to_sandbox(tmp_path, monkeypatch) -> None:
     with (
         patch("agent.loop.call_llm", side_effect=lambda *a, **k: next(responses)),
         patch("agent.loop.run_sandboxed", return_value=ok) as sandbox,
-        patch("agent.loop.write_log_entry"),
+        patch("agent.run_export.write_log_entry"),
     ):
         run("goal", df, log_dir=str(tmp_path))
     assert sandbox.call_args.kwargs["timeout_seconds"] == 17.0
@@ -111,7 +111,7 @@ def test_run_json_abort_suffix(tmp_path) -> None:
     with (
         patch("agent.loop.call_llm", side_effect=lambda p, role, *a, **k: '["Q1?"]' if role == "plan" else ("result = 1" if role == "codegen" else revise)),
         patch("agent.loop.run_sandboxed", return_value=ok),
-        patch("agent.loop.write_log_entry"),
+        patch("agent.run_export.write_log_entry"),
     ):
         state = run("goal", df, log_dir=str(tmp_path), max_retries_per_step=1, dataset_label="corrupted")
     assert state.aborted

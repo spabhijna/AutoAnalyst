@@ -151,7 +151,7 @@ def test_run_replan_with_structured_response(tmp_path) -> None:
     with (
         patch("agent.loop.call_llm", side_effect=lambda *a, **k: next(responses)),
         patch("agent.loop.run_sandboxed", return_value=ok),
-        patch("agent.loop.write_log_entry"),
+        patch("agent.run_export.write_log_entry"),
     ):
         state = run("goal", df, log_dir=str(tmp_path))
 

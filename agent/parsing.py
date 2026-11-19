@@ -1,5 +1,5 @@
 """
-Parsers for LLM output: plan JSON, flat question lists, critique JSON, code fences.
+Parsers for LLM output: plan JSON, critique JSON, code fences.
 
 All functions are pure and defensive: malformed LLM output never raises.
 """
@@ -55,7 +55,7 @@ def parse_plan_json(raw: str) -> list[dict]:
     of the loop can treat both formats identically.
 
     The function is intentionally defensive: if JSON parsing fails entirely,
-    it falls back to line-splitting (same as the old ``parse_json_list``).
+    it falls back to line-splitting (same as the old flat-list parser).
 
     Args:
         raw: Raw LLM response string.
@@ -87,7 +87,7 @@ def parse_plan_json(raw: str) -> list[dict]:
         except json.JSONDecodeError:
             pass
 
-    # Fallback: split on numbered lines (same as legacy parse_json_list)
+    # Fallback: split on numbered lines (same as the legacy flat-list parser)
     lines = []
     for line in raw.splitlines():
         line = re.sub(r"^\d+[\.)\-]\s*", "", line.strip())
@@ -96,38 +96,6 @@ def parse_plan_json(raw: str) -> list[dict]:
     if lines:
         return lines
     return [_task_spec(raw.strip())]
-
-
-def parse_json_list(raw: str) -> list[str]:
-    """
-    Parse a JSON array of strings from LLM output.
-
-    Handles extra prose or markdown fences around the JSON.
-    Falls back to splitting on newlines if JSON parsing fails.
-
-    Args:
-        raw: Raw LLM response string.
-
-    Returns:
-        List of question strings (non-empty).
-    """
-    # Try to extract a JSON array
-    match = re.search(r"\[.*?\]", raw, re.DOTALL)
-    if match:
-        try:
-            result = json.loads(match.group(0))
-            if isinstance(result, list) and all(isinstance(q, str) for q in result):
-                return [q.strip() for q in result if q.strip()]
-        except json.JSONDecodeError:
-            pass
-
-    # Fallback: numbered lines
-    lines = []
-    for line in raw.splitlines():
-        line = re.sub(r"^\d+[\.)\]]\s*", "", line.strip())
-        if line:
-            lines.append(line)
-    return lines or [raw.strip()]
 
 
 def parse_critique_json(raw: str) -> dict[str, Any]:

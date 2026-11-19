@@ -6,7 +6,8 @@ import json
 
 import pytest
 
-from agent.loop import _artifact_contract_text, run
+from agent.loop import run
+from agent.stages import artifact_contract_text as _artifact_contract_text
 from agent.state import TaskNode
 from data.generate_data import generate_sales_data
 

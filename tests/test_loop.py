@@ -17,15 +17,12 @@ from unittest.mock import MagicMock, call, patch
 import pandas as pd
 import pytest
 
-from agent.loop import (
-    AgentRun,
-    _accepted_findings,
-    _final_results,
-    run,
-)
+from agent.findings import attempt_for_finding, final_results, finding_from_attempt
+from agent.loop import AgentRun, run
+from agent.planning import build_tasks, task_order
+from agent.state import AttemptRecord
 from agent.parsing import (
     parse_critique_json,
-    parse_json_list,
     parse_plan_json,
     strip_markdown_fences,
 )
@@ -51,7 +48,7 @@ def small_df() -> pd.DataFrame:
 
 CALL_LLM = "agent.loop.call_llm"
 RUN_SANDBOXED = "agent.loop.run_sandboxed"
-WRITE_LOG = "agent.loop.write_log_entry"
+WRITE_LOG = "agent.run_export.write_log_entry"
 
 
 def _accept_critique() -> str:
@@ -140,13 +137,13 @@ class TestAcceptPath:
             len(
                 [
                     h
-                    for h in state.history
-                    if h["sub_question"] == "What is total revenue?"
+                    for h in state.debug_history
+                    if h.sub_question == "What is total revenue?"
                 ]
             )
             == 1
         )
-        assert state.history[0]["action"] == "accept"
+        assert state.debug_history[0].action == "accept"
         assert state.summary == "Summary text."
 
     def test_two_questions_both_accepted(self, small_df: pd.DataFrame) -> None:
@@ -163,8 +160,8 @@ class TestAcceptPath:
             ],
             sandbox_side_effects=[_ok_sandbox(), _ok_sandbox()],
         )
-        assert len(state.history) == 2
-        assert all(h["action"] == "accept" for h in state.history)
+        assert len(state.debug_history) == 2
+        assert all(h.action == "accept" for h in state.debug_history)
 
 
 # ---------------------------------------------------------------------------
@@ -188,11 +185,11 @@ class TestReviseCode:
             sandbox_side_effects=[_ok_sandbox(), _ok_sandbox()],
         )
         q_entries = [
-            h for h in state.history if h["sub_question"] == "What is revenue?"
+            h for h in state.debug_history if h.sub_question == "What is revenue?"
         ]
         assert len(q_entries) == 2
-        assert q_entries[0]["action"] == "revise_code"
-        assert q_entries[1]["action"] == "accept"
+        assert q_entries[0].action == "revise_code"
+        assert q_entries[1].action == "accept"
         assert len(state.debug_history) == 2
         assert len(state.final_results) == 1
         finding = state.final_results[0]
@@ -263,7 +260,7 @@ class TestReviseCode:
             ],
             sandbox_side_effects=[_fail_sandbox(), _ok_sandbox()],
         )
-        assert any(h["action"] == "accept" for h in state.history)
+        assert any(h.action == "accept" for h in state.debug_history)
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +296,7 @@ class TestRevisePlan:
         ):
             state = run("goal", small_df, log_dir="/tmp/test_runs")
 
-        assert "Q2_bad?" not in [h["sub_question"] for h in state.history]
+        assert "Q2_bad?" not in [h.sub_question for h in state.debug_history]
         assert state.plan_revisions == 1
 
     def test_plan_revision_cap(self, small_df: pd.DataFrame) -> None:
@@ -386,13 +383,41 @@ class TestLogging:
 
 class TestSummaryWorkingMemory:
     def _make_state(self, plan: list[str], history: list[dict]) -> AgentRun:
+        """Build a state from attempt dicts: debug history, tasks and working memory."""
         state = AgentRun(goal="test goal", schema_summary="cols")
         state.plan = plan
-        state.history = history
+        state.tasks = build_tasks(plan)
+        by_question = {t.question: t for t in state.tasks}
+        for entry in history:
+            task = by_question[entry["sub_question"]]
+            attempt = AttemptRecord(
+                task_id=task.task_id,
+                sub_question=entry["sub_question"],
+                iteration=entry["iteration"],
+                code=entry.get("code", ""),
+                sandbox_result=entry.get("sandbox_result") or {},
+                critique=entry.get("critique", ""),
+                action=entry["action"],
+                trust=entry["trust"],
+            )
+            state.debug_history.append(attempt)
+            if attempt.action == "accept":
+                state.working_memory.add_finding(
+                    finding_from_attempt(
+                        attempt=attempt,
+                        task=task,
+                        attempt_count=attempt.iteration + 1,
+                        had_execution_errors=False,
+                        reason="accepted",
+                    )
+                )
+        state.final_results = state.working_memory.accepted_findings(
+            task_order(state.tasks)
+        )
         return state
 
     def test_accepted_findings_strips_intermediate_failures(self) -> None:
-        """Intermediate revise_code entries must not appear in accepted_findings."""
+        """Intermediate revise_code entries must not appear in the findings."""
         q = "What is total revenue?"
         history = [
             {
@@ -418,23 +443,17 @@ class TestSummaryWorkingMemory:
             },
         ]
         state = self._make_state([q], history)
-        findings = _accepted_findings(state)
 
-        assert len(findings) == 1
-        assert findings[0]["action"] == "accept"
-        assert findings[0]["iteration"] == 2
+        assert len(state.final_results) == 1
+        attempt = attempt_for_finding(state, state.final_results[0])
+        assert attempt is not None
+        assert attempt.action == "accept"
+        assert attempt.iteration == 2
 
     def test_accepted_findings_preserves_plan_order(self) -> None:
         """Findings are returned in plan order, not history insertion order."""
         q1, q2 = "Q1?", "Q2?"
         history = [
-            {
-                "sub_question": q1,
-                "iteration": 0,
-                "action": "accept",
-                "trust": "high",
-                "sandbox_result": {"result": "A1"},
-            },
             {
                 "sub_question": q2,
                 "iteration": 0,
@@ -442,11 +461,17 @@ class TestSummaryWorkingMemory:
                 "trust": "high",
                 "sandbox_result": {"result": "A2"},
             },
+            {
+                "sub_question": q1,
+                "iteration": 0,
+                "action": "accept",
+                "trust": "high",
+                "sandbox_result": {"result": "A1"},
+            },
         ]
         state = self._make_state([q1, q2], history)
-        findings = _accepted_findings(state)
 
-        assert [f["sub_question"] for f in findings] == [q1, q2]
+        assert [f.question for f in state.final_results] == [q1, q2]
 
     def test_summary_llm_sees_only_accepted_entry(self, small_df: pd.DataFrame) -> None:
         """End-to-end: a step with 2 iterations should produce exactly 1 finding."""
@@ -499,7 +524,7 @@ class TestSummaryWorkingMemory:
         ]
         state = self._make_state([q], history)
 
-        assert _final_results(state) == [
+        assert final_results(state) == [
             {
                 "question": q,
                 "answer": "100",
@@ -539,7 +564,7 @@ class TestSummaryWorkingMemory:
         ]
         state = self._make_state([q], history)
 
-        prompt_payload = _final_results(state)
+        prompt_payload = final_results(state)
         assert prompt_payload == [
             {
                 "question": q,
@@ -600,7 +625,7 @@ class TestParsePlanJson:
             patch(WRITE_LOG),
         ):
             state = run("test goal", small_df, log_dir="/tmp/test_runs")
-        assert len(state.history) == 2
+        assert len(state.debug_history) == 2
 
     def test_structured_format_populates_task_node(
         self, small_df: pd.DataFrame
@@ -665,16 +690,6 @@ class TestHelpers:
         df = pd.DataFrame({"x": [1.0, None, 3.0]})
         summary = build_schema_summary(df)
         assert "33.3%" in summary or "nulls=" in summary
-
-    def test_parse_json_list_clean(self) -> None:
-        raw = '["What is X?", "How does Y compare?"]'
-        result = parse_json_list(raw)
-        assert result == ["What is X?", "How does Y compare?"]
-
-    def test_parse_json_list_with_prose(self) -> None:
-        raw = 'Here are the questions:\n["Q1?", "Q2?"]'
-        result = parse_json_list(raw)
-        assert "Q1?" in result
 
     def test_parse_critique_json_valid(self) -> None:
         raw = '{"trust": "high", "reason": "Looks good.", "action": "accept"}'

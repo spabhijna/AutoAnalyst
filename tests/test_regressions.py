@@ -15,14 +15,14 @@ import pandas as pd
 import pytest
 
 import agent.loop as loop
-from agent.parsing import parse_json_list
+from agent.parsing import parse_plan_json
 from agent.artifact_store import ArtifactStore
 from agent.loop import MAX_PLAN_REVISIONS, run
 from data.generate_data import generate_sales_data
 
 CALL_LLM = "agent.loop.call_llm"
 RUN_SANDBOXED = "agent.loop.run_sandboxed"
-WRITE_LOG = "agent.loop.write_log_entry"
+WRITE_LOG = "agent.run_export.write_log_entry"
 
 
 @pytest.fixture()
@@ -45,13 +45,18 @@ def test_dry_run_smoke(sales_df, tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# D1: _parse_json_list fallback regex is malformed
+# D1: the numbered-line fallback regex was malformed (re.error); the flat-list
+# parser it lived in was removed in Phase 5, the plan parser has the same fallback
 # ---------------------------------------------------------------------------
 
 
-def test_parse_json_list_numbered_fallback() -> None:
-    result = parse_json_list("1. First question\n2) Second question")
-    assert result == ["First question", "Second question"]
+def test_numbered_line_fallback_parses_every_marker_style() -> None:
+    specs = parse_plan_json("1. First question\n2) Second question\n3- Third")
+    assert [spec["question"] for spec in specs] == [
+        "First question",
+        "Second question",
+        "Third",
+    ]
 
 
 # ---------------------------------------------------------------------------

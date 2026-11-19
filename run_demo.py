@@ -62,7 +62,7 @@ def main() -> None:
     state = run(goal, df, dry_run=args.dry_run)
 
     print(f"\nLog written to: runs/{state.run_id}.jsonl")
-    print(f"Total steps executed: {len(state.history)}")
+    print(f"Total steps executed: {len(state.debug_history)}")
 
 
 if __name__ == "__main__":

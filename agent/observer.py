@@ -131,6 +131,23 @@ class ObservationReport:
 # ---------------------------------------------------------------------------
 
 
+def _revenue_outliers_iqr(df: pd.DataFrame) -> list[int]:
+    """Row indices whose revenue lies outside 1.5 × IQR (needs ≥ 4 values)."""
+    outliers: list[int] = []
+    if "revenue" in df.columns:
+        rev = df["revenue"].dropna()
+        if len(rev) >= 4:
+            q1 = float(rev.quantile(0.25))
+            q3 = float(rev.quantile(0.75))
+            iqr = q3 - q1
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
+            outlier_mask = (rev < lower) | (rev > upper)
+            outlier_indices = rev[outlier_mask].index.tolist()
+            outliers = [int(i) for i in outlier_indices]
+    return outliers
+
+
 def observe(
     df: pd.DataFrame,
     sandbox_result: dict[str, Any],
@@ -179,17 +196,7 @@ def observe(
         report.zero_units_positive_revenue = int(mask.sum())
 
     # ── 5. Revenue outliers (IQR method) ───────────────────────────────────────
-    if "revenue" in df.columns:
-        rev = df["revenue"].dropna()
-        if len(rev) >= 4:
-            q1 = float(rev.quantile(0.25))
-            q3 = float(rev.quantile(0.75))
-            iqr = q3 - q1
-            lower = q1 - 1.5 * iqr
-            upper = q3 + 1.5 * iqr
-            outlier_mask = (rev < lower) | (rev > upper)
-            outlier_indices = rev[outlier_mask].index.tolist()
-            report.revenue_outliers_iqr = [int(i) for i in outlier_indices]
+    report.revenue_outliers_iqr = _revenue_outliers_iqr(df)
 
     # ── 6. Rows after code filter (heuristic from stdout head() prints) ────────
     stdout = sandbox_result.get("stdout", "")

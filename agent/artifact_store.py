@@ -181,34 +181,9 @@ class ArtifactStore:
     # Write API
     # ------------------------------------------------------------------
 
-    def register(
-        self,
-        key: str,
-        df: pd.DataFrame,
-        producing_task_id: str = "",
-        consumers: list[str] | None = None,
-        confidence: str = "unknown",
-        provenance: list[str] | None = None,
-    ) -> bool:
-        """
-        Register *df* under *key* as an :class:`Artifact`.
-
-        Performs three validations before accepting:
-          1. Value is a non-None pd.DataFrame.
-          2. DataFrame is non-empty.
-          3. Pickled size is within MAX_ARTIFACT_BYTES.
-
-        The artifact's ``type`` and ``schema`` are auto-detected from the
-        DataFrame structure via :func:`classify_artifact`.
-
-        Args:
-            key:               Snake_case name declared by the planner.
-            df:                Validated DataFrame from an accepted sandbox run.
-            producing_task_id: task_id of the step that produced this artifact.
-
-        Returns:
-            True if the artifact was registered, False if rejected.
-        """
+    @staticmethod
+    def _is_registrable(key: str, df: object) -> bool:
+        """Run the three register() validations; log and return False on failure."""
         if not isinstance(df, pd.DataFrame):
             logger.warning(
                 "ArtifactStore.register(%r): value is not a DataFrame — skipping", key
@@ -238,6 +213,38 @@ class ArtifactStore:
                 size_bytes // (1024 * 1024),
                 MAX_ARTIFACT_BYTES // (1024 * 1024),
             )
+            return False
+        return True
+
+    def register(
+        self,
+        key: str,
+        df: pd.DataFrame,
+        producing_task_id: str = "",
+        consumers: list[str] | None = None,
+        confidence: str = "unknown",
+        provenance: list[str] | None = None,
+    ) -> bool:
+        """
+        Register *df* under *key* as an :class:`Artifact`.
+
+        Performs three validations before accepting:
+          1. Value is a non-None pd.DataFrame.
+          2. DataFrame is non-empty.
+          3. Pickled size is within MAX_ARTIFACT_BYTES.
+
+        The artifact's ``type`` and ``schema`` are auto-detected from the
+        DataFrame structure via :func:`classify_artifact`.
+
+        Args:
+            key:               Snake_case name declared by the planner.
+            df:                Validated DataFrame from an accepted sandbox run.
+            producing_task_id: task_id of the step that produced this artifact.
+
+        Returns:
+            True if the artifact was registered, False if rejected.
+        """
+        if not self._is_registrable(key, df):
             return False
 
         # Classify and build the artifact atomically — no separate metadata dict.

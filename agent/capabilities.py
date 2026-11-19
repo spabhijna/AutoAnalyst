@@ -156,12 +156,13 @@ def _determine_scope_df(
     return context.df.loc[mask].copy(deep=False)
 
 
-def _single_row_result(
-    df: pd.DataFrame, artifact_key: str, result_text: str
+def _df_result(
+    df: pd.DataFrame, artifact_key: str, result_text: str | None = None
 ) -> DeterministicExecutionResult:
+    """Wrap a produced DataFrame as a successful deterministic result."""
     return DeterministicExecutionResult(
         success=True,
-        result=result_text,
+        result=df.head().to_string(index=False) if result_text is None else result_text,
         stdout="",
         error=None,
         error_type=None,
@@ -171,19 +172,28 @@ def _single_row_result(
     )
 
 
+def _failed_result(error: str) -> DeterministicExecutionResult:
+    """A failed result: the engine returns None and the loop falls back to CODE-GEN."""
+    return DeterministicExecutionResult(
+        success=False,
+        result=None,
+        stdout="",
+        error=error,
+        error_type="ValueError",
+        error_category="capability_error",
+        artifact=None,
+        artifact_key=None,
+    )
+
+
 def execute_filter_by_date_range(
     context: CapabilityExecutionContext,
 ) -> DeterministicExecutionResult:
     quarter_df = _determine_scope_df(context, "quarter_df")
-    return DeterministicExecutionResult(
-        success=True,
-        result=f"quarter_df: {len(quarter_df):,} rows",
-        stdout="",
-        error=None,
-        error_type=None,
-        error_category="none",
-        artifact=quarter_df,
-        artifact_key=context.task.produces_artifact or "quarter_df",
+    return _df_result(
+        quarter_df,
+        context.task.produces_artifact or "quarter_df",
+        f"quarter_df: {len(quarter_df):,} rows",
     )
 
 
@@ -198,16 +208,7 @@ def execute_group_revenue_by_region(
         .sort_values("total_revenue", ascending=False)
         .reset_index(drop=True)
     )
-    return DeterministicExecutionResult(
-        success=True,
-        result=grouped.head().to_string(index=False),
-        stdout="",
-        error=None,
-        error_type=None,
-        error_category="none",
-        artifact=grouped,
-        artifact_key=context.task.produces_artifact or "region_revenue",
-    )
+    return _df_result(grouped, context.task.produces_artifact or "region_revenue")
 
 
 def execute_find_maximum_revenue_region(
@@ -217,11 +218,7 @@ def execute_find_maximum_revenue_region(
     if region_revenue is None:
         region_revenue = execute_group_revenue_by_region(context).artifact
     top_region = region_revenue.head(1).copy(deep=False)
-    return _single_row_result(
-        top_region,
-        context.task.produces_artifact or "top_region",
-        top_region.to_string(index=False),
-    )
+    return _df_result(top_region, context.task.produces_artifact or "top_region")
 
 
 def execute_monthly_revenue_trend(
@@ -239,16 +236,7 @@ def execute_monthly_revenue_trend(
         .sort_values("month")
         .reset_index(drop=True)
     )
-    return DeterministicExecutionResult(
-        success=True,
-        result=trend.head().to_string(index=False),
-        stdout="",
-        error=None,
-        error_type=None,
-        error_category="none",
-        artifact=trend,
-        artifact_key=context.task.produces_artifact or "monthly_trend",
-    )
+    return _df_result(trend, context.task.produces_artifact or "monthly_trend")
 
 
 def execute_revenue_share(
@@ -257,19 +245,17 @@ def execute_revenue_share(
     region_revenue = context.artifacts.get("region_revenue")
     if region_revenue is None:
         region_revenue = execute_group_revenue_by_region(context).artifact
-    total = region_revenue.iloc[:, 1].sum()
+    if "total_revenue" not in region_revenue.columns:
+        return _failed_result(
+            "RevenueShare needs a 'total_revenue' column in region_revenue, "
+            f"got {list(region_revenue.columns)}"
+        )
+    total = region_revenue["total_revenue"].sum()
     share = region_revenue.copy(deep=False)
-    share["revenue_share"] = 0.0 if total == 0 else share.iloc[:, 1] / total
-    return DeterministicExecutionResult(
-        success=True,
-        result=share.head().to_string(index=False),
-        stdout="",
-        error=None,
-        error_type=None,
-        error_category="none",
-        artifact=share,
-        artifact_key=context.task.produces_artifact or "revenue_share",
+    share["revenue_share"] = (
+        0.0 if total == 0 else share["total_revenue"] / total
     )
+    return _df_result(share, context.task.produces_artifact or "revenue_share")
 
 
 def execute_category_aggregation(
@@ -283,16 +269,7 @@ def execute_category_aggregation(
         .sort_values("total_revenue", ascending=False)
         .reset_index(drop=True)
     )
-    return DeterministicExecutionResult(
-        success=True,
-        result=category.head().to_string(index=False),
-        stdout="",
-        error=None,
-        error_type=None,
-        error_category="none",
-        artifact=category,
-        artifact_key=context.task.produces_artifact or "category_revenue",
-    )
+    return _df_result(category, context.task.produces_artifact or "category_revenue")
 
 
 def execute_average_unit_price(
@@ -307,16 +284,7 @@ def execute_average_unit_price(
         .sort_values("average_price", ascending=False)
         .reset_index(drop=True)
     )
-    return DeterministicExecutionResult(
-        success=True,
-        result=avg_price.head().to_string(index=False),
-        stdout="",
-        error=None,
-        error_type=None,
-        error_category="none",
-        artifact=avg_price,
-        artifact_key=context.task.produces_artifact or "average_prices",
-    )
+    return _df_result(avg_price, context.task.produces_artifact or "average_prices")
 
 
 def execute_top_selling_product_category(
@@ -330,114 +298,97 @@ def execute_top_selling_product_category(
         .sort_values("total_units_sold", ascending=False)
         .reset_index(drop=True)
     )
-    return DeterministicExecutionResult(
-        success=True,
-        result=top_selling.head().to_string(index=False),
-        stdout="",
-        error=None,
-        error_type=None,
-        error_category="none",
-        artifact=top_selling,
-        artifact_key=context.task.produces_artifact or "top_selling_category",
+    return _df_result(
+        top_selling, context.task.produces_artifact or "top_selling_category"
     )
+
+
+_DEFAULT_CAPABILITIES: tuple[Capability, ...] = (
+    Capability(
+        capability_id="FilterByDateRange",
+        description="Filter the working dataset to the analysis date window.",
+        required_artifacts=(),
+        produced_artifacts=("quarter_df",),
+        input_schema=("date",),
+        output_schema=("same_as_input",),
+        executor=execute_filter_by_date_range,
+        match_terms=("last quarter", "date range", "filter", "quarter_df"),
+    ),
+    Capability(
+        capability_id="GroupRevenueByRegion",
+        description="Aggregate revenue by region in the scoped dataset.",
+        required_artifacts=("quarter_df",),
+        produced_artifacts=("region_revenue",),
+        input_schema=("region", "revenue"),
+        output_schema=("region", "total_revenue"),
+        executor=execute_group_revenue_by_region,
+        match_terms=("region revenue", "revenue by region", "groupby region"),
+    ),
+    Capability(
+        capability_id="FindMaximumRevenueRegion",
+        description="Find the region with the highest total revenue.",
+        required_artifacts=("region_revenue",),
+        produced_artifacts=("top_region",),
+        input_schema=("region", "total_revenue"),
+        output_schema=("region", "total_revenue"),
+        executor=execute_find_maximum_revenue_region,
+        match_terms=("highest revenue", "top region", "maximum revenue"),
+    ),
+    Capability(
+        capability_id="MonthlyRevenueTrend",
+        description="Summarize revenue trends by month.",
+        required_artifacts=("quarter_df",),
+        produced_artifacts=("monthly_trend",),
+        input_schema=("date", "revenue"),
+        output_schema=("month", "total_revenue"),
+        executor=execute_monthly_revenue_trend,
+        match_terms=("month-over-month", "monthly trend", "monthly revenue trend"),
+    ),
+    Capability(
+        capability_id="RevenueShare",
+        description="Compute revenue share across regions or categories.",
+        required_artifacts=("region_revenue",),
+        produced_artifacts=("revenue_share",),
+        input_schema=("region", "total_revenue"),
+        output_schema=("region", "total_revenue", "revenue_share"),
+        executor=execute_revenue_share,
+        match_terms=("share", "percentage", "revenue share"),
+    ),
+    Capability(
+        capability_id="CategoryAggregation",
+        description="Aggregate revenue by product category.",
+        required_artifacts=("quarter_df",),
+        produced_artifacts=("category_revenue",),
+        input_schema=("product_category", "revenue"),
+        output_schema=("product_category", "total_revenue"),
+        executor=execute_category_aggregation,
+        match_terms=("category", "product category", "category aggregation"),
+    ),
+    Capability(
+        capability_id="AverageUnitPrice",
+        description="Compute the average unit price by product category.",
+        required_artifacts=("quarter_df",),
+        produced_artifacts=("average_prices",),
+        input_schema=("product_category", "unit_price"),
+        output_schema=("product_category", "average_price"),
+        executor=execute_average_unit_price,
+        match_terms=("average price", "unit price", "mean price"),
+    ),
+    Capability(
+        capability_id="TopSellingProductCategory",
+        description="Find the product category with the highest units sold.",
+        required_artifacts=("quarter_df",),
+        produced_artifacts=("top_selling_category",),
+        input_schema=("product_category", "units_sold"),
+        output_schema=("product_category", "total_units_sold"),
+        executor=execute_top_selling_product_category,
+        match_terms=("top selling", "most units sold", "highest volume"),
+    ),
+)
 
 
 def build_default_capability_registry() -> CapabilityRegistry:
     registry = CapabilityRegistry()
-    registry.register(
-        Capability(
-            capability_id="FilterByDateRange",
-            description="Filter the working dataset to the analysis date window.",
-            required_artifacts=(),
-            produced_artifacts=("quarter_df",),
-            input_schema=("date",),
-            output_schema=("same_as_input",),
-            executor=execute_filter_by_date_range,
-            match_terms=("last quarter", "date range", "filter", "quarter_df"),
-        )
-    )
-    registry.register(
-        Capability(
-            capability_id="GroupRevenueByRegion",
-            description="Aggregate revenue by region in the scoped dataset.",
-            required_artifacts=("quarter_df",),
-            produced_artifacts=("region_revenue",),
-            input_schema=("region", "revenue"),
-            output_schema=("region", "total_revenue"),
-            executor=execute_group_revenue_by_region,
-            match_terms=("region revenue", "revenue by region", "groupby region"),
-        )
-    )
-    registry.register(
-        Capability(
-            capability_id="FindMaximumRevenueRegion",
-            description="Find the region with the highest total revenue.",
-            required_artifacts=("region_revenue",),
-            produced_artifacts=("top_region",),
-            input_schema=("region", "total_revenue"),
-            output_schema=("region", "total_revenue"),
-            executor=execute_find_maximum_revenue_region,
-            match_terms=("highest revenue", "top region", "maximum revenue"),
-        )
-    )
-    registry.register(
-        Capability(
-            capability_id="MonthlyRevenueTrend",
-            description="Summarize revenue trends by month.",
-            required_artifacts=("quarter_df",),
-            produced_artifacts=("monthly_trend",),
-            input_schema=("date", "revenue"),
-            output_schema=("month", "total_revenue"),
-            executor=execute_monthly_revenue_trend,
-            match_terms=("month-over-month", "monthly trend", "monthly revenue trend"),
-        )
-    )
-    registry.register(
-        Capability(
-            capability_id="RevenueShare",
-            description="Compute revenue share across regions or categories.",
-            required_artifacts=("region_revenue",),
-            produced_artifacts=("revenue_share",),
-            input_schema=("region", "total_revenue"),
-            output_schema=("region", "total_revenue", "revenue_share"),
-            executor=execute_revenue_share,
-            match_terms=("share", "percentage", "revenue share"),
-        )
-    )
-    registry.register(
-        Capability(
-            capability_id="CategoryAggregation",
-            description="Aggregate revenue by product category.",
-            required_artifacts=("quarter_df",),
-            produced_artifacts=("category_revenue",),
-            input_schema=("product_category", "revenue"),
-            output_schema=("product_category", "total_revenue"),
-            executor=execute_category_aggregation,
-            match_terms=("category", "product category", "category aggregation"),
-        )
-    )
-    registry.register(
-        Capability(
-            capability_id="AverageUnitPrice",
-            description="Compute the average unit price by product category.",
-            required_artifacts=("quarter_df",),
-            produced_artifacts=("average_prices",),
-            input_schema=("product_category", "unit_price"),
-            output_schema=("product_category", "average_price"),
-            executor=execute_average_unit_price,
-            match_terms=("average price", "unit price", "mean price"),
-        )
-    )
-    registry.register(
-        Capability(
-            capability_id="TopSellingProductCategory",
-            description="Find the product category with the highest units sold.",
-            required_artifacts=("quarter_df",),
-            produced_artifacts=("top_selling_category",),
-            input_schema=("product_category", "units_sold"),
-            output_schema=("product_category", "total_units_sold"),
-            executor=execute_top_selling_product_category,
-            match_terms=("top selling", "most units sold", "highest volume"),
-        )
-    )
+    for capability in _DEFAULT_CAPABILITIES:
+        registry.register(capability)
     return registry

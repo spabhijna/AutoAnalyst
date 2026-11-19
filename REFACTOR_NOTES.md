@@ -200,3 +200,50 @@ None. Only import lines and the names used in call sites changed in `test_loop.p
 - `ruff` F841 for `last_line` in `agent/sandbox.py` (out of scope: sandbox).
 - `.env.example` already documents the three variables; no change needed. `README`/`ARCHITECTURE` text is Phase 6.
 - A replan that still returns the same questions will loop until the cap and then abort cleanly (covered by the D5 test).
+
+## Phase 4 follow-up (`02be8d0`, "clarify contract vs result, share schema placeholders")
+- `_artifact_contract_text` now ends with "Then also set `result = <name>`."; `SCHEMA_PLACEHOLDERS` lives once in `agent/state.py` (used by the validator and the contract text). `tests/test_codegen_contract.py` asserts the new line (contract-text tests and the reviewer scenario); additions only.
+
+## Phase 5 — Capabilities tidy and shrinking `loop.py`
+
+### 1. What changed
+- **Shims removed:** `AgentRun.history` (getter and setter), `_accepted_findings` and `_task_for_attempt` (only used by the setter). `main.py` / `run_demo.py` now print `len(state.debug_history)`.
+- **New modules (all moves, names made public, no logic edits):**
+  - `agent/findings.py`: `finding_from_attempt`, `attempt_for_finding`, `artifact_key`, `coerce_trust`, `build_history_summary`, `build_working_memory_prompt`, `final_results`.
+  - `agent/run_export.py`: `log_entry` (was `_log`) and `finalize_run` (was `_finalize_run`).
+  - `agent/stages.py`: `do_codegen`, `do_repair`, `do_critique`, `do_summary`, `artifact_contract_text`, plus the per-attempt stages `generate_code`, `observe_and_critique`, `record_constraints`, `record_attempt`.
+  - `agent/scheduling.py`: `next_ready_task`, `ensure_dependencies_available`, `mark_failed_and_skipped`.
+  - `agent/errors.py`: `PipelineAbortedError` (still importable from `agent.loop`, which uses it).
+- **`loop.py` 1061 → 589 lines.** `run()` is now 51 lines (`_init_run`, `_execute_plan`, `_replan`, `_handle_abort` helpers). `_run_codegen_loop` is 69 lines: it calls `generate_code` → `_execute_and_validate` → `observe_and_critique` → `record_constraints` → `record_attempt`, then routes (`_accept` / replan / retry, `_abort_retries_exhausted` at the end). Console output is byte-identical (normalised `--dry-run` and `--dry-run --corrupt` stdout diffed against the previous commit).
+- **Capabilities:** `_df_result(df, artifact_key, result_text=None)` replaces the 8 hand-written result literals and `_single_row_result`; the 99-line registry builder became a module-level `_DEFAULT_CAPABILITIES` table plus a 4-line builder. `RevenueShare` uses the named `total_revenue` column instead of `iloc[:, 1]`.
+- **Other splits to reach "no function over 80 lines"** (pure moves): `ArtifactStore._is_registrable` (the three `register()` checks), `observer._revenue_outliers_iqr` (the IQR block, maths untouched), and `log_viewer.print_run_trace` into `_print_header` / `_print_steps` / `_print_attempt_entry` / `_print_plan_entry` / `_print_summary_entry` (viewer output diffed identical on a run JSON).
+- **`parse_json_list` removed** (only its tests used it since the D4 replan switched to `parse_plan_json`).
+
+### 2. Deviations from the plan
+- **`RevenueShare` on a region_revenue without a `total_revenue` column** now returns a *failed* deterministic result (`_failed_result`, success False), so the engine returns None and the loop falls back to CODE-GEN. A bare `KeyError` would have crashed the run, whereas `iloc[:, 1]` used to work on any second column. Tested.
+- **`PipelineAbortedError` moved to `agent/errors.py`** and the stage/scheduling helpers got their own modules (the plan only named `findings.py` and `run_export.py`), to get `loop.py` under 600 lines without import cycles. `MAX_PLAN_REVISIONS` stays in `loop.py`.
+- **Four functions are still over 80 lines**, all in modules the plan puts out of scope, so I left them: `prompts.critique_prompt` (167) and `prompts.repair_prompt` (85) (one big prompt template each; splitting means chopping the text), `sandbox._worker` (147) and `sandbox.run_sandboxed` (138) (isolation code). "No function in `agent/` over 80 lines" is therefore met everywhere except those; flagging for review.
+- Test patch targets: `write_log_entry` now lives in `agent.run_export`, so the tests' `WRITE_LOG` patch string changed from `agent.loop.write_log_entry` to `agent.run_export.write_log_entry` (test_loop, test_regressions, test_replan, test_config). `run_sandboxed` and `call_llm` are still patched in `agent.loop`.
+
+### 3. Test assertions changed
+- `tests/test_loop.py` (shim removal):
+  - `TestAcceptPath`, `TestReviseCode`, `TestRevisePlan` (`test_replan_replaces_tail`), `test_flat_format_works_in_run_loop`: `state.history` dict access (`h["action"]`, `h["sub_question"]`, `len(state.history)`) became `state.debug_history` attribute access (`h.action`, `h.sub_question`, `len(state.debug_history)`). Same meaning: both are the debug history, one attempt per entry.
+  - `TestSummaryWorkingMemory._make_state` no longer uses the removed `history` setter: it builds `debug_history`, `tasks` and `working_memory` from the same attempt dicts with `build_tasks` / `finding_from_attempt`.
+  - `test_accepted_findings_strips_intermediate_failures`: was `_accepted_findings(state)` has one entry with action `accept` and iteration 2; now `state.final_results` has one finding whose `attempt_for_finding` is the iteration-2 accepted attempt.
+  - `test_accepted_findings_preserves_plan_order`: was `[f["sub_question"] ...] == [q1, q2]` with attempts seeded in plan order; now `[f.question for f in state.final_results] == [q1, q2]` with the attempts seeded in *reverse* order (stricter: it really tests plan order, not insertion order).
+  - `_final_results` → `final_results` (import path only); the `test_final_results_*` / `test_summary_payload_*` assertions are unchanged.
+  - Removed `test_parse_json_list_clean` and `test_parse_json_list_with_prose` (function deleted).
+- `tests/test_regressions.py`: `test_parse_json_list_numbered_fallback` replaced by `test_numbered_line_fallback_parses_every_marker_style`, which asserts the same numbered-line fallback on `parse_plan_json` (`1.`, `2)` and `3-` markers; the old D1 bug was the regex in the removed function, `parse_plan_json` has its own correct one).
+- `tests/test_codegen_contract.py`: import of the contract helper now from `agent.stages` (import only).
+- Added tests: `_df_result`, `RevenueShare` named column (with reordered columns) and graceful failure.
+
+### 4. Results
+- `pytest tests/ -q`: `254 passed`.
+- `python main.py --dry-run` and `--dry-run --corrupt`: 5 steps each; console output identical to the previous commit.
+- `agent/loop.py`: **589 lines** (target ≤ 600). Longest function in `loop.py`: `_accept`, 71 lines.
+
+### 5. Noticed, left alone
+- `ruff` F841 `last_line` in `agent/sandbox.py` (sandbox out of scope).
+- `agent/loop.py` still imports `call_llm` and `run_sandboxed` at module level on purpose: tests (and `run()`) resolve them there.
+- `README`, `ARCHITECTURE`, `PROGRESS` still describe the old layout (`runtime.py`, `executors.py`, the old loop); Phase 6.
+- `run_demo.py` is still a near-duplicate of `main.py` (Phase 6).
