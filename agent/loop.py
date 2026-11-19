@@ -30,12 +30,13 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
 from agent import config, reporting
 from agent.artifact_store import ArtifactStore
+from agent.dry_run import dry_run_llm
 from agent.execution_engine import ExecutionEngine
 from agent.execution_graph import ExecutionGraph
 from agent.llm_client import call_llm
@@ -147,6 +148,8 @@ class AgentRun:
     aborted: bool = False
     abort_reason: str = ""
     llm_call_count: int = 0
+    # LLM callable for this run; set by run() (counting wrapper), None until then.
+    llm: Callable[..., str] | None = None
     environment_manifest: EnvironmentManifest = field(
         default_factory=EnvironmentManifest
     )
@@ -205,6 +208,16 @@ class AgentRun:
         )
 
 
+def _counting_llm(state: AgentRun, llm: Callable[..., str]) -> Callable[..., str]:
+    """Wrap *llm* so every call increments ``state.llm_call_count``."""
+
+    def _call(prompt: str, role: str, *args: Any, **kwargs: Any) -> str:
+        state.llm_call_count += 1
+        return llm(prompt, role, *args, **kwargs)
+
+    return _call
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -216,6 +229,7 @@ def run(
     log_dir: str = config.LOG_DIR,
     max_retries_per_step: int = config.MAX_PIPELINE_RETRIES,
     dry_run: bool = False,
+    llm: Callable[..., str] | None = None,
 ) -> AgentRun:
     """
     Execute the full five-stage loop for *goal* against *df*.
@@ -230,6 +244,10 @@ def run(
         max_retries_per_step: Hard cap on CODE-GEN retries per sub-question.
         dry_run:            When True, uses canned LLM responses so the
                             pipeline runs without API keys.  Defaults to False.
+        llm:                Callable ``(prompt, role) -> str`` used for every LLM
+                            call. Defaults to :func:`agent.llm_client.call_llm`
+                            (or :func:`agent.dry_run.dry_run_llm` when
+                            ``dry_run`` is True). An explicit *llm* wins.
 
     Returns:
         Completed :class:`AgentRun` with full history and summary populated.
@@ -246,43 +264,16 @@ def run(
     logger.info("=== AgentRun start: run_id=%s ===", state.run_id)
     reporting.run_banner(state.run_id, goal)
 
-    # ── Inject dry-run mode ─────────────────────────────────────────────────
+    # ── Select the LLM callable (no module-level monkeypatching) ───────────
+    if llm is None:
+        llm = dry_run_llm if dry_run else call_llm
     if dry_run:
-        import sys as _sys
-
-        _m = _sys.modules[__name__]
-
-        def _dry_call(prompt: str, role: str, model: str | None = None) -> str:
-            plan_json = (
-                '[{"question": "Filter to last quarter and return quarter_df", "capability": "FilterByDateRange", "produces_artifact": "quarter_df", "consumes_artifacts": [], "output_schema": ["transaction_id", "date", "region", "product_category", "units_sold", "unit_price", "revenue"]}, '
-                '{"question": "What is total revenue by region in the last quarter?", "capability": "GroupRevenueByRegion", "produces_artifact": "region_revenue", "consumes_artifacts": ["quarter_df"], "output_schema": ["region", "total_revenue"]}, '
-                '{"question": "Which region had highest revenue and which category drove it?", "capability": "FindMaximumRevenueRegion", "produces_artifact": "top_region", "consumes_artifacts": ["region_revenue"], "output_schema": ["region", "total_revenue"]}, '
-                '{"question": "Check if top region performance was consistent month-over-month", "capability": "MonthlyRevenueTrend", "produces_artifact": "monthly_trend", "consumes_artifacts": ["quarter_df"], "output_schema": ["month", "total_revenue"]}, '
-                '{"question": "What was the overall revenue trend by region over the quarter?", "capability": "RevenueShare", "produces_artifact": "revenue_share", "consumes_artifacts": ["region_revenue"], "output_schema": ["region", "total_revenue", "revenue_share"]}]'
-            )
-            code = 'result = df.describe() if len(df) > 0 else "(empty DataFrame)"'
-            critique = (
-                '{"trust": "high", "action": "accept", "reason": "Dry-run: verified."}'
-            )
-            summary = (
-                "Dry-run summary: The pipeline executed successfully without LLM API keys. "
-                "The planner produced a capability-based execution graph, and all five "
-                "steps were resolved deterministically through registered capabilities."
-            )
-            if role == "plan":
-                return plan_json
-            if role == "codegen":
-                return code
-            if role == "critique":
-                return critique
-            return summary
-
-        _m.call_llm = _dry_call
         logger.info("Dry-run mode enabled — using canned LLM responses")
         reporting.dry_run_notice()
+    state.llm = _counting_llm(state, llm)
 
     # ── PLAN ──────────────────────────────────────────────────────────────────
-    do_plan(state, df, call_llm, _log)  # sets state.plan and state.tasks (with artifact declarations)
+    do_plan(state, df, state.llm, _log)  # sets state.plan and state.tasks (with artifact declarations)
 
     # ── Per-sub-question loop ─────────────────────────────────────────────────
     try:
@@ -312,7 +303,7 @@ def run(
                     state.current_step += 1
                 else:
                     new_plan_tail = do_replan(
-                        state, df, call_llm, _build_working_memory_prompt(state)
+                        state, df, state.llm, _build_working_memory_prompt(state)
                     )
                     state.plan = state.plan[: state.current_step] + new_plan_tail
                     state.tasks = build_tasks(state.plan)
@@ -377,6 +368,150 @@ def _run_question(
     df: pd.DataFrame,
 ) -> bool:
     """
+    Run one sub-question: deterministic capability first, CODE-GEN loop otherwise.
+
+    Returns:
+        True if critique returned "revise_plan", False otherwise.
+    """
+    if task.task_id not in state.task_memories:
+        state.task_memories[task.task_id] = TaskMemory(task_id=task.task_id)
+
+    if _try_deterministic(state, task, df):
+        return False
+    return _run_codegen_loop(state, task, df)
+
+
+def _accept(
+    state: AgentRun,
+    task: TaskNode,
+    attempt: AttemptRecord,
+    sandbox_result: dict[str, Any],
+    trust: str,
+    reason: str,
+    attempt_count: int,
+    had_execution_errors: bool,
+    artifact_key: str | None = None,
+    provenance: list[str] | None = None,
+) -> Finding:
+    """
+    The single accept path for both the deterministic and the CODE-GEN branch.
+
+    Sets the task status, promotes the attempt into working memory, refreshes
+    ``final_results`` and registers the produced artifact.
+
+    Artifact ownership: ``_accept`` is the ONLY place a task's artifact is
+    registered in ``state.artifact_store``. ``ExecutionEngine.execute`` merely
+    executes and validates, and never writes to the store, so an artifact is
+    registered exactly once (bug D2).
+
+    Args:
+        artifact_key: Store key override (the deterministic executor's default
+            key); falls back to ``task.produces_artifact``.
+        provenance:   Optional provenance list recorded on the artifact.
+    """
+    task.status = "accepted"
+    finding = _finding_from_attempt(
+        attempt=attempt,
+        task=task,
+        attempt_count=attempt_count,
+        had_execution_errors=had_execution_errors,
+        reason=reason,
+    )
+    state.working_memory.add_finding(finding)
+    state.final_results = state.working_memory.accepted_findings(
+        task_order(state.tasks)
+    )
+
+    key = task.produces_artifact or artifact_key
+    extracted_df = sandbox_result.get("artifact") if key else None
+    if key and isinstance(extracted_df, pd.DataFrame):
+        registered = state.artifact_store.register(
+            key=key,
+            df=extracted_df,
+            producing_task_id=task.task_id,
+            consumers=state.execution_graph.consumers_for(task.produces_artifact)
+            if task.produces_artifact
+            else [],
+            confidence=trust,
+            provenance=provenance,
+        )
+        if registered:
+            finding.produced_artifact_name = key
+            logger.info(
+                "Artifact %r registered from %s (%d rows)",
+                key,
+                task.task_id,
+                len(extracted_df),
+            )
+        else:
+            logger.warning(
+                "Task %s declared produces_artifact=%r but registration failed",
+                task.task_id,
+                key,
+            )
+    return finding
+
+
+def _try_deterministic(state: AgentRun, task: TaskNode, df: pd.DataFrame) -> bool:
+    """
+    Try to resolve *task* with a registered deterministic capability.
+
+    Returns True when the task was executed, validated and accepted (the engine
+    does not register artifacts; :func:`_accept` does), False when the caller
+    should fall back to the CODE-GEN loop.
+    """
+    sandbox_result = state.execution_engine.execute(task, df, state.artifact_store)
+    if sandbox_result is None:
+        return False
+
+    reporting.deterministic_execute_start()
+    reporting.deterministic_execute_ok()
+    sub_question = task.question
+    reason = "Deterministic executor validated the reusable dataframe step."
+    trust = "high"
+    attempt = AttemptRecord(
+        task_id=task.task_id,
+        sub_question=sub_question,
+        iteration=0,
+        code="(deterministic executor)",
+        sandbox_result=sandbox_result,
+        critique=reason,
+        action="accept",
+        trust=_coerce_trust(trust),
+        error_category="none",
+    )
+    state.debug_history.append(attempt)
+    _log(
+        state,
+        LogEntry(
+            run_id=state.run_id,
+            sub_question=sub_question,
+            iteration=0,
+            stage="deterministic_execute",
+            action="accept",
+            code=attempt.code,
+            sandbox_result=sandbox_result,
+            critique=reason,
+            trust=trust,
+        ),
+    )
+    _accept(
+        state,
+        task,
+        attempt,
+        sandbox_result,
+        trust,
+        reason,
+        attempt_count=1,
+        had_execution_errors=False,
+        artifact_key=sandbox_result.get("artifact_key"),
+        provenance=[task.capability, task.task_id] if task.capability else None,
+    )
+    return True
+
+
+def _run_codegen_loop(state: AgentRun, task: TaskNode, df: pd.DataFrame) -> bool:
+    """
     Run the CODE-GEN → EXECUTE → CRITIQUE loop for one sub-question.
 
     Before CODE-GEN, builds an artifact namespace from the ArtifactStore for
@@ -384,9 +519,8 @@ def _run_question(
     into the sandbox so generated code can read pre-validated DataFrames without
     re-deriving them.
 
-    After CRITIQUE accepts a result, if ``task.produces_artifact`` is set, the
-    named DataFrame is extracted from the sandbox result and registered in
-    ``state.artifact_store`` for downstream steps.
+    After CRITIQUE accepts a result, :func:`_accept` registers the task's
+    declared artifact in ``state.artifact_store`` for downstream steps.
 
     Returns:
         True if critique returned "revise_plan", False otherwise.
@@ -395,9 +529,6 @@ def _run_question(
     previous_critique_reason: str | None = None
     had_execution_errors = False
     sub_question = task.question
-
-    if task.task_id not in state.task_memories:
-        state.task_memories[task.task_id] = TaskMemory(task_id=task.task_id)
     task_memory = state.task_memories[task.task_id]
 
     # ── Pre-build artifact namespace for this task ───────────────────────────────────
@@ -409,73 +540,6 @@ def _run_question(
         )
     else:
         artifact_namespace = state.artifact_store.as_namespace()
-
-    deterministic_result = state.execution_engine.execute(
-        task,
-        df,
-        state.artifact_store,
-        consumers=state.execution_graph.consumers_for(task.produces_artifact)
-        if task.produces_artifact
-        else [],
-    )
-    if deterministic_result is not None:
-        reporting.deterministic_execute_start()
-        sandbox_result = deterministic_result
-        reporting.deterministic_execute_ok()
-        reason = "Deterministic executor validated the reusable dataframe step."
-        trust = "high"
-        attempt = AttemptRecord(
-            task_id=task.task_id,
-            sub_question=sub_question,
-            iteration=0,
-            code="(deterministic executor)",
-            sandbox_result=sandbox_result,
-            critique=reason,
-            action="accept",
-            trust=_coerce_trust(trust),
-            error_category="none",
-        )
-        state.debug_history.append(attempt)
-        _log(
-            state,
-            LogEntry(
-                run_id=state.run_id,
-                sub_question=sub_question,
-                iteration=0,
-                stage="deterministic_execute",
-                action="accept",
-                code=attempt.code,
-                sandbox_result=sandbox_result,
-                critique=reason,
-                trust=trust,
-            ),
-        )
-        task.status = "accepted"
-        finding = _finding_from_attempt(
-            attempt=attempt,
-            task=task,
-            attempt_count=1,
-            had_execution_errors=False,
-            reason=reason,
-        )
-        state.working_memory.add_finding(finding)
-        state.final_results = state.working_memory.accepted_findings(
-            task_order(state.tasks)
-        )
-        if task.produces_artifact:
-            extracted_df = sandbox_result.get("artifact")
-            if isinstance(extracted_df, pd.DataFrame):
-                finding.produced_artifact_name = task.produces_artifact
-                state.artifact_store.register(
-                    key=task.produces_artifact,
-                    df=extracted_df,
-                    producing_task_id=task.task_id,
-                    consumers=state.execution_graph.consumers_for(
-                        task.produces_artifact
-                    ),
-                    confidence="high",
-                )
-        return False
 
     for iteration in range(state.max_retries_per_step):
         # ── CODE-GEN ──────────────────────────────────────────────────────────
@@ -598,49 +662,16 @@ def _run_question(
 
         # ── ROUTING ───────────────────────────────────────────────────────────
         if action == "accept":
-            task.status = "accepted"
-            finding = _finding_from_attempt(
-                attempt=attempt,
-                task=task,
+            _accept(
+                state,
+                task,
+                attempt,
+                sandbox_result,
+                trust,
+                reason,
                 attempt_count=iteration + 1,
                 had_execution_errors=had_execution_errors,
-                reason=reason,
             )
-            state.working_memory.add_finding(finding)
-            state.final_results = state.working_memory.accepted_findings(
-                task_order(state.tasks)
-            )
-
-            # ── Artifact registration ──────────────────────────────────────────
-            # If the task declared it would produce an artifact, check whether
-            # the sandbox extracted a DataFrame for it and register it.
-            if task.produces_artifact:
-                extracted_df = sandbox_result.get("artifact")
-                if isinstance(extracted_df, pd.DataFrame):
-                    registered = state.artifact_store.register(
-                        key=task.produces_artifact,
-                        df=extracted_df,
-                        producing_task_id=task.task_id,
-                        consumers=state.execution_graph.consumers_for(
-                            task.produces_artifact
-                        ),
-                        confidence=trust,
-                    )
-                    if registered:
-                        finding.produced_artifact_name = task.produces_artifact
-                        logger.info(
-                            "Artifact %r registered from %s (%d rows)",
-                            task.produces_artifact,
-                            task.task_id,
-                            len(extracted_df),
-                        )
-                    else:
-                        logger.warning(
-                            "Task %s declared produces_artifact=%r but registration failed",
-                            task.task_id,
-                            task.produces_artifact,
-                        )
-
             return False  # move to next sub-question
 
         if action == "revise_plan":
@@ -683,7 +714,7 @@ def _do_codegen(
         task_constraints=task_memory.as_prompt_text(),
         available_artifacts=state.artifact_store.describe(),
     )
-    raw = call_llm(prompt, role="codegen")
+    raw = state.llm(prompt, role="codegen")
     return strip_markdown_fences(raw)
 
 
@@ -705,7 +736,7 @@ def _do_repair(
         error_reason=previous_critique_reason,
         available_artifacts=state.artifact_store.describe(),
     )
-    raw = call_llm(prompt, role="codegen")
+    raw = state.llm(prompt, role="codegen")
     return strip_markdown_fences(raw)
 
 
@@ -737,7 +768,7 @@ def _do_critique(
         history_summary,
         observation_text=observation_text,
     )
-    raw = call_llm(prompt, role="critique")
+    raw = state.llm(prompt, role="critique")
     parsed = parse_critique_json(raw)
     return raw, parsed
 
@@ -773,7 +804,7 @@ def _do_summary(state: AgentRun) -> str:
     reporting.summary_stage_start()
     findings = _final_results(state)
     prompt = summary_prompt(state.goal, findings)
-    summary = call_llm(prompt, role="observe")
+    summary = state.llm(prompt, role="observe")
 
     _log(
         state,

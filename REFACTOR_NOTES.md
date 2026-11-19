@@ -105,3 +105,41 @@ None. Only import lines and the names used in call sites changed in `test_loop.p
 - `_do_summary`, `_do_codegen`, `_do_repair`, `_do_critique` still call `call_llm` directly in `loop.py`; Phase 3 threads the callable through.
 - `_log`, `_finalize_run` (with its hard-coded `"clean"` label, D7) and `_finalize_run`'s Groq model names stay in `loop.py`.
 - `ruff --select F` also flags unused imports in tests (`MagicMock`, `call`, `ObservationReport`, numpy in `test_sandbox.py`) and F841 in `prompts.py` / `sandbox.py`; untouched (out of scope).
+
+## Phase 2 review follow-up
+- `99bfbb6 fix(phase-2)`: `planning.py` types `state` as `"AgentRun"` via `TYPE_CHECKING` (no runtime import, no cycle). Names stay `parse_plan_json` / `parse_json_list` (the plan's `parse_plan` / `parse_string_list` mean these).
+
+## Phase 3 — One accept path, injectable LLM (fixes D2, D3)
+
+### 1. What changed
+- `agent/loop.py`:
+  - New `_accept(...)`: the single accept path (task status, Finding, working memory, `final_results`, artifact registration once, `produced_artifact_name`). Both branches call it.
+  - `_run_question` is now a dispatcher over `_try_deterministic(state, task, df) -> bool` and `_run_codegen_loop(state, task, df) -> bool`.
+  - `run(..., llm=None)`: `llm` defaults to `call_llm`, or `dry_run_llm` when `dry_run=True` (an explicit `llm` wins). It is wrapped by `_counting_llm`, stored on the new `AgentRun.llm` field, and used by every stage (`do_plan`, `do_replan`, codegen, repair, critique, summary). The dry-run monkeypatch is gone.
+- New `agent/dry_run.py` with `dry_run_llm` (canned responses moved verbatim).
+- `agent/execution_engine.py`: **owner of artifact registration is `_accept`**; the engine only executes and validates. Dropped the now-meaningless `consumers` argument of `execute()`.
+- `tests/test_regressions.py`: D2 and D3 xfail markers removed (both pass); the Phase 0 monkeypatch workarounds (restoring `loop.call_llm` after dry-run) removed since the leak is fixed; new test `test_explicit_llm_callable_is_used_and_counted`.
+- `tests/test_execution_engine.py`: see §3.
+
+### 2. Deviations from the plan
+- `_accept` has two extra optional parameters, `artifact_key` and `provenance`. The engine used to register under `task.produces_artifact or result.artifact_key`, with provenance `[capability, task_id]`; `_try_deterministic` passes the executor's `artifact_key` and `[task.capability, task.task_id]` so artifacts of tasks without a declared `produces_artifact` are still registered, and the artifact keeps the engine's provenance (previously the loop's second registration overwrote it with `[task_id]`).
+- Behaviour that changes beyond D2/D3 (all intended by the plan, or tiny side effects):
+  - `state.llm_call_count` (and `total_llm_calls` in the run JSON) is now real: a dry run reports 10 (plan + 4 codegen + 4 critique + summary, because D6 is still open). Before, always 0.
+  - Deterministic artifacts now carry the engine's provenance and `confidence=trust` (`"high"`); `finding.produced_artifact_name` is set whenever registration succeeds, including executor-default keys.
+  - `TaskMemory` is still created for every task (kept in `_run_question`).
+- `_run_codegen_loop` is still ~190 lines and `run()` ~140; `loop.py` is 1040 lines (up from 1009: new docstrings and `_accept`). Shrinking to the plan's ≤450 / ≤80-line targets needs the later moves; not attempted here (Phase 3 scope is the split, not more extraction).
+
+### 3. Test assertions changed
+- `tests/test_execution_engine.py::test_engine_executes_registered_capability_and_registers_artifact` → renamed `..._without_registering`. Was: after `execute(..., consumers=["step_2"])` the store holds `quarter_df` with producer `step_1`, consumers `["step_2"]`, frozen, provenance `["FilterByDateRange", "step_1"]`, `validated_at` set. Now: result carries a DataFrame artifact with `artifact_key == "quarter_df"` and the store is still empty. Why: registration moved to `_accept` (D2 owner decision); the `consumers` argument no longer exists. Coverage of the registered artifact's metadata (producer, consumers, freeze, provenance) now comes from the dry-run path through `_accept`; I did not add a dedicated unit test for it.
+- `tests/test_execution_engine.py::test_engine_reuses_region_artifact`: was `store.get_artifact("region_revenue")` has columns `[region, total_revenue]`; now `result["artifact"]` has those columns and the store has no `region_revenue`. Same reason.
+- `tests/test_regressions.py`: D2/D3 xfail removal (intended); `test_dry_run_does_not_leak` assertion unchanged.
+
+### 4. Results
+- `pytest tests/ -q`: `209 passed, 5 xfailed` (remaining xfails: D1, D5 ×2, D6, D8).
+- `python main.py --dry-run` and `--dry-run --corrupt`: 5 steps each. Normalised dry-run stdout is identical to the previous commit.
+- `agent/loop.py`: 1040 lines.
+
+### 5. Noticed, left alone
+- The dry-run summary text still claims five deterministic steps (false until D6 is fixed in Phase 4); the text was only moved to `agent/dry_run.py`.
+- `ExecutionEngine.execute` still runs `validate_semantic_contract` (the hard-coded step_N checks, D6).
+- `_do_replan` still sets `state.tasks = build_tasks(state.plan)` from the flat list (D4).

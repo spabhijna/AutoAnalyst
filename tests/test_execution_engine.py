@@ -12,7 +12,7 @@ from agent.execution_engine import ExecutionEngine
 from agent.state import TaskNode
 
 
-def test_engine_executes_registered_capability_and_registers_artifact() -> None:
+def test_engine_executes_registered_capability_without_registering() -> None:
     df = pd.DataFrame(
         {
             "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
@@ -30,17 +30,14 @@ def test_engine_executes_registered_capability_and_registers_artifact() -> None:
         produces_artifact="quarter_df",
     )
 
-    result = engine.execute(task, df, store, consumers=["step_2"])
+    result = engine.execute(task, df, store)
 
     assert result is not None
     assert result["success"] is True
-    artifact = store.get_artifact("quarter_df")
-    assert artifact is not None
-    assert artifact.producer == "step_1"
-    assert artifact.consumers == ["step_2"]
-    assert artifact.is_frozen is True
-    assert artifact.provenance == ["FilterByDateRange", "step_1"]
-    assert artifact.validated_at is not None
+    assert isinstance(result["artifact"], pd.DataFrame)
+    assert result["artifact_key"] == "quarter_df"
+    # The engine only executes and validates; the loop's _accept() registers.
+    assert store.get_artifact("quarter_df") is None
 
 
 def test_engine_reuses_region_artifact() -> None:
@@ -73,9 +70,8 @@ def test_engine_reuses_region_artifact() -> None:
 
     assert result is not None
     assert result["success"] is True
-    artifact = store.get_artifact("region_revenue")
-    assert artifact is not None
-    assert list(artifact.value.columns) == ["region", "total_revenue"]
+    assert list(result["artifact"].columns) == ["region", "total_revenue"]
+    assert store.get_artifact("region_revenue") is None  # registered by _accept()
 
 
 def test_engine_rejects_missing_dependency_for_capability() -> None:

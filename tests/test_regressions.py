@@ -34,9 +34,7 @@ def sales_df() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def test_dry_run_smoke(sales_df, tmp_path, monkeypatch) -> None:
-    # Restore loop.call_llm afterwards: dry-run currently patches it for good (D3).
-    monkeypatch.setattr(loop, "call_llm", loop.call_llm)
+def test_dry_run_smoke(sales_df, tmp_path) -> None:
     state = run("any goal", sales_df, dry_run=True, log_dir=str(tmp_path))
 
     assert not state.aborted
@@ -61,11 +59,7 @@ def test_parse_json_list_numbered_fallback() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="bug D2: artifact registered by engine and loop")
-def test_deterministic_artifacts_registered_once(
-    sales_df, tmp_path, monkeypatch
-) -> None:
-    monkeypatch.setattr(loop, "call_llm", loop.call_llm)
+def test_deterministic_artifacts_registered_once(sales_df, tmp_path) -> None:
     keys: list[str] = []
     original = ArtifactStore.register
 
@@ -86,10 +80,8 @@ def test_deterministic_artifacts_registered_once(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="bug D3: dry-run monkeypatches the module")
-def test_dry_run_does_not_leak(sales_df, tmp_path, monkeypatch) -> None:
+def test_dry_run_does_not_leak(sales_df, tmp_path) -> None:
     original = loop.call_llm
-    monkeypatch.setattr(loop, "call_llm", original)  # teardown restores it
     run("any goal", sales_df, dry_run=True, log_dir=str(tmp_path))
     assert loop.call_llm is original
 
@@ -141,8 +133,7 @@ def test_plan_revision_cap_aborts(sales_df, tmp_path, plan) -> None:
     strict=True,
     reason="bug D6: step-specific semantic checks reject capability outputs",
 )
-def test_dry_run_is_fully_deterministic(sales_df, tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(loop, "call_llm", loop.call_llm)
+def test_dry_run_is_fully_deterministic(sales_df, tmp_path) -> None:
     state = run("any goal", sales_df, dry_run=True, log_dir=str(tmp_path))
 
     assert all(a.code == "(deterministic executor)" for a in state.debug_history)
@@ -173,3 +164,24 @@ def test_critique_prompt_includes_observation_text() -> None:
         observation_text="SENTINEL_OBS",
     )
     assert "SENTINEL_OBS" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: injectable LLM and call counting
+# ---------------------------------------------------------------------------
+
+
+def test_explicit_llm_callable_is_used_and_counted(sales_df, tmp_path) -> None:
+    from agent.dry_run import dry_run_llm
+
+    seen: list[str] = []
+
+    def spy(prompt: str, role: str, *a, **k) -> str:
+        seen.append(role)
+        return dry_run_llm(prompt, role)
+
+    state = run("any goal", sales_df, log_dir=str(tmp_path), llm=spy)
+
+    assert not state.aborted
+    assert seen and seen[0] == "plan"
+    assert state.llm_call_count == len(seen)
