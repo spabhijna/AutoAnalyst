@@ -1,0 +1,128 @@
+"""
+Phase-0 safety net for the cleanup refactor (see REFACTOR_PLAN.md).
+
+Tests marked ``xfail(strict=True)`` document known bugs.  The phase that fixes a
+bug removes its marker; strict mode makes an accidental fix fail loudly.
+"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import patch
+
+import pandas as pd
+import pytest
+
+import agent.loop as loop
+from agent.artifact_store import ArtifactStore
+from agent.loop import MAX_PLAN_REVISIONS, run
+from data.generate_data import generate_sales_data
+
+CALL_LLM = "agent.loop.call_llm"
+RUN_SANDBOXED = "agent.loop.run_sandboxed"
+WRITE_LOG = "agent.loop.write_log_entry"
+
+
+@pytest.fixture()
+def sales_df() -> pd.DataFrame:
+    return generate_sales_data(n_rows=200, seed=42)
+
+
+# ---------------------------------------------------------------------------
+# Dry-run smoke test (passes today; must keep passing through every phase)
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_smoke(sales_df, tmp_path, monkeypatch) -> None:
+    # Restore loop.call_llm afterwards: dry-run currently patches it for good (D3).
+    monkeypatch.setattr(loop, "call_llm", loop.call_llm)
+    state = run("any goal", sales_df, dry_run=True, log_dir=str(tmp_path))
+
+    assert not state.aborted
+    assert len(state.working_memory.findings) == 5
+    assert len(state.final_results) == 5
+    assert state.summary
+
+
+# ---------------------------------------------------------------------------
+# D1: _parse_json_list fallback regex is malformed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(strict=True, reason="bug D1: unterminated character set in regex")
+def test_parse_json_list_numbered_fallback() -> None:
+    result = loop._parse_json_list("1. First question\n2) Second question")
+    assert result == ["First question", "Second question"]
+
+
+# ---------------------------------------------------------------------------
+# D2: deterministic artifacts are registered twice
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(strict=True, reason="bug D2: artifact registered by engine and loop")
+def test_deterministic_artifacts_registered_once(
+    sales_df, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(loop, "call_llm", loop.call_llm)
+    keys: list[str] = []
+    original = ArtifactStore.register
+
+    def spy(self, key, *args, **kwargs):
+        keys.append(key)
+        return original(self, key, *args, **kwargs)
+
+    with patch.object(ArtifactStore, "register", spy):
+        run("any goal", sales_df, dry_run=True, log_dir=str(tmp_path))
+
+    assert keys, "dry run should register artifacts"
+    duplicates = {k for k in keys if keys.count(k) > 1}
+    assert not duplicates, f"registered more than once: {sorted(duplicates)}"
+
+
+# ---------------------------------------------------------------------------
+# D3: dry-run permanently replaces agent.loop.call_llm
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(strict=True, reason="bug D3: dry-run monkeypatches the module")
+def test_dry_run_does_not_leak(sales_df, tmp_path, monkeypatch) -> None:
+    original = loop.call_llm
+    monkeypatch.setattr(loop, "call_llm", original)  # teardown restores it
+    run("any goal", sales_df, dry_run=True, log_dir=str(tmp_path))
+    assert loop.call_llm is original
+
+
+# ---------------------------------------------------------------------------
+# D5: plan-revision cap must abort, not advance past an incomplete task
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(strict=True, reason="bug D5: hitting the revision cap neither aborts nor completes")
+def test_plan_revision_cap_aborts(sales_df, tmp_path) -> None:
+    revise = json.dumps({"trust": "low", "reason": ".", "action": "revise_plan"})
+    calls = {"n": 0}
+
+    def fake_llm(prompt: str, role: str, *a, **k) -> str:
+        calls["n"] += 1
+        if calls["n"] > 60:  # guard: a hung loop must fail the test, not freeze it
+            raise AssertionError("loop did not terminate after revision cap")
+        if role == "plan":
+            return '["Q1?"]'
+        if role == "codegen":
+            return "result = 1"
+        if role == "critique":
+            return revise
+        return "Summary."
+
+    ok = {"success": True, "result": "1", "stdout": "", "error": None, "error_type": None}
+    with (
+        patch(CALL_LLM, side_effect=fake_llm),
+        patch(RUN_SANDBOXED, return_value=ok),
+        patch(WRITE_LOG),
+    ):
+        state = run("goal", sales_df, log_dir=str(tmp_path))
+
+    assert state.plan_revisions == MAX_PLAN_REVISIONS
+    assert state.aborted
+    assert "revision" in state.abort_reason.lower()
