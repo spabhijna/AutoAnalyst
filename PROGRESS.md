@@ -3,7 +3,7 @@
 > Short status page. Architecture and rules: [ARCHITECTURE.md](ARCHITECTURE.md). Usage:
 > [README.md](README.md). Full development history: [docs/HISTORY.md](docs/HISTORY.md).
 > Details of the 2026-11 cleanup (what moved, every deviation, every changed test
-> assertion): `REFACTOR_NOTES.md`.
+> assertion): `docs/REFACTOR_NOTES.md`.
 
 ## Status
 

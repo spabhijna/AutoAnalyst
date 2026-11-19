@@ -6,7 +6,7 @@
 > `runtime.py`, `executors.py`, `_build_schema_summary`, a "dry-run by default"
 > `run_demo.py`) describe the code *at the time* and may no longer exist.
 > For the current state see `PROGRESS.md`, `README.md` and `ARCHITECTURE.md`;
-> for the cleanup that removed those files see `REFACTOR_NOTES.md`.
+> for the cleanup that removed those files see `REFACTOR_NOTES.md` (in this folder).
 
 ---
 

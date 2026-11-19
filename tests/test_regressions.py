@@ -1,5 +1,5 @@
 """
-Phase-0 safety net for the cleanup refactor (see REFACTOR_PLAN.md).
+Phase-0 safety net for the cleanup refactor (see docs/REFACTOR_PLAN.md).
 
 These tests were added in Phase 0 as ``xfail(strict=True)`` regressions for the
 bugs found in the audit (D1, D2, D3, D5, D6, D8); each fixing phase removed its
