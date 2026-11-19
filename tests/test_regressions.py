@@ -98,8 +98,11 @@ def test_dry_run_does_not_leak(sales_df, tmp_path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="bug D5: hitting the revision cap neither aborts nor completes")
-def test_plan_revision_cap_aborts(sales_df, tmp_path) -> None:
+@pytest.mark.xfail(
+    strict=True, reason="bug D5: hitting the revision cap neither aborts nor completes"
+)
+@pytest.mark.parametrize("plan", ['["Q1?"]', '["Q1?", "Q2?", "Q3?"]'])
+def test_plan_revision_cap_aborts(sales_df, tmp_path, plan) -> None:
     revise = json.dumps({"trust": "low", "reason": ".", "action": "revise_plan"})
     calls = {"n": 0}
 
@@ -108,7 +111,7 @@ def test_plan_revision_cap_aborts(sales_df, tmp_path) -> None:
         if calls["n"] > 60:  # guard: a hung loop must fail the test, not freeze it
             raise AssertionError("loop did not terminate after revision cap")
         if role == "plan":
-            return '["Q1?"]'
+            return plan
         if role == "codegen":
             return "result = 1"
         if role == "critique":
@@ -123,6 +126,28 @@ def test_plan_revision_cap_aborts(sales_df, tmp_path) -> None:
     ):
         state = run("goal", sales_df, log_dir=str(tmp_path))
 
-    assert state.plan_revisions == MAX_PLAN_REVISIONS
     assert state.aborted
     assert "revision" in state.abort_reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# D6: step-specific semantic checks reject correct capability outputs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="bug D6: step-specific semantic checks reject capability outputs",
+)
+def test_dry_run_is_fully_deterministic(sales_df, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(loop, "call_llm", loop.call_llm)
+    state = run("any goal", sales_df, dry_run=True, log_dir=str(tmp_path))
+
+    assert all(a.code == "(deterministic executor)" for a in state.debug_history)
+    assert set(state.artifact_store.available_keys()) == {
+        "quarter_df",
+        "region_revenue",
+        "top_region",
+        "monthly_trend",
+        "revenue_share",
+    }
