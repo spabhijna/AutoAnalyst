@@ -30,10 +30,11 @@ User goal
 |---|---|
 | `loop.py` | Orchestration only: `AgentRun` state, `run()`, task dispatch, the single `_accept()` path, `_try_deterministic()`, `_run_codegen_loop()`, replan/abort handling. Re-exports `PipelineAbortedError` (defined in `errors.py`). |
 | `stages.py` | Stage implementations used by the loop: `do_codegen`, `do_repair`, `do_critique`, `do_summary`, `artifact_contract_text`, and the per-attempt steps `generate_code`, `observe_and_critique`, `record_constraints`, `record_attempt`. |
-| `planning.py` | `build_tasks`, `do_plan`, `do_replan`, `apply_replan`, `sync_task_capabilities`, task-ID helpers. |
+| `planning.py` | `build_tasks`, `do_plan`, `do_replan`, `apply_replan`, `sync_task_capabilities`, task-ID helpers, and `plan_guidance` (the capabilities and example plan the planner sees, built from the data's columns). |
 | `parsing.py` | Defensive parsers for LLM output: `parse_plan_json`, `parse_critique_json`, `strip_markdown_fences`. |
-| `schema.py` | `build_schema_summary(df)`: the dataset description (with the pre-computed last-quarter window) that goes into prompts. |
-| `dates.py` | `last_quarter_window(df)`: the one implementation of the "last quarter" window. |
+| `schema.py` | `build_schema_summary(df, scope)`: the dataset description that goes into prompts; adds the pre-computed last-quarter window only when `scope.quarter`. |
+| `dates.py` | `detect_date_column`, `goal_mentions_quarter` / `goal_mentions_time_window`, `TimeScope` (decided once per run), and `last_quarter_window` / `last_quarter_constants`: the one implementation of the "last quarter" window. |
+| `inputs.py` | `load_dataset` (CSV/Parquet, date-like string columns parsed), `load_data_dictionary`, `format_data_dictionary`. |
 | `findings.py` | Promotes accepted attempts to `Finding`s and builds the prompt-facing views of memory (`build_history_summary`, `build_working_memory_prompt`, `final_results`). |
 | `scheduling.py` | `next_ready_task`, `ensure_dependencies_available`, `mark_failed_and_skipped`. |
 | `errors.py` | `PipelineAbortedError` (with a `kind`: retries exhausted, plan-revision cap, scheduling failure). |
@@ -48,7 +49,7 @@ User goal
 | `validator.py` | `CapabilityValidator`: `validate_context`, `validate_output` (exact schema, capability outputs) and the generic `validate_semantic_contract`. |
 | `artifact_store.py` | `ArtifactStore` / `Artifact`: the only artifact store; frozen, typed artifacts with producer, consumers, confidence, provenance. |
 | `sandbox.py` | `run_sandboxed`: process-isolated execution of generated code with a hard timeout. |
-| `observer.py` | Deterministic data-quality facts (nulls, duplicate IDs, outliers, ...) given to the critic. |
+| `observer.py` | Deterministic data-quality facts given to the critic: generic checks (nulls, duplicate rows, negative values, out-of-range datetimes, IQR outliers) plus the sales checks the evaluator scores. `observe_dataset` runs once per run; `observe` adds per-attempt notes. |
 | `environment.py` | `EnvironmentManifest`: what the sandbox allows, passed to codegen. |
 | `prompts.py` | **All** prompt templates. |
 | `llm_client.py` | `call_llm(prompt, role)`: the only gateway to LLM providers (see §5). |
@@ -56,11 +57,18 @@ User goal
 | `dry_run.py` | `dry_run_llm`: canned responses so the pipeline runs without API keys. |
 | `evaluator.py` | Scores the observer against the corruption manifest (precision/recall/F1). |
 
-Entry points: `main.py` (the CLI), `run_demo.py` (thin wrapper around `main.main()`).
+Entry points: `main.py` (the CLI: `--data PATH` for a CSV/Parquet file, `--describe PATH` for
+a data dictionary), `run_demo.py` (thin wrapper around `main.main()`).
 Synthetic data: `data/generate_data.py` (`generate_sales_data`, `inject_corruption`).
 
 ## 3. Execution pipeline in detail
 
+0. **Inputs** (`loop._init_run`). Besides the goal and `df`, `run()` takes an optional
+   `data_dictionary` (free text or `{column: description}`), normalised by
+   `inputs.format_data_dictionary` and stored on `AgentRun.data_dictionary`. It is passed to
+   the PLAN, RE-PLAN, CODE-GEN, REPAIR, CRITIQUE and SUMMARY prompts; without one, those
+   prompts forbid guessing what coded values mean. `TimeScope.from_goal(goal, df)` decides
+   once whether the "last quarter" machinery applies (see *Time scope* below).
 1. **PLAN** (`planning.do_plan`). The planner returns a JSON array of task objects
    (`question`, `capability`, `produces_artifact`, `consumes_artifacts`, `output_schema`),
    parsed by `parse_plan_json` (legacy flat string arrays and numbered lines are still
@@ -85,6 +93,32 @@ Synthetic data: `data/generate_data.py` (`generate_sales_data`, `inject_corrupti
 6. **SUMMARY** (`stages.do_summary`). The summary prompt sees only `final_results`
    (question / answer / trust / artifact key), never code, retries or critiques.
 
+### Time scope (no dataset assumptions)
+
+`AgentRun.scope` is a `TimeScope(date_column, quarter, window)`:
+
+- `date_column`: `detect_date_column(df)`: a column named `date`, else a datetime64 column
+  (pickup/start preferred over dropoff/end), else a date-like string column.
+- `quarter`: the goal mentions a quarter (`last quarter`, `Q3`, `quarterly`) **and** a date
+  column exists. Only then does the schema summary carry `LAST_QUARTER_START/END`, and only
+  then do the PLAN / CODE-GEN / REPAIR / CRITIQUE prompts include the `quarter_df` rules
+  (`time_scoped=True`). The `FilterByDateRange` capability (`requires_time_scope=True`) is
+  only offered to the planner then, and its executor refuses tasks that do not ask for the
+  last quarter, so a generic "filter ..." task goes to code generation.
+- `window`: any other time window in the goal (month, week, a year, "over time"): the
+  schema gets a one-line note to anchor it on the data's latest date, not today.
+
+The sandbox always defines `LAST_QUARTER_START/END` when there is a date column (harmless
+when unused). Capability `input_schema` may use the token `"date"` for "the detected datetime
+column".
+
+`planning.plan_guidance` builds the planner's capability list and example from
+`CapabilityRegistry.applicable(columns, time_scoped)`: capabilities whose input columns and
+required artifacts can be satisfied. When at least two chain together (sales data with a
+quarter goal: FilterByDateRange → GroupRevenueByRegion → FindMaximumRevenueRegion) the
+example is that chain; otherwise it is a two-task example built from one numeric and one
+categorical column of the data. When adding a capability, give it an `example_question`.
+
 ### The artifact contract
 
 A task that declares `produces_artifact` must leave a DataFrame under that variable name in
@@ -103,11 +137,22 @@ executes and validates. Provenance is `[capability_id, task_id]` for determinist
 
 ### Injectable LLM
 
-`run(goal, df, ..., llm=None, dry_run=False, dataset_label="clean")`. `llm` is any callable
+`run(goal, df, ..., llm=None, dry_run=False, dataset_label="clean", data_dictionary=None)`. `llm` is any callable
 `(prompt, role) -> str`; by default `llm_client.call_llm`, or `dry_run.dry_run_llm` when
 `dry_run=True`. It is wrapped to count calls (`AgentRun.llm_call_count`, recorded as
 `total_llm_calls` in the run JSON) and stored on `AgentRun.llm`; every stage calls
 `state.llm`. Nothing is monkeypatched, so tests pass `llm=` or patch `agent.loop.call_llm`.
+
+### Observer
+
+`observe_dataset(df)` computes the dataset-level facts once per run (cached on
+`AgentRun.data_quality`); `observe(df, sandbox_result, keys, baseline=...)` copies it and
+adds per-attempt notes. Generic checks: duplicate rows, negative values per numeric column,
+datetimes outside the 1%–99% span widened by half its length (and before 1900 or in the
+future), and IQR outliers per numeric column (columns with ≤10 distinct values are treated
+as codes and skipped). The sales fields (`duplicate_txn_ids`, `negative_revenue_rows`,
+`zero_units_positive_revenue`, `revenue_outliers_iqr`) are kept because `evaluator.py`
+scores them against the corruption manifest.
 
 ## 4. State management (crucial constraints)
 
