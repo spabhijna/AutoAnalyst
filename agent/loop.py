@@ -37,8 +37,7 @@ import pandas as pd
 
 from agent import config
 from agent.artifact_store import ArtifactStore
-from agent.runtime import AnalysisRuntime
-from agent.capabilities import CapabilityRegistry
+from agent.dates import last_quarter_window
 from agent.execution_engine import ExecutionEngine
 from agent.execution_graph import ExecutionGraph
 from agent.llm_client import call_llm
@@ -59,7 +58,6 @@ from agent.state import (
     ExecutionDifficulty,
     Finding,
     TaskNode,
-    TaskStatus,
     TaskMemory,
     WorkingMemory,
     utc_now_iso,
@@ -126,8 +124,6 @@ class AgentRun:
         plan_revisions:       Count of plan revisions so far (capped at MAX_PLAN_REVISIONS).
         summary:              Final LLM-generated summary (populated at end of run).
         log_dir:              Directory where JSONL logs are written.
-        runtime:              Phase-1 persistent AnalysisRuntime (owns the
-                              ArtifactRegistry and the persistent namespace).
     """
 
     goal: str
@@ -150,13 +146,7 @@ class AgentRun:
         default_factory=EnvironmentManifest
     )
     task_memories: dict[str, TaskMemory] = field(default_factory=dict)
-    # Phase-1: AnalysisRuntime is now the primary artifact authority.
-    # artifact_store is kept as a backward-compat shim (populated from runtime).
-    runtime: AnalysisRuntime | None = None  # set in run() after df is known
     artifact_store: ArtifactStore = field(default_factory=ArtifactStore)
-    capability_registry: CapabilityRegistry = field(
-        default_factory=lambda: ExecutionEngine().registry
-    )
     execution_engine: ExecutionEngine = field(default_factory=ExecutionEngine)
     execution_graph: ExecutionGraph = field(default_factory=ExecutionGraph)
 
@@ -247,9 +237,6 @@ def run(
         log_dir=log_dir,
         max_retries_per_step=max_retries_per_step,
     )
-    # Phase-1: initialise the persistent runtime.  One runtime per run.
-    state.runtime = AnalysisRuntime(df)
-    logger.debug("AnalysisRuntime initialised for run_id=%s", state.run_id)
 
     logger.info("=== AgentRun start: run_id=%s ===", state.run_id)
     print(f"\n{'=' * 60}")
@@ -326,7 +313,6 @@ def run(
                     state.plan = state.plan[: state.current_step] + new_plan_tail
                     state.tasks = _build_tasks(state.plan)
                     state.execution_graph = ExecutionGraph.from_tasks(state.tasks)
-                    _sync_artifact_consumers(state)
                     state.plan_revisions += 1
                     logger.info(
                         "Plan revised (revision %d/%d): %d new questions",
@@ -398,7 +384,6 @@ def _do_plan(state: AgentRun, df: pd.DataFrame) -> list[str]:
     state.tasks = _build_tasks(questions, task_specs)
     state.execution_graph = ExecutionGraph.from_tasks(state.tasks)
     _sync_task_capabilities(state)
-    _sync_artifact_consumers(state)
     print(f"  → {len(questions)} sub-questions generated")
     for i, q in enumerate(questions, 1):
         print(f"     {i}. {q}")
@@ -428,7 +413,7 @@ def _do_replan(state: AgentRun, df: pd.DataFrame) -> list[str]:
     whether the task declared explicit consumes_artifacts.
     """
     print("► RE-PLAN stage …")
-    completed = _build_completed_findings(state)
+    completed = _build_working_memory_prompt(state)
     # Get the critique reason from the most recent debug attempt.
     last_reason = ""
     if state.debug_history:
@@ -501,11 +486,6 @@ def _run_question(
         print("  ► DETERMINISTIC EXECUTE …")
         sandbox_result = deterministic_result
         print("    ✓ OK (deterministic)")
-        obs_report = observe(
-            df,
-            sandbox_result,
-            artifact_store_available_keys=state.artifact_store.available_keys(),
-        )
         reason = "Deterministic executor validated the reusable dataframe step."
         trust = "high"
         attempt = AttemptRecord(
@@ -550,24 +530,15 @@ def _run_question(
             extracted_df = sandbox_result.get("artifact")
             if isinstance(extracted_df, pd.DataFrame):
                 finding.produced_artifact_name = task.produces_artifact
-                # Phase-1: capture into runtime registry under stable ID.
-                if state.runtime is not None:
-                    state.runtime.capture_result(
-                        task_id=task.task_id,
-                        value=extracted_df,
-                        variable_name=task.produces_artifact,
-                    )
-                    # Keep artifact_store in sync for backward compat.
-                    state.artifact_store.register(
-                        key=task.produces_artifact,
-                        df=extracted_df,
-                        producing_task_id=task.task_id,
-                        consumers=state.execution_graph.consumers_for(
-                            task.produces_artifact
-                        ),
-                        confidence="high",
-                    )
-                _sync_artifact_consumers(state)
+                state.artifact_store.register(
+                    key=task.produces_artifact,
+                    df=extracted_df,
+                    producing_task_id=task.task_id,
+                    consumers=state.execution_graph.consumers_for(
+                        task.produces_artifact
+                    ),
+                    confidence="high",
+                )
         return False
 
     for iteration in range(state.max_retries_per_step):
@@ -722,14 +693,6 @@ def _run_question(
             if task.produces_artifact:
                 extracted_df = sandbox_result.get("artifact")
                 if isinstance(extracted_df, pd.DataFrame):
-                    # Phase-1: capture into runtime registry under stable ID.
-                    if state.runtime is not None:
-                        state.runtime.capture_result(
-                            task_id=task.task_id,
-                            value=extracted_df,
-                            variable_name=task.produces_artifact,
-                        )
-                    # Keep artifact_store in sync for backward compat.
                     registered = state.artifact_store.register(
                         key=task.produces_artifact,
                         df=extracted_df,
@@ -753,13 +716,6 @@ def _run_question(
                             task.task_id,
                             task.produces_artifact,
                         )
-
-            # Phase-1: merge sandbox-produced variables into runtime namespace
-            # so subsequent steps can access them naturally.
-            if state.runtime is not None:
-                new_vars = sandbox_result.get("new_variables") or {}
-                if new_vars:
-                    state.runtime.update_namespace(new_vars)
 
             return False  # move to next sub-question
 
@@ -946,20 +902,9 @@ def _build_schema_summary(df: pd.DataFrame) -> str:
     # ── Pre-compute the "last quarter" window in Python so LLMs never have to ──
     # "Last quarter" = the 3 most-recent complete calendar months in the data.
     # Example: if max date is 2024-06-15, the window is 2024-04-01 → 2024-06-15.
-    last_quarter_start: str | None = None
-    last_quarter_end: str | None = None
-    if "date" in df.columns:
-        try:
-            date_series = pd.to_datetime(df["date"].dropna())
-            if not date_series.empty:
-                max_ts = date_series.max()  # pandas Timestamp
-                # First day of the month that is 2 full months before max_ts month.
-                # e.g. max=2024-06-15 → start=2024-04-01 (3 months including June).
-                start_ts = (max_ts - pd.DateOffset(months=2)).replace(day=1)
-                last_quarter_start = start_ts.strftime("%Y-%m-%d")
-                last_quarter_end = max_ts.strftime("%Y-%m-%d")
-        except Exception:  # noqa: BLE001 — schema build must never crash
-            pass
+    window = last_quarter_window(df)
+    last_quarter_start = window[0].strftime("%Y-%m-%d") if window else None
+    last_quarter_end = window[1].strftime("%Y-%m-%d") if window else None
 
     lines.append("")
     if last_quarter_start and last_quarter_end:
@@ -1014,11 +959,6 @@ def _build_history_summary(state: AgentRun) -> str:
             f"    code: {code_preview}"
         )
     return "\n".join(lines)
-
-
-def _build_completed_findings(state: AgentRun) -> str:
-    """Multi-line summary of high-trust completed findings for prompts."""
-    return _build_working_memory_prompt(state)
 
 
 def _final_results(state: AgentRun) -> list[dict[str, str]]:
@@ -1098,24 +1038,6 @@ def _sync_task_capabilities(state: AgentRun) -> None:
         capability = state.execution_engine.registry.resolve(task)
         if capability is not None:
             task.capability = capability.capability_id
-
-
-def _sync_artifact_consumers(state: AgentRun) -> None:
-    """Validate downstream artifact lineage without mutating frozen artifacts."""
-    for task in state.tasks:
-        if not task.produces_artifact:
-            continue
-        artifact = state.artifact_store.get_artifact(task.produces_artifact)
-        if artifact is None:
-            continue
-        expected_consumers = state.execution_graph.consumers_for(task.produces_artifact)
-        if artifact.consumers != expected_consumers:
-            logger.debug(
-                "Artifact %r consumers differ from graph lineage: store=%s graph=%s",
-                task.produces_artifact,
-                artifact.consumers,
-                expected_consumers,
-            )
 
 
 def _task_for_attempt(tasks: list[TaskNode], attempt: AttemptRecord) -> TaskNode:

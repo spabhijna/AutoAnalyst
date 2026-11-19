@@ -33,3 +33,33 @@ None. No existing test was modified.
 - D6 is covered by `test_dry_run_is_fully_deterministic` (xfail, removed in Phase 4).
 - The dry-run summary text claiming all five steps were resolved deterministically is currently false. Left alone until Phase 3 moves dry-run into `agent/dry_run.py`.
 - `runs/` is gitignored, so dry-run output is not committed.
+
+## Phase 1 — Delete dead code
+
+### 1. What changed
+- Deleted `agent/runtime.py`, `agent/executors.py`, `tests/test_runtime.py` (47 tests), `tests/test_executors.py` (2 tests, covering the removed `try_execute` duplicate).
+- `agent/loop.py` (1524 → 1446 lines):
+  - removed `AgentRun.runtime`, `AgentRun.capability_registry`, every `state.runtime` call (including the `update_namespace(new_vars)` merge), `_sync_artifact_consumers` and its 4 calls, `_build_completed_findings` (caller now uses `_build_working_memory_prompt`), and the unused `obs_report` in the deterministic branch.
+  - `_artifact_key` kept: `_finding_from_attempt` uses it.
+  - the schema summary now calls `dates.last_quarter_window`.
+- `DeterministicExecutionResult` moved into `agent/capabilities.py` (no re-export).
+- New `agent/dates.py` (`last_quarter_window`), used by `capabilities.py` and the schema summary; new `tests/test_dates.py` (4 tests). `tests/test_capabilities.py` gained one test for `DeterministicExecutionResult.to_sandbox_result`.
+- Unused imports removed (`ruff check agent --select F401 --fix`): `loop.py` (`AnalysisRuntime`, `CapabilityRegistry`, `TaskStatus`), `observer.py` (`numpy`), `llm_client.py` (`Any`, `CEREBRAS_BASE_URL`; import lines only, no provider logic touched).
+
+### 2. Deviations from the plan
+- `AgentRun.llm_call_count` is NOT removed here: it is still read by `_finalize_run`. Phase 3 makes it real, per the plan.
+- The deterministic branch previously registered the artifact only inside `if state.runtime is not None`; the guard is gone but the `artifact_store.register` call is kept as-is, so the D2 double registration is unchanged (xfail still strict).
+- Schema summary now uses `pd.to_datetime(..., errors="coerce")` via `last_quarter_window`; the old inline code used no `coerce` inside try/except. Only differs for unparseable date values (old: fell back to the generic text; new: window from the parseable rows).
+
+### 3. Test assertions changed
+None changed. Removed whole files only: `test_runtime.py` (the runtime is gone) and `test_executors.py` (the duplicate `try_execute`). The capabilities' own executors stay covered by `test_capabilities.py` / `test_execution_engine.py`.
+
+### 4. Results
+- `pytest tests/ -q`: `206 passed, 6 xfailed` (250 − 49 deleted + 5 added).
+- `python main.py --dry-run`: completes, 5 steps.
+- `agent/loop.py`: 1446 lines.
+
+### 5. Noticed, left alone
+- `ruff` F841 in `agent/prompts.py` (`obs_block` unused, in `critique_prompt`) and `agent/sandbox.py` (`last_line`): out of scope (prompts/sandbox).
+- `README.md`, `ARCHITECTURE.md` and `PROGRESS.md` still mention `runtime.py` / `executors.py`; Phase 6 rewrites them.
+- `_accepted_findings` and the `AgentRun.history` shim remain (tests still use them).

@@ -13,8 +13,32 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from agent.executors import DeterministicExecutionResult
+from agent.dates import last_quarter_window
 from agent.state import TaskNode
+
+
+@dataclass
+class DeterministicExecutionResult:
+    success: bool
+    result: str | None
+    stdout: str
+    error: str | None
+    error_type: str | None
+    error_category: str
+    artifact: pd.DataFrame | None
+    artifact_key: str | None
+
+    def to_sandbox_result(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "result": self.result,
+            "stdout": self.stdout,
+            "error": self.error,
+            "error_type": self.error_type,
+            "error_category": self.error_category,
+            "artifact": self.artifact,
+            "artifact_key": self.artifact_key,
+        }
 
 
 @dataclass(frozen=True)
@@ -117,24 +141,13 @@ class CapabilityRegistry:
         return "\n".join(lines)
 
 
-def _last_quarter_window(df: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp] | None:
-    if "date" not in df.columns:
-        return None
-    date_series = pd.to_datetime(df["date"], errors="coerce").dropna()
-    if date_series.empty:
-        return None
-    end_ts = date_series.max()
-    start_ts = (end_ts - pd.DateOffset(months=2)).replace(day=1)
-    return start_ts, end_ts
-
-
 def _determine_scope_df(
     context: CapabilityExecutionContext, artifact_name: str = "quarter_df"
 ) -> pd.DataFrame:
     scoped = context.artifacts.get(artifact_name)
     if scoped is not None:
         return scoped
-    window = _last_quarter_window(context.df)
+    window = last_quarter_window(context.df)
     if window is None:
         return context.df.copy(deep=False)
     start_ts, end_ts = window

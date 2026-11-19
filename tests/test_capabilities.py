@@ -100,3 +100,26 @@ def test_execute_top_selling_product_category() -> None:
     assert len(result.artifact) == 2
     assert result.artifact.iloc[0]["product_category"] == "B"
     assert result.artifact.iloc[0]["total_units_sold"] == 10
+
+
+def test_deterministic_execution_result_to_sandbox_result() -> None:
+    import pandas as pd
+
+    from agent.capabilities import DeterministicExecutionResult
+
+    frame = pd.DataFrame({"a": [1]})
+    result = DeterministicExecutionResult(
+        success=True,
+        result="ok",
+        stdout="",
+        error=None,
+        error_type=None,
+        error_category="none",
+        artifact=frame,
+        artifact_key="k",
+    )
+    payload = result.to_sandbox_result()
+    assert payload["success"] is True
+    assert payload["artifact_key"] == "k"
+    assert payload["artifact"] is frame
+    assert payload["error_category"] == "none"
