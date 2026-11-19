@@ -90,11 +90,14 @@ def observe_start() -> None:
 
 
 def observe_result(obs_report: Any) -> None:
-    print(
-        f"    ✓ nulls={obs_report.null_counts}, dupes={obs_report.duplicate_txn_ids}, "
-        f"neg_rev={obs_report.negative_revenue_rows}, "
-        f"outliers={len(obs_report.revenue_outliers_iqr)}"
-    )
+    nulls = {c: n for c, n in obs_report.null_counts.items() if n}
+    parts = [f"nulls={nulls or 0}", f"dup_rows={obs_report.duplicate_rows}"]
+    if obs_report.duplicate_txn_ids:
+        parts.append(f"dup_ids={obs_report.duplicate_txn_ids}")
+    parts.append(f"neg_cols={len(obs_report.negative_values)}")
+    parts.append(f"bad_dates={sum(i['count'] for i in obs_report.datetime_out_of_range.values())}")
+    parts.append(f"outlier_cols={len(obs_report.numeric_outliers_iqr)}")
+    print("    ✓ " + ", ".join(parts))
 
 
 def critique_start() -> None:

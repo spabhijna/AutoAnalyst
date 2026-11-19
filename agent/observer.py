@@ -16,14 +16,35 @@ Design decisions
 3. **Separate concern.**  The observer does not judge correctness — it only
    surfaces data-quality signals.  The critique LLM decides whether those
    signals imply a logic error.
+4. **Generic checks plus sales checks.**  Duplicate rows, negative values,
+   out-of-range datetimes and IQR outliers run on any dataset. The sales
+   checks (``transaction_id`` duplicates, negative ``revenue``, zero
+   ``units_sold`` with revenue, revenue outliers) stay as separate fields,
+   because :mod:`agent.evaluator` scores them against the corruption manifest.
+5. **Computed once per run.**  The dataset-level checks do not depend on the
+   attempt: :func:`observe_dataset` computes them once and the loop passes
+   that baseline to every :func:`observe` call, so retries stay cheap on a
+   multi-million-row dataset.
 """
 
 from __future__ import annotations
 
+import copy
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
 import pandas as pd
+
+# Numeric columns with at most this many distinct values are treated as codes
+# (e.g. payment_type 1-6): IQR outliers mean nothing for them.
+_CODE_MAX_UNIQUE = 10
+# Rows sampled to decide whether a numeric column looks like a code.
+_SAMPLE_ROWS = 100_000
+# Datetimes before this are almost always placeholders / parse errors.
+_MIN_PLAUSIBLE_DATE = pd.Timestamp("1900-01-01")
+# Columns listed per generic check in the critique text.
+_MAX_COLUMNS_SHOWN = 6
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +75,17 @@ class ObservationReport:
 
     # Outlier indices detected via IQR on revenue
     revenue_outliers_iqr: list[int] = field(default_factory=list)
+
+    # ── Generic checks (any dataset) ─────────────────────────────────────────
+    # Fully duplicated rows (all columns equal), counting extra copies only.
+    duplicate_rows: int = 0
+    # Numeric column -> rows with a value < 0 (non-zero counts only).
+    negative_values: dict[str, int] = field(default_factory=dict)
+    # Datetime column -> {"count", "min", "max", "expected_start", "expected_end"}
+    # for values outside the column's plausible range (non-zero counts only).
+    datetime_out_of_range: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Numeric column -> rows outside 1.5 × IQR (code-like columns skipped).
+    numeric_outliers_iqr: dict[str, int] = field(default_factory=dict)
 
     # Row counts for scope awareness
     total_rows: int = 0
@@ -112,6 +144,29 @@ class ObservationReport:
                 f"row(s) at indices {self.revenue_outliers_iqr[:10]}{'…' if len(self.revenue_outliers_iqr) > 10 else ''}."
             )
 
+        # ── Generic checks ────────────────────────────────────────────────────
+        if self.duplicate_rows > 0:
+            lines.append(
+                f"DUPLICATE ROWS: {self.duplicate_rows:,} row(s) are exact copies "
+                f"of an earlier row."
+            )
+        negatives = {c: n for c, n in self.negative_values.items() if c != "revenue"}
+        if negatives:
+            lines.append("NEGATIVE VALUES (check whether the column can be negative):")
+            lines.extend(_top_counts(negatives))
+        if self.datetime_out_of_range:
+            lines.append("DATETIMES OUTSIDE THE DATA'S MAIN RANGE:")
+            for col, info in list(self.datetime_out_of_range.items())[:_MAX_COLUMNS_SHOWN]:
+                lines.append(
+                    f"  {col}: {info['count']:,} row(s) outside "
+                    f"{info['expected_start']} → {info['expected_end']} "
+                    f"(min {info['min']}, max {info['max']})"
+                )
+        outliers = {c: n for c, n in self.numeric_outliers_iqr.items() if c != "revenue"}
+        if outliers:
+            lines.append("NUMERIC OUTLIERS (IQR method, 1.5 × IQR):")
+            lines.extend(_top_counts(outliers, self.total_rows))
+
         # ── Scope ─────────────────────────────────────────────────────────────
         lines.append(f"Input rows: {self.total_rows:,}")
         if self.rows_after_code_filter:
@@ -126,49 +181,120 @@ class ObservationReport:
         return "\n".join(lines)
 
 
+def _top_counts(counts: dict[str, int], total: int = 0) -> list[str]:
+    """Format the largest per-column counts, one indented line each."""
+    ordered = sorted(counts.items(), key=lambda item: -item[1])
+    lines = []
+    for col, n in ordered[:_MAX_COLUMNS_SHOWN]:
+        pct = f" ({n / total * 100:.1f}%)" if total else ""
+        lines.append(f"  {col}: {n:,} row(s){pct}")
+    if len(ordered) > _MAX_COLUMNS_SHOWN:
+        lines.append(f"  … and {len(ordered) - _MAX_COLUMNS_SHOWN} more column(s)")
+    return lines
+
+
 # ---------------------------------------------------------------------------
-# Public API
+# Generic dataset-level checks
 # ---------------------------------------------------------------------------
 
 
-def _revenue_outliers_iqr(df: pd.DataFrame) -> list[int]:
-    """Row indices whose revenue lies outside 1.5 × IQR (needs ≥ 4 values)."""
-    outliers: list[int] = []
-    if "revenue" in df.columns:
-        rev = df["revenue"].dropna()
-        if len(rev) >= 4:
-            q1 = float(rev.quantile(0.25))
-            q3 = float(rev.quantile(0.75))
-            iqr = q3 - q1
-            lower = q1 - 1.5 * iqr
-            upper = q3 + 1.5 * iqr
-            outlier_mask = (rev < lower) | (rev > upper)
-            outlier_indices = rev[outlier_mask].index.tolist()
-            outliers = [int(i) for i in outlier_indices]
-    return outliers
+def _numeric_columns(df: pd.DataFrame) -> list[str]:
+    """Numeric, non-boolean columns."""
+    return [
+        c
+        for c in df.columns
+        if pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_bool_dtype(df[c])
+    ]
 
 
-def observe(
-    df: pd.DataFrame,
-    sandbox_result: dict[str, Any],
-    artifact_store_available_keys: list[str] | None = None,
-) -> ObservationReport:
+def count_duplicate_rows(df: pd.DataFrame) -> int:
+    """Rows that exactly repeat an earlier row (0 if rows are unhashable)."""
+    try:
+        return int(df.duplicated().sum())
+    except TypeError:  # unhashable cells (lists, dicts)
+        return 0
+
+
+def negative_value_counts(df: pd.DataFrame) -> dict[str, int]:
+    """Numeric column -> number of values below zero (zero counts omitted)."""
+    counts = {}
+    for col in _numeric_columns(df):
+        n = int((df[col] < 0).sum())
+        if n:
+            counts[str(col)] = n
+    return counts
+
+
+def numeric_outlier_counts(df: pd.DataFrame) -> dict[str, int]:
     """
-    Run deterministic data-quality checks on *df* and return a structured report.
+    Numeric column -> rows outside ``[Q1 - 1.5·IQR, Q3 + 1.5·IQR]``.
 
-    The observer is called after every EXECUTE stage, before CRITIQUE.  It
-    inspects the *original input DataFrame* (not the sandbox result string)
-    so the critic receives actual computed counts, not LLM speculation.
+    Skips code-like columns (at most ``_CODE_MAX_UNIQUE`` distinct values in a
+    sample), columns with fewer than 4 values, and columns with zero IQR.
+    """
+    counts = {}
+    sample = df.head(_SAMPLE_ROWS)
+    for col in _numeric_columns(df):
+        if sample[col].nunique() <= _CODE_MAX_UNIQUE:
+            continue
+        values = df[col].dropna()
+        if len(values) < 4:
+            continue
+        q1, q3 = float(values.quantile(0.25)), float(values.quantile(0.75))
+        iqr = q3 - q1
+        if iqr <= 0:
+            continue
+        n = int(((values < q1 - 1.5 * iqr) | (values > q3 + 1.5 * iqr)).sum())
+        if n:
+            counts[str(col)] = n
+    return counts
 
-    Args:
-        df:                              The original full DataFrame (not filtered).
-        sandbox_result:                  The full sandbox output dict
-                                         (used to extract row-count hints).
-        artifact_store_available_keys:   Keys currently in the ArtifactStore
-                                         (for contextual notes only).
 
-    Returns:
-        A populated :class:`ObservationReport`.
+def datetime_out_of_range(
+    df: pd.DataFrame, now: pd.Timestamp | None = None
+) -> dict[str, dict[str, Any]]:
+    """
+    Datetime column -> summary of values outside the column's plausible range.
+
+    The expected range is the 1%–99% quantile span widened by half its
+    length (at least one day) on each side, clipped to 1900-01-01 and to
+    *now* + 1 day. So a month of taxi trips flags the stray 2002 / 2009
+    timestamps but not trips that end just after midnight on the 1st.
+    """
+    now = now or pd.Timestamp.now()
+    out: dict[str, dict[str, Any]] = {}
+    for col in df.columns:
+        series = df[col]
+        if not pd.api.types.is_datetime64_any_dtype(series):
+            continue
+        if getattr(series.dt, "tz", None) is not None:
+            series = series.dt.tz_localize(None)
+        values = series.dropna()
+        if len(values) < 4:
+            continue
+        lo, hi = values.quantile(0.01), values.quantile(0.99)
+        pad = max((hi - lo) / 2, pd.Timedelta(days=1))
+        start = max(lo - pad, _MIN_PLAUSIBLE_DATE)
+        end = min(hi + pad, now + pd.Timedelta(days=1))
+        mask = (values < start) | (values > end)
+        n = int(mask.sum())
+        if n:
+            out[str(col)] = {
+                "count": n,
+                "min": f"{values.min():%Y-%m-%d %H:%M}",
+                "max": f"{values.max():%Y-%m-%d %H:%M}",
+                "expected_start": f"{start:%Y-%m-%d}",
+                "expected_end": f"{end:%Y-%m-%d}",
+            }
+    return out
+
+
+def observe_dataset(df: pd.DataFrame) -> "ObservationReport":
+    """
+    Run every check that depends only on *df* (nulls, duplicates, negative
+    values, out-of-range datetimes, outliers, and the sales checks).
+
+    Compute it once per run and pass it to :func:`observe` as ``baseline``.
     """
     report = ObservationReport()
     report.total_rows = len(df)
@@ -198,7 +324,67 @@ def observe(
     # ── 5. Revenue outliers (IQR method) ───────────────────────────────────────
     report.revenue_outliers_iqr = _revenue_outliers_iqr(df)
 
-    # ── 6. Rows after code filter (heuristic from stdout head() prints) ────────
+    # ── 6. Generic checks ──────────────────────────────────────────────────────
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        report.duplicate_rows = count_duplicate_rows(df)
+        report.negative_values = negative_value_counts(df)
+        report.datetime_out_of_range = datetime_out_of_range(df)
+        report.numeric_outliers_iqr = numeric_outlier_counts(df)
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def _revenue_outliers_iqr(df: pd.DataFrame) -> list[int]:
+    """Row indices whose revenue lies outside 1.5 × IQR (needs ≥ 4 values)."""
+    outliers: list[int] = []
+    if "revenue" in df.columns:
+        rev = df["revenue"].dropna()
+        if len(rev) >= 4:
+            q1 = float(rev.quantile(0.25))
+            q3 = float(rev.quantile(0.75))
+            iqr = q3 - q1
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
+            outlier_mask = (rev < lower) | (rev > upper)
+            outlier_indices = rev[outlier_mask].index.tolist()
+            outliers = [int(i) for i in outlier_indices]
+    return outliers
+
+
+def observe(
+    df: pd.DataFrame,
+    sandbox_result: dict[str, Any],
+    artifact_store_available_keys: list[str] | None = None,
+    baseline: ObservationReport | None = None,
+) -> ObservationReport:
+    """
+    Run deterministic data-quality checks on *df* and return a structured report.
+
+    The observer is called after every EXECUTE stage, before CRITIQUE.  It
+    inspects the *original input DataFrame* (not the sandbox result string)
+    so the critic receives actual computed counts, not LLM speculation.
+
+    Args:
+        df:                              The original full DataFrame (not filtered).
+        sandbox_result:                  The full sandbox output dict
+                                         (used to extract row-count hints).
+        artifact_store_available_keys:   Keys currently in the ArtifactStore
+                                         (for contextual notes only).
+        baseline:                        Result of :func:`observe_dataset` for
+                                         *df*; computed here when omitted.
+
+    Returns:
+        A populated :class:`ObservationReport`.
+    """
+    report = copy.deepcopy(baseline) if baseline is not None else observe_dataset(df)
+
+    # ── Rows after code filter (heuristic from stdout head() prints) ────────
     stdout = sandbox_result.get("stdout", "")
     if stdout:
         # Heuristic: count non-empty lines in stdout blocks that look like
@@ -211,7 +397,7 @@ def observe(
                 f"i.e., rows the code operated on)."
             )
 
-    # ── 7. Schema-level notes ──────────────────────────────────────────────────
+    # ── Schema-level notes ──────────────────────────────────────────────────
     if artifact_store_available_keys:
         report.notes.append(
             f"ArtifactStore has {len(artifact_store_available_keys)} "
