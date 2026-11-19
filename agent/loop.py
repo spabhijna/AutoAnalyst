@@ -505,7 +505,7 @@ def _try_deterministic(state: AgentRun, task: TaskNode, df: pd.DataFrame) -> boo
         attempt_count=1,
         had_execution_errors=False,
         artifact_key=sandbox_result.get("artifact_key"),
-        provenance=[task.capability, task.task_id] if task.capability else None,
+        provenance=[sandbox_result["capability_id"], task.task_id],
     )
     return True
 

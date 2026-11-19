@@ -36,6 +36,7 @@ def test_engine_executes_registered_capability_without_registering() -> None:
     assert result["success"] is True
     assert isinstance(result["artifact"], pd.DataFrame)
     assert result["artifact_key"] == "quarter_df"
+    assert result["capability_id"] == "FilterByDateRange"
     # The engine only executes and validates; the loop's _accept() registers.
     assert store.get_artifact("quarter_df") is None
 

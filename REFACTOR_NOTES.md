@@ -143,3 +143,8 @@ None. Only import lines and the names used in call sites changed in `test_loop.p
 - The dry-run summary text still claims five deterministic steps (false until D6 is fixed in Phase 4); the text was only moved to `agent/dry_run.py`.
 - `ExecutionEngine.execute` still runs `validate_semantic_contract` (the hard-coded step_N checks, D6).
 - `_do_replan` still sets `state.tasks = build_tasks(state.plan)` from the flat list (D4).
+
+## Phase 3 review follow-up
+- New `tests/test_accept.py`: `_accept` registration metadata (producer, consumers `["step_2"]`, frozen, confidence, provenance, `validated_at`, `produced_artifact_name`, status, working memory), no-artifact case, and provenance for `_try_deterministic` with a declared and an undeclared `task.capability`. This replaces the metadata coverage removed from `test_execution_engine.py`.
+- `ExecutionEngine.execute` now returns `capability_id` (the resolved capability) in its result dict; `_try_deterministic` builds provenance `[capability_id, task_id]` from it, so replanned tasks (no `task.capability`) keep provenance. `test_engine_executes_registered_capability_without_registering` also asserts `capability_id`.
+- Assertion changes: none (only additions).

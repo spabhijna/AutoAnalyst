@@ -75,4 +75,6 @@ class ExecutionEngine:
         if not semantic_validation.success:
             return None
 
-        return result.to_sandbox_result()
+        payload = result.to_sandbox_result()
+        payload["capability_id"] = capability.capability_id
+        return payload
