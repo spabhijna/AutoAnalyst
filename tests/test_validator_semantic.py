@@ -58,3 +58,14 @@ def test_columns_must_match_declared_schema() -> None:
 def test_schema_placeholders_are_skipped(placeholder) -> None:
     df = pd.DataFrame({"anything": [1]})
     assert V.validate_semantic_contract(_task(schema=placeholder), df).success
+
+
+def test_column_order_is_ignored_but_missing_and_extra_are_reported() -> None:
+    task = _task(schema=["region", "avg_units"])
+    reordered = pd.DataFrame({"avg_units": [1.0], "region": ["N"]})
+    assert V.validate_semantic_contract(task, reordered).success
+
+    wrong = pd.DataFrame({"region": ["N"], "units_sold": [1.0]})
+    reason = V.validate_semantic_contract(task, wrong).reasons[0]
+    assert "missing: ['avg_units']" in reason
+    assert "extra: ['units_sold']" in reason

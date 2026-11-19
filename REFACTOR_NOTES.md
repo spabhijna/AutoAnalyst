@@ -177,6 +177,17 @@ None. Only import lines and the names used in call sites changed in `test_loop.p
 - No existing test depended on the step-specific semantic checks (they were only exercised through the xfail test), so none had to change for D6.
 - `test_revise_plan_replaces_tail` (flat `["Q2_new?"]` replan response) passes unchanged: `parse_plan_json` still accepts the legacy flat format.
 
+### D9 — regression found in the Phase 4 review, fixed in `fix(phase-4)`
+- **Bug:** the new generic `validate_semantic_contract` fails a CODE-GEN attempt when `task.produces_artifact` is declared but no DataFrame with that variable name exists (or its columns differ from `output_schema`), yet `codegen_prompt` / `repair_prompt` never told the model the variable name or the columns. The dry run no longer exercises codegen, so nothing caught it. Reviewer probe: `produces_artifact="units_by_region"`, `output_schema=["region","avg_units"]`, answer assigned to `out`: accepted on attempt 1 before Phase 4, aborted after max retries after it.
+- **Fix:**
+  - `codegen_prompt` and `repair_prompt` take an optional `artifact_contract` text, rendered as its own block right after the sub-question only when non-empty (the prompts are byte-identical otherwise, tested). This is the only prompt edit.
+  - `loop._artifact_contract_text(task)` builds it ("OUTPUT CONTRACT: Assign your final DataFrame to a variable named `x` with columns: a, b (any order)."); empty without `produces_artifact`; no columns line for an empty or placeholder schema. `_do_codegen` / `_do_repair` now take the `TaskNode` instead of the question string.
+  - `validate_semantic_contract` compares columns as a set (order-insensitive); the reason lists `missing` and `extra` columns. `validate_output` (capability outputs, exact order) is untouched.
+- **Tests:** new `tests/test_codegen_contract.py` (reviewer scenario with reordered columns is accepted on attempt 1 with the artifact registered and the codegen prompt naming `units_by_region` / `avg_units`; variable never assigned is still rejected as `revise_code` with "no DataFrame artifact was produced" and the repair prompt carries the contract; wrong columns still rejected with missing/extra; `_artifact_contract_text` unit tests; prompts unchanged without a contract). `tests/test_validator_semantic.py` gained an order-insensitivity test.
+- **Assertions changed:** none (additions only). The earlier Phase 4 test `test_columns_must_match_declared_schema` still passes (it uses a genuinely different column set).
+- **Results after the fix:** `pytest tests/ -q`: `253 passed`; both dry-runs finish with 5 deterministic steps.
+- Note: §1.D item 9 of `REFACTOR_PLAN.md` was not present in the copy I could read on disk, so this entry follows the review message.
+
 ### 4. Results
 - `pytest tests/ -q`: `243 passed` (no xfail left).
 - `python main.py --dry-run` and `--dry-run --corrupt`: 5 steps, all deterministic. Run JSON: `dataset` is `clean` / `corrupted`, `total_llm_calls` 2 (plan + summary). The dry-run summary text claiming five deterministic steps is now true.

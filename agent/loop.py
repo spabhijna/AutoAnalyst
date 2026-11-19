@@ -565,11 +565,11 @@ def _run_codegen_loop(state: AgentRun, task: TaskNode, df: pd.DataFrame) -> bool
         # ── CODE-GEN ──────────────────────────────────────────────────────────
         reporting.codegen_start(iteration)
         if iteration == 0:
-            code = _do_codegen(state, sub_question, task_memory)
+            code = _do_codegen(state, task, task_memory)
         else:
             code = _do_repair(
                 state,
-                sub_question,
+                task,
                 previous_code or "",
                 previous_critique_reason or "",
                 task_memory,
@@ -717,19 +717,43 @@ def _run_codegen_loop(state: AgentRun, task: TaskNode, df: pd.DataFrame) -> bool
     )
 
 
+def _artifact_contract_text(task: TaskNode) -> str:
+    """
+    Describe the DataFrame a task must produce, for the CODE-GEN / REPAIR prompts.
+
+    The semantic validator requires a DataFrame under ``task.produces_artifact``
+    (with the declared columns), so the model has to be told the name and
+    columns. Returns ``""`` when the task declares no artifact; the columns line
+    is omitted when ``output_schema`` is empty or a placeholder.
+    """
+    if not task.produces_artifact:
+        return ""
+    text = (
+        "OUTPUT CONTRACT:\n"
+        f"Assign your final DataFrame to a variable named `{task.produces_artifact}`"
+    )
+    schema = list(task.output_schema)
+    if schema and schema not in (["same_as_input"], ["<scalar>"]):
+        text += f"\nwith columns: {', '.join(schema)} (any order)."
+    else:
+        text += "."
+    return text
+
+
 def _do_codegen(
     state: AgentRun,
-    sub_question: str,
+    task: TaskNode,
     task_memory: TaskMemory,
 ) -> str:
     """Call CODE-GEN, strip markdown fences, and return the code string."""
     prompt = codegen_prompt(
         state.goal,
-        sub_question,
+        task.question,
         state.schema_summary,
         environment_manifest=state.environment_manifest.as_prompt_text(),
         task_constraints=task_memory.as_prompt_text(),
         available_artifacts=state.artifact_store.describe(),
+        artifact_contract=_artifact_contract_text(task),
     )
     raw = state.llm(prompt, role="codegen")
     return strip_markdown_fences(raw)
@@ -737,7 +761,7 @@ def _do_codegen(
 
 def _do_repair(
     state: AgentRun,
-    sub_question: str,
+    task: TaskNode,
     previous_code: str,
     previous_critique_reason: str,
     task_memory: TaskMemory,
@@ -745,13 +769,14 @@ def _do_repair(
     """Call REPAIR, strip markdown fences, and return the code string."""
     prompt = repair_prompt(
         state.goal,
-        sub_question,
+        task.question,
         state.schema_summary,
         environment_manifest=state.environment_manifest.as_prompt_text(),
         task_constraints=task_memory.as_prompt_text(),
         previous_code=previous_code,
         error_reason=previous_critique_reason,
         available_artifacts=state.artifact_store.describe(),
+        artifact_contract=_artifact_contract_text(task),
     )
     raw = state.llm(prompt, role="codegen")
     return strip_markdown_fences(raw)

@@ -114,7 +114,8 @@ class CapabilityValidator:
 
         Applies only when the task declares ``produces_artifact``:
           * the artifact must be a non-empty DataFrame;
-          * its columns must equal ``task.output_schema`` when one is declared
+          * its columns must match ``task.output_schema`` as a set (order-insensitive)
+            when one is declared
             (``["same_as_input"]`` / ``["<scalar>"]`` placeholders are skipped).
 
         Nothing here depends on the task's position or ID in the plan.
@@ -133,15 +134,15 @@ class CapabilityValidator:
             else:
                 expected = list(task.output_schema)
                 actual = list(artifact.columns)
-                if (
-                    expected
-                    and expected not in (["same_as_input"], ["<scalar>"])
-                    and actual != expected
-                ):
-                    reasons.append(
-                        f"Artifact {task.produces_artifact!r} columns {actual} "
-                        f"do not match the declared output_schema {expected}."
-                    )
+                if expected and expected not in (["same_as_input"], ["<scalar>"]):
+                    missing = [c for c in expected if c not in actual]
+                    extra = [c for c in actual if c not in expected]
+                    if missing or extra:
+                        reasons.append(
+                            f"Artifact {task.produces_artifact!r} columns {actual} "
+                            f"do not match the declared output_schema {expected} "
+                            f"(missing: {missing}, extra: {extra})."
+                        )
 
         return ValidationResult(
             success=not reasons,

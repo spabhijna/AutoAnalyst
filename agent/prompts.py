@@ -158,6 +158,7 @@ def codegen_prompt(
     environment_manifest: str = "",
     task_constraints: str = "",
     available_artifacts: str = "",
+    artifact_contract: str = "",
 ) -> str:
     """
     Build the CODE-GEN prompt.
@@ -171,7 +172,11 @@ def codegen_prompt(
         available_artifacts: Human-readable description of pre-validated DataFrames
                              available in the ``artifacts`` sandbox global. Generated
                              by :meth:`ArtifactStore.describe`.
+        artifact_contract:  Optional OUTPUT CONTRACT block (variable name and
+                            columns of the DataFrame this task must produce);
+                            rendered only when non-empty.
     """
+    contract_section = f"\n{artifact_contract}\n" if artifact_contract else ""
     artifacts_section = (
         f"\n{available_artifacts}\n"
         if available_artifacts
@@ -192,7 +197,7 @@ CUMULATIVE TASK CONSTRAINTS (Do not violate these):
 {task_constraints}
 
 SUB-QUESTION TO ANSWER: {sub_question}
-
+{contract_section}
 Write a Python snippet that answers the sub-question using the DataFrame `df`.
 
 STRICT RULES — violating any of these will cause execution to fail:
@@ -236,6 +241,7 @@ def repair_prompt(
     previous_code: str,
     error_reason: str,
     available_artifacts: str = "",
+    artifact_contract: str = "",
 ) -> str:
     """
     Build the REPAIR prompt for localized fixes on a failed attempt.
@@ -250,7 +256,10 @@ def repair_prompt(
         error_reason:       The critique reason explaining what went wrong.
         available_artifacts: Human-readable description of available pre-validated
                              DataFrames (from ArtifactStore.describe()).
+        artifact_contract:  Optional OUTPUT CONTRACT block; rendered only when
+                            non-empty.
     """
+    contract_section = f"\n{artifact_contract}\n" if artifact_contract else ""
     artifacts_section = (
         f"\n{available_artifacts}\n"
         if available_artifacts
@@ -271,7 +280,7 @@ CUMULATIVE TASK CONSTRAINTS (Do not violate these):
 {task_constraints}
 
 SUB-QUESTION TO ANSWER: {sub_question}
-
+{contract_section}
 PREVIOUS CODE ATTEMPT:
 ```python
 {previous_code}
