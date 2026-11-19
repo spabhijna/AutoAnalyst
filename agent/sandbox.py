@@ -209,6 +209,7 @@ def _worker(
                 "error_category": "execution_error",
                 "artifact": None,
                 "artifact_key": extract_artifact,
+                "artifact_info": None,
             }
         )
         return
@@ -250,6 +251,7 @@ def _worker(
         # If requested, extract the named DataFrame variable from the sandbox
         # namespace and include it in the result dict for ArtifactStore registration.
         extracted_artifact: pd.DataFrame | None = None
+        artifact_info: dict[str, Any] | None = None
         if extract_artifact:
             # Use explicit None check — `or` would trigger pd.DataFrame.__bool__
             # which raises "ValueError: The truth value of a DataFrame is ambiguous".
@@ -257,14 +259,9 @@ def _worker(
             if candidate is None:
                 candidate = global_ns.get(extract_artifact)
             if isinstance(candidate, pd.DataFrame) and not candidate.empty:
-                try:
-                    if (
-                        len(pickle.dumps(candidate, protocol=4))
-                        <= _ARTIFACT_SIZE_LIMIT_BYTES
-                    ):
-                        extracted_artifact = candidate
-                except Exception:  # noqa: BLE001
-                    pass  # silently skip oversized or un-picklable artifacts
+                extracted_artifact, artifact_info = _extract_artifact(
+                    extract_artifact, candidate
+                )
 
         # Only the result repr and the declared artifact go back to the parent.
         # Other variables stay in the child: sending them could mean hundreds
@@ -279,6 +276,7 @@ def _worker(
                 "error_category": "none",
                 "artifact": extracted_artifact,
                 "artifact_key": extract_artifact,
+                "artifact_info": artifact_info,
             }
         )
     except Exception as exc:  # noqa: BLE001
@@ -305,6 +303,7 @@ def _worker(
                 else "execution_error",
                 "artifact": None,
                 "artifact_key": extract_artifact,
+                "artifact_info": None,
             }
         )
     finally:
@@ -339,6 +338,40 @@ def _safe_repr(value: Any) -> str | None:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+def _extract_artifact(
+    name: str, candidate: pd.DataFrame
+) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    """
+    Decide whether *candidate* travels back to the parent as an artifact.
+
+    Returns ``(frame_or_None, info)``. ``info`` always describes the frame
+    (rows, columns, size) and says whether it was stored, so an oversized
+    artifact is reported instead of silently disappearing.
+    """
+    info: dict[str, Any] = {
+        "name": name,
+        "rows": len(candidate),
+        "columns": [str(c) for c in candidate.columns],
+        "bytes": None,
+        "stored": False,
+        "reason": None,
+    }
+    try:
+        size = len(pickle.dumps(candidate, protocol=4))
+    except Exception as exc:  # noqa: BLE001
+        info["reason"] = f"not picklable: {type(exc).__name__}"
+        return None, info
+    info["bytes"] = size
+    if size > _ARTIFACT_SIZE_LIMIT_BYTES:
+        info["reason"] = (
+            f"too large to store ({size / 1e6:,.0f} MB > "
+            f"{_ARTIFACT_SIZE_LIMIT_BYTES / 1e6:,.0f} MB limit)"
+        )
+        return None, info
+    info["stored"] = True
+    return candidate, info
 
 
 def _await_result(
@@ -448,6 +481,7 @@ def run_sandboxed(
             "error_category": "execution_error",
             "artifact": None,
             "artifact_key": extract_artifact,
+            "artifact_info": None,
         }
 
     # Pickle the artifacts dict for inter-process transfer
@@ -505,6 +539,7 @@ def run_sandboxed(
             "error_category": "execution_error",
             "artifact": None,
             "artifact_key": extract_artifact,
+            "artifact_info": None,
         }
 
     # Process exited without putting anything in the queue (e.g. OOM kill)
@@ -520,4 +555,5 @@ def run_sandboxed(
         "error_category": "execution_error",
         "artifact": None,
         "artifact_key": extract_artifact,
+        "artifact_info": None,
     }

@@ -133,6 +133,7 @@ class CapabilityValidator:
         self,
         task: TaskNode,
         artifact: Any,
+        artifact_info: dict[str, Any] | None = None,
     ) -> ValidationResult:
         """
         Generic, plan-independent contract checks for a task's artifact.
@@ -143,22 +144,35 @@ class CapabilityValidator:
             when one is declared
             (``SCHEMA_PLACEHOLDERS`` are skipped).
 
+        An artifact the sandbox produced but did not send back because it is too
+        large (``artifact_info["stored"] is False``) still satisfies the contract:
+        its columns are checked from ``artifact_info``, and
+        ``metadata["artifact_not_stored"]`` carries the reason. Downstream tasks
+        then recompute from ``df``.
+
         Nothing here depends on the task's position or ID in the plan.
         """
         reasons: list[str] = []
+        metadata: dict[str, Any] = {"task_id": task.task_id}
         if task.produces_artifact:
-            if not isinstance(artifact, pd.DataFrame):
+            actual: list[str] | None = None
+            if isinstance(artifact, pd.DataFrame):
+                if artifact.empty:
+                    reasons.append(
+                        f"Artifact {task.produces_artifact!r} is an empty DataFrame."
+                    )
+                else:
+                    actual = list(artifact.columns)
+            elif _too_large_to_store(artifact_info):
+                actual = list(artifact_info["columns"])
+                metadata["artifact_not_stored"] = artifact_info["reason"]
+            else:
                 reasons.append(
                     f"Task {task.task_id} declares produces_artifact="
                     f"{task.produces_artifact!r} but no DataFrame artifact was produced."
                 )
-            elif artifact.empty:
-                reasons.append(
-                    f"Artifact {task.produces_artifact!r} is an empty DataFrame."
-                )
-            else:
+            if actual is not None:
                 expected = list(task.output_schema)
-                actual = list(artifact.columns)
                 if expected and expected not in SCHEMA_PLACEHOLDERS:
                     missing = [c for c in expected if c not in actual]
                     extra = [c for c in actual if c not in expected]
@@ -172,5 +186,15 @@ class CapabilityValidator:
         return ValidationResult(
             success=not reasons,
             reasons=reasons,
-            metadata={"task_id": task.task_id},
+            metadata=metadata,
         )
+
+
+def _too_large_to_store(artifact_info: dict[str, Any] | None) -> bool:
+    """True when the sandbox built the artifact but kept it because of its size."""
+    return bool(
+        artifact_info
+        and not artifact_info.get("stored")
+        and artifact_info.get("bytes") is not None
+        and artifact_info.get("columns") is not None
+    )

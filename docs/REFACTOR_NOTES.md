@@ -329,3 +329,19 @@ Found by a live run on NYC yellow taxi trips, January 2024 (2,964,624 rows, 536 
 ### 3. Results
 - `pytest tests/ -q`: 264 passed.
 - 3M-row filters in the sandbox: 185s timeout before, 5–8s after.
+
+## After the large-dataset rerun: oversized artifacts
+
+With the deadlock fixed, the taxi rerun (`run_86b2e2e7`) still aborted at step 1. The filtered table (~3M rows, ~400 MB) was over the sandbox's 50 MB artifact limit. The sandbox dropped it silently, and the contract check then reported "no DataFrame artifact was produced", which was false. The model and critic spent all 5 attempts chasing that.
+
+### 1. What changed
+- **The sandbox describes an artifact it doesn't send.** A new `artifact_info` key (name, rows, columns, bytes, `stored`, `reason`) is in every result. `_extract_artifact` decides whether a frame is stored or only described.
+- **An oversized artifact satisfies the contract.** `validate_semantic_contract(..., artifact_info)` checks its columns from the metadata and sets `metadata["artifact_not_stored"]`. Producing nothing still fails.
+- **The step is accepted without registering the table.** The loop logs a warning and appends a `[pipeline] ... not stored ... Later steps will recompute it from df.` line to stdout, so the critic knows why. Later steps don't find the artifact and recompute from `df`, which is the fallback the codegen prompt already teaches.
+
+### 2. Test assertions changed
+- `tests/test_sandbox.py`: `RESULT_KEYS` now includes `artifact_info`.
+- New `tests/test_oversized_artifacts.py` (7 tests), including an end-to-end run past an oversized artifact.
+
+### 3. Results
+- `pytest tests/ -q`: 271 passed.

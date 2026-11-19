@@ -560,8 +560,20 @@ def _execute_and_validate(
     error_category = sandbox_result.get("error_category", "none")
     if sandbox_result["success"]:
         semantic = CapabilityValidator().validate_semantic_contract(
-            task, sandbox_result.get("artifact")
+            task, sandbox_result.get("artifact"), sandbox_result.get("artifact_info")
         )
+        not_stored = semantic.metadata.get("artifact_not_stored")
+        if semantic.success and not_stored:
+            # Tell the critic (which reads stdout) why no artifact is registered,
+            # so it doesn't send the model chasing a non-existent bug.
+            info = sandbox_result["artifact_info"]
+            note = (
+                f"[pipeline] Artifact {task.produces_artifact!r} was produced "
+                f"({info['rows']:,} rows) but not stored: {not_stored}. "
+                f"Later steps will recompute it from df."
+            )
+            logger.warning(note)
+            sandbox_result["stdout"] = (sandbox_result.get("stdout") or "") + note + "\n"
         if not semantic.success:
             sandbox_result["success"] = False
             sandbox_result["error"] = "Semantic Validation Failed: " + "; ".join(
