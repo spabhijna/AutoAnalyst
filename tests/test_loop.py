@@ -416,39 +416,46 @@ class TestSummaryWorkingMemory:
         )
         return state
 
-    def test_accepted_findings_strips_intermediate_failures(self) -> None:
-        """Intermediate revise_code entries must not appear in the findings."""
-        q = "What is total revenue?"
-        history = [
-            {
-                "sub_question": q,
-                "iteration": 0,
-                "action": "revise_code",
-                "trust": "low",
-                "sandbox_result": {"result": None},
-            },
-            {
-                "sub_question": q,
-                "iteration": 1,
-                "action": "revise_code",
-                "trust": "low",
-                "sandbox_result": {"result": None},
-            },
-            {
-                "sub_question": q,
-                "iteration": 2,
-                "action": "accept",
-                "trust": "high",
-                "sandbox_result": {"result": "{'East': 100}"},
-            },
-        ]
-        state = self._make_state([q], history)
+    def test_accepted_findings_strips_intermediate_failures(
+        self, small_df: pd.DataFrame
+    ) -> None:
+        """Two failed attempts then an accept: one finding, from the accepted attempt."""
 
+        def sandbox(result: str) -> dict:
+            return {**_ok_sandbox(), "result": result}
+
+        state = _run_with_responses(
+            small_df,
+            plan_response='["What is total revenue?"]',
+            llm_side_effects=[
+                "result = bad1()",  # codegen iteration 0
+                _revise_critique(),
+                "result = bad2()",  # repair iteration 1
+                _revise_critique(),
+                "result = df['revenue'].sum()",  # repair iteration 2
+                _accept_critique(),
+                "Summary.",
+            ],
+            sandbox_side_effects=[
+                sandbox("WRONG-0"),
+                sandbox("WRONG-1"),
+                sandbox("{'East': 100}"),
+            ],
+        )
+
+        assert len(state.debug_history) == 3
+        assert [a.action for a in state.debug_history] == [
+            "revise_code",
+            "revise_code",
+            "accept",
+        ]
         assert len(state.final_results) == 1
-        attempt = attempt_for_finding(state, state.final_results[0])
-        assert attempt is not None
-        assert attempt.action == "accept"
-        assert attempt.iteration == 2
+        finding = state.final_results[0]
+        assert finding.source_iteration == 2
+        assert finding.answer == "{'East': 100}"
+        assert "WRONG" not in str(final_results(state))
+        accepted = attempt_for_finding(state, finding)
+        assert accepted is not None and accepted.iteration == 2
 
     def test_accepted_findings_preserves_plan_order(self) -> None:
         """Findings are returned in plan order, not history insertion order."""
