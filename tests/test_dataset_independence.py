@@ -134,7 +134,9 @@ def test_critique_prompt_has_no_default_dataset_figures() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_last_quarter_constants_are_day_precision() -> None:
+def test_last_quarter_constants_keep_the_last_timestamp() -> None:
+    """START is midnight of the first day; END keeps the time of the latest row,
+    so `<= LAST_QUARTER_END` still includes the last day's rows."""
     df = pd.DataFrame(
         {"date": [pd.Timestamp("2024-02-10"), pd.Timestamp("2024-04-15 13:45")]}
     )
@@ -142,8 +144,9 @@ def test_last_quarter_constants_are_day_precision() -> None:
 
     assert constants == {
         "LAST_QUARTER_START": pd.Timestamp("2024-02-01"),
-        "LAST_QUARTER_END": pd.Timestamp("2024-04-15"),
+        "LAST_QUARTER_END": pd.Timestamp("2024-04-15 13:45"),
     }
+    assert (df["date"] <= constants["LAST_QUARTER_END"]).all()
 
 
 def test_last_quarter_constants_empty_without_date_column() -> None:

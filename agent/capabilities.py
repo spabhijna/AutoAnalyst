@@ -13,7 +13,12 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from agent.dates import last_quarter_window
+from agent.dates import (
+    DATE_COLUMN_TOKEN,
+    detect_date_column,
+    goal_mentions_quarter,
+    last_quarter_window,
+)
 from agent.state import TaskNode
 
 
@@ -52,7 +57,16 @@ class CapabilityExecutionContext:
 
 @dataclass(frozen=True)
 class Capability:
-    """Reusable analytical operation registered with the engine."""
+    """
+    Reusable analytical operation registered with the engine.
+
+    ``input_schema`` lists the columns the executor reads; the token ``"date"``
+    (:data:`agent.dates.DATE_COLUMN_TOKEN`) means "the dataset's detected
+    datetime column", whatever it is called. ``example_question`` is used to
+    build the planner's example plan from the capabilities that apply to the
+    data. ``requires_time_scope`` capabilities only apply when the goal asks
+    about a quarter (``TimeScope.quarter``).
+    """
 
     capability_id: str
     description: str
@@ -62,6 +76,8 @@ class Capability:
     output_schema: tuple[str, ...]
     executor: Callable[[CapabilityExecutionContext], DeterministicExecutionResult]
     match_terms: tuple[str, ...] = ()
+    example_question: str = ""
+    requires_time_scope: bool = False
 
 
 @dataclass
@@ -129,16 +145,53 @@ class CapabilityRegistry:
         scored.sort(key=lambda item: (-item[0], item[1].capability_id))
         return scored[0][1]
 
-    def describe(self) -> str:
-        if not self._capabilities:
+    def describe(self, capabilities: list[Capability] | None = None) -> str:
+        """Describe *capabilities* (default: all registered) for a prompt."""
+        selected = self.list() if capabilities is None else capabilities
+        if not selected:
             return "(no capabilities registered)"
         lines = ["AVAILABLE CAPABILITIES:"]
-        for capability in self.list():
+        for capability in selected:
             lines.append(
                 f"- {capability.capability_id}: {capability.description} "
-                f"requires={list(capability.required_artifacts)} produces={list(capability.produced_artifacts)}"
+                f"requires={list(capability.required_artifacts)} "
+                f"produces={list(capability.produced_artifacts)} "
+                f"input_columns={list(capability.input_schema)}"
             )
         return "\n".join(lines)
+
+    def applicable(self, columns: list[str], time_scoped: bool) -> list[Capability]:
+        """
+        Capabilities that can run on a dataset with *columns*, in registry order.
+
+        A capability applies when every input column is available — in the
+        dataset, or produced by another applicable capability — and every
+        required artifact is produced by an applicable capability.
+        ``requires_time_scope`` capabilities apply only when *time_scoped*; the
+        ``"date"`` input token is satisfied by a detected datetime column, which
+        callers signal by including :data:`DATE_COLUMN_TOKEN` in *columns*.
+        """
+        available_columns = set(columns)
+        produced: set[str] = set()
+        chosen: list[Capability] = []
+        changed = True
+        while changed:
+            changed = False
+            for capability in self.list():
+                if capability in chosen:
+                    continue
+                if capability.requires_time_scope and not time_scoped:
+                    continue
+                if not set(capability.input_schema) <= available_columns:
+                    continue
+                if not set(capability.required_artifacts) <= produced:
+                    continue
+                chosen.append(capability)
+                produced.update(capability.produced_artifacts)
+                available_columns.update(capability.output_schema)
+                changed = True
+        order = {c.capability_id: i for i, c in enumerate(self.list())}
+        return sorted(chosen, key=lambda c: order[c.capability_id])
 
 
 def _determine_scope_df(
@@ -147,11 +200,12 @@ def _determine_scope_df(
     scoped = context.artifacts.get(artifact_name)
     if scoped is not None:
         return scoped
-    window = last_quarter_window(context.df)
+    date_col = detect_date_column(context.df)
+    window = last_quarter_window(context.df, date_col)
     if window is None:
         return context.df.copy(deep=False)
     start_ts, end_ts = window
-    date_series = pd.to_datetime(context.df["date"], errors="coerce")
+    date_series = pd.to_datetime(context.df[date_col], errors="coerce")
     mask = (date_series >= start_ts) & (date_series <= end_ts)
     return context.df.loc[mask].copy(deep=False)
 
@@ -189,6 +243,16 @@ def _failed_result(error: str) -> DeterministicExecutionResult:
 def execute_filter_by_date_range(
     context: CapabilityExecutionContext,
 ) -> DeterministicExecutionResult:
+    task = context.task
+    # Only a task that asks for the last quarter may be answered by this
+    # filter; any other filter (a month, a subset) must go to CODE-GEN.
+    if not (
+        goal_mentions_quarter(task.question)
+        or "quarter" in (task.produces_artifact or "")
+    ):
+        return _failed_result(
+            "FilterByDateRange only applies to tasks that ask for the last quarter"
+        )
     quarter_df = _determine_scope_df(context, "quarter_df")
     return _df_result(
         quarter_df,
@@ -226,8 +290,9 @@ def execute_monthly_revenue_trend(
 ) -> DeterministicExecutionResult:
     quarter_df = _determine_scope_df(context, "quarter_df")
     monthly = quarter_df.copy(deep=False)
+    date_col = detect_date_column(monthly) or DATE_COLUMN_TOKEN
     monthly["month"] = (
-        pd.to_datetime(monthly["date"], errors="coerce").dt.to_period("M").astype(str)
+        pd.to_datetime(monthly[date_col], errors="coerce").dt.to_period("M").astype(str)
     )
     trend = (
         monthly.groupby("month", as_index=False)["revenue"]
@@ -312,7 +377,9 @@ _DEFAULT_CAPABILITIES: tuple[Capability, ...] = (
         input_schema=("date",),
         output_schema=("same_as_input",),
         executor=execute_filter_by_date_range,
-        match_terms=("last quarter", "date range", "filter", "quarter_df"),
+        match_terms=("last quarter", "date range", "quarter_df"),
+        example_question="Filter df to the last quarter and return the filtered DataFrame",
+        requires_time_scope=True,
     ),
     Capability(
         capability_id="GroupRevenueByRegion",
@@ -323,6 +390,7 @@ _DEFAULT_CAPABILITIES: tuple[Capability, ...] = (
         output_schema=("region", "total_revenue"),
         executor=execute_group_revenue_by_region,
         match_terms=("region revenue", "revenue by region", "groupby region"),
+        example_question="What is the total revenue by region in the last quarter?",
     ),
     Capability(
         capability_id="FindMaximumRevenueRegion",
@@ -333,6 +401,7 @@ _DEFAULT_CAPABILITIES: tuple[Capability, ...] = (
         output_schema=("region", "total_revenue"),
         executor=execute_find_maximum_revenue_region,
         match_terms=("highest revenue", "top region", "maximum revenue"),
+        example_question="Which region has the highest total revenue?",
     ),
     Capability(
         capability_id="MonthlyRevenueTrend",
@@ -343,6 +412,7 @@ _DEFAULT_CAPABILITIES: tuple[Capability, ...] = (
         output_schema=("month", "total_revenue"),
         executor=execute_monthly_revenue_trend,
         match_terms=("month-over-month", "monthly trend", "monthly revenue trend"),
+        example_question="How did total revenue change month by month?",
     ),
     Capability(
         capability_id="RevenueShare",
@@ -353,6 +423,7 @@ _DEFAULT_CAPABILITIES: tuple[Capability, ...] = (
         output_schema=("region", "total_revenue", "revenue_share"),
         executor=execute_revenue_share,
         match_terms=("share", "percentage", "revenue share"),
+        example_question="What share of total revenue does each region contribute?",
     ),
     Capability(
         capability_id="CategoryAggregation",
@@ -363,6 +434,7 @@ _DEFAULT_CAPABILITIES: tuple[Capability, ...] = (
         output_schema=("product_category", "total_revenue"),
         executor=execute_category_aggregation,
         match_terms=("category", "product category", "category aggregation"),
+        example_question="What is the total revenue by product category?",
     ),
     Capability(
         capability_id="AverageUnitPrice",
@@ -373,6 +445,7 @@ _DEFAULT_CAPABILITIES: tuple[Capability, ...] = (
         output_schema=("product_category", "average_price"),
         executor=execute_average_unit_price,
         match_terms=("average price", "unit price", "mean price"),
+        example_question="What is the average unit price by product category?",
     ),
     Capability(
         capability_id="TopSellingProductCategory",
@@ -383,6 +456,7 @@ _DEFAULT_CAPABILITIES: tuple[Capability, ...] = (
         output_schema=("product_category", "total_units_sold"),
         executor=execute_top_selling_product_category,
         match_terms=("top selling", "most units sold", "highest volume"),
+        example_question="Which product category sold the most units?",
     ),
 )
 
