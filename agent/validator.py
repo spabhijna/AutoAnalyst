@@ -14,6 +14,7 @@ from typing import Any
 import pandas as pd
 
 from agent.capabilities import Capability, CapabilityExecutionContext
+from agent.dates import DATE_COLUMN_TOKEN, detect_date_column
 from agent.state import SCHEMA_PLACEHOLDERS, TaskNode
 
 
@@ -41,6 +42,35 @@ class CapabilityValidator:
             return ValidationResult(
                 success=False,
                 reasons=[f"Missing required artifacts: {', '.join(missing)}"],
+                metadata={"required_artifacts": list(capability.required_artifacts)},
+            )
+
+        # The capability reads its input_schema columns from its first required
+        # artifact, or from the input DataFrame when it requires none.
+        source_name = (
+            capability.required_artifacts[0] if capability.required_artifacts else "df"
+        )
+        source = (
+            context.artifacts[source_name]
+            if capability.required_artifacts
+            else context.df
+        )
+        missing_columns = [
+            column
+            for column in capability.input_schema
+            if column not in source.columns
+            # "date" means the detected datetime column, whatever its name.
+            and not (column == DATE_COLUMN_TOKEN and detect_date_column(source))
+        ]
+        if missing_columns:
+            return ValidationResult(
+                success=False,
+                reasons=[
+                    f"{capability.capability_id} needs columns {missing_columns} "
+                    f"that are missing from {source_name}"
+                ],
+                expected_schema=list(capability.input_schema),
+                actual_schema=list(source.columns),
                 metadata={"required_artifacts": list(capability.required_artifacts)},
             )
         return ValidationResult(
@@ -108,6 +138,7 @@ class CapabilityValidator:
         self,
         task: TaskNode,
         artifact: Any,
+        artifact_info: dict[str, Any] | None = None,
     ) -> ValidationResult:
         """
         Generic, plan-independent contract checks for a task's artifact.
@@ -118,22 +149,35 @@ class CapabilityValidator:
             when one is declared
             (``SCHEMA_PLACEHOLDERS`` are skipped).
 
+        An artifact the sandbox produced but did not send back because it is too
+        large (``artifact_info["stored"] is False``) still satisfies the contract:
+        its columns are checked from ``artifact_info``, and
+        ``metadata["artifact_not_stored"]`` carries the reason. Downstream tasks
+        then recompute from ``df``.
+
         Nothing here depends on the task's position or ID in the plan.
         """
         reasons: list[str] = []
+        metadata: dict[str, Any] = {"task_id": task.task_id}
         if task.produces_artifact:
-            if not isinstance(artifact, pd.DataFrame):
+            actual: list[str] | None = None
+            if isinstance(artifact, pd.DataFrame):
+                if artifact.empty:
+                    reasons.append(
+                        f"Artifact {task.produces_artifact!r} is an empty DataFrame."
+                    )
+                else:
+                    actual = list(artifact.columns)
+            elif _too_large_to_store(artifact_info):
+                actual = list(artifact_info["columns"])
+                metadata["artifact_not_stored"] = artifact_info["reason"]
+            else:
                 reasons.append(
                     f"Task {task.task_id} declares produces_artifact="
                     f"{task.produces_artifact!r} but no DataFrame artifact was produced."
                 )
-            elif artifact.empty:
-                reasons.append(
-                    f"Artifact {task.produces_artifact!r} is an empty DataFrame."
-                )
-            else:
+            if actual is not None:
                 expected = list(task.output_schema)
-                actual = list(artifact.columns)
                 if expected and expected not in SCHEMA_PLACEHOLDERS:
                     missing = [c for c in expected if c not in actual]
                     extra = [c for c in actual if c not in expected]
@@ -147,5 +191,15 @@ class CapabilityValidator:
         return ValidationResult(
             success=not reasons,
             reasons=reasons,
-            metadata={"task_id": task.task_id},
+            metadata=metadata,
         )
+
+
+def _too_large_to_store(artifact_info: dict[str, Any] | None) -> bool:
+    """True when the sandbox built the artifact but kept it because of its size."""
+    return bool(
+        artifact_info
+        and not artifact_info.get("stored")
+        and artifact_info.get("bytes") is not None
+        and artifact_info.get("columns") is not None
+    )

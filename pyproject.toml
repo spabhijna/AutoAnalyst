@@ -1,7 +1,7 @@
 [project]
 name = "autoanalyst"
 version = "0.1.0"
-description = "Self-Correcting Data Pipeline Agent — analyzes sales data via a PLAN→CODEGEN→EXECUTE→OBSERVE→CRITIQUE loop with independent LLM critique."
+description = "Self-Correcting Data Pipeline Agent — analyzes tabular data via a PLAN→CODEGEN→EXECUTE→OBSERVE→CRITIQUE loop with independent LLM critique."
 readme = "README.md"
 requires-python = ">=3.12"
 # Runtime dependencies, one per import in the code:
@@ -21,6 +21,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0",
+]
+# Reading Parquet files with `main.py --data file.parquet` (agent/inputs.py).
+parquet = [
+    "pyarrow",
 ]
 
 [dependency-groups]

@@ -29,12 +29,13 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import pandas as pd
 
 from agent import config, reporting
 from agent.artifact_store import ArtifactStore
+from agent.dates import TimeScope, last_quarter_constants
 from agent.dry_run import dry_run_llm
 from agent.errors import PipelineAbortedError
 from agent.environment import EnvironmentManifest
@@ -45,8 +46,10 @@ from agent.findings import (
     coerce_trust,
     finding_from_attempt,
 )
+from agent.inputs import format_data_dictionary
 from agent.llm_client import call_llm
 from agent.logger import LogEntry, new_run_id
+from agent.observer import ObservationReport
 from agent.planning import apply_replan, do_plan, do_replan, task_order
 from agent.run_export import finalize_run, log_entry
 from agent.stages import (
@@ -107,10 +110,19 @@ class AgentRun:
         plan_revisions:       Count of plan revisions so far (capped at MAX_PLAN_REVISIONS).
         summary:              Final LLM-generated summary (populated at end of run).
         log_dir:              Directory where JSONL logs are written.
+        scope:                Time scope decided from the goal and the data: the
+                              detected datetime column, and whether the "last
+                              quarter" machinery applies (see TimeScope).
+        data_dictionary:      User-supplied column / code descriptions, passed to
+                              the plan, code-gen, critique and summary prompts.
     """
 
     goal: str
     schema_summary: str
+    scope: TimeScope = field(default_factory=TimeScope)
+    data_dictionary: str = ""
+    # Dataset-level OBSERVE checks, computed on the first critique and reused.
+    data_quality: ObservationReport | None = None
     plan: list[str] = field(default_factory=list)
     tasks: list[TaskNode] = field(default_factory=list)
     debug_history: list[AttemptRecord] = field(default_factory=list)
@@ -159,6 +171,7 @@ def run(
     dry_run: bool = False,
     llm: Callable[..., str] | None = None,
     dataset_label: str = "clean",
+    data_dictionary: str | Mapping[str, Any] | None = None,
 ) -> AgentRun:
     """
     Execute the full five-stage loop for *goal* against *df*.
@@ -179,12 +192,19 @@ def run(
                             call. Defaults to :func:`agent.llm_client.call_llm`
                             (or :func:`agent.dry_run.dry_run_llm` when
                             ``dry_run`` is True). An explicit *llm* wins.
+        data_dictionary:    Optional description of the columns and coded values
+                            (free text, or a ``{column: description}`` mapping),
+                            e.g. ``{"payment_type": "1=credit card, 2=cash"}``.
+                            Passed to the plan, code-gen, repair, critique and
+                            summary prompts so coded values are labelled correctly.
 
     Returns:
         Completed :class:`AgentRun` with full history and summary populated.
     """
     t_start = time.monotonic()
-    state = _init_run(goal, df, log_dir, max_retries_per_step, dry_run, llm)
+    state = _init_run(
+        goal, df, log_dir, max_retries_per_step, dry_run, llm, data_dictionary
+    )
 
     do_plan(state, df, state.llm, log_entry)  # sets state.plan / state.tasks
 
@@ -209,11 +229,15 @@ def _init_run(
     max_retries_per_step: int,
     dry_run: bool,
     llm: Callable[..., str] | None,
+    data_dictionary: str | Mapping[str, Any] | None = None,
 ) -> AgentRun:
     """Create the run state and select the LLM callable (no monkeypatching)."""
+    scope = TimeScope.from_goal(goal, df)
     state = AgentRun(
         goal=goal,
-        schema_summary=build_schema_summary(df),
+        schema_summary=build_schema_summary(df, scope),
+        scope=scope,
+        data_dictionary=format_data_dictionary(data_dictionary),
         log_dir=log_dir,
         max_retries_per_step=max_retries_per_step,
     )
@@ -469,13 +493,15 @@ def _run_codegen_loop(state: AgentRun, task: TaskNode, df: pd.DataFrame) -> bool
     had_execution_errors = False
     task_memory = state.task_memories[task.task_id]
     artifact_namespace = _artifact_namespace(state, task)
+    # The prompts tell the model to use these names, so define them in the sandbox.
+    constants = last_quarter_constants(df, state.scope.date_column)
 
     for iteration in range(state.max_retries_per_step):
         code = generate_code(
             state, task, task_memory, iteration, previous_code, previous_reason
         )
         sandbox_result, error_category = _execute_and_validate(
-            state, task, df, code, artifact_namespace
+            state, task, df, code, artifact_namespace, constants
         )
         had_execution_errors = had_execution_errors or not sandbox_result["success"]
         critique_raw, trust, action, reason, error_category = observe_and_critique(
@@ -531,6 +557,7 @@ def _execute_and_validate(
     df: pd.DataFrame,
     code: str,
     artifact_namespace: dict[str, pd.DataFrame],
+    constants: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Run *code* in the sandbox, then apply the task's semantic contract.
 
@@ -544,6 +571,7 @@ def _execute_and_validate(
         artifacts=artifact_namespace,
         extract_artifact=task.produces_artifact,
         timeout_seconds=config.SANDBOX_TIMEOUT_SECONDS,
+        constants=constants,
     )
     status = (
         "✓ OK"
@@ -555,8 +583,20 @@ def _execute_and_validate(
     error_category = sandbox_result.get("error_category", "none")
     if sandbox_result["success"]:
         semantic = CapabilityValidator().validate_semantic_contract(
-            task, sandbox_result.get("artifact")
+            task, sandbox_result.get("artifact"), sandbox_result.get("artifact_info")
         )
+        not_stored = semantic.metadata.get("artifact_not_stored")
+        if semantic.success and not_stored:
+            # Tell the critic (which reads stdout) why no artifact is registered,
+            # so it doesn't send the model chasing a non-existent bug.
+            info = sandbox_result["artifact_info"]
+            note = (
+                f"[pipeline] Artifact {task.produces_artifact!r} was produced "
+                f"({info['rows']:,} rows) but not stored: {not_stored}. "
+                f"Later steps will recompute it from df."
+            )
+            logger.warning(note)
+            sandbox_result["stdout"] = (sandbox_result.get("stdout") or "") + note + "\n"
         if not semantic.success:
             sandbox_result["success"] = False
             sandbox_result["error"] = "Semantic Validation Failed: " + "; ".join(

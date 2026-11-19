@@ -57,7 +57,7 @@ RESULT_KEYS = {
     "error_category",
     "artifact",
     "artifact_key",
-    "new_variables",
+    "artifact_info",
 }
 
 
@@ -308,3 +308,45 @@ class TestResultFormatting:
         out = _run(code, sales_df)
         assert out["success"] is True
         assert "{'a': 1, 'b': 2}" in out["result"]
+
+
+# ---------------------------------------------------------------------------
+# Large results (regression: join-before-get deadlock)
+# ---------------------------------------------------------------------------
+
+
+class TestLargeResults:
+    """Payloads bigger than the OS pipe buffer must come back without hanging.
+
+    The parent used to join() the child before reading the queue. A child that
+    has put a large item can't exit until the parent reads it, so any big
+    artifact or variable hung until the timeout.
+    """
+
+    @pytest.fixture()
+    def big_df(self) -> pd.DataFrame:
+        rng = np.random.default_rng(0)
+        n = 200_000
+        return pd.DataFrame(
+            {"key": rng.integers(0, 100, n), "value": rng.uniform(0, 100, n)}
+        )
+
+    def test_large_artifact_returns_well_before_timeout(self, big_df) -> None:
+        code = "quarter_df = df[df['value'] > 10]\nresult = len(quarter_df)"
+        start = time.monotonic()
+        out = run_sandboxed(code, big_df, extract_artifact="quarter_df", timeout_seconds=60)
+        elapsed = time.monotonic() - start
+
+        assert out["success"], out["error"]
+        assert isinstance(out["artifact"], pd.DataFrame)
+        assert len(out["artifact"]) == int(out["result"])
+        assert elapsed < 30, f"took {elapsed:.1f}s: the result read is blocking"
+
+    def test_large_local_variables_are_not_returned(self, big_df) -> None:
+        code = "copy_a = df.copy()\ncopy_b = df.copy()\nresult = len(copy_a)"
+        start = time.monotonic()
+        out = run_sandboxed(code, big_df, timeout_seconds=60)
+
+        assert out["success"], out["error"]
+        assert set(out) == RESULT_KEYS
+        assert time.monotonic() - start < 30

@@ -53,7 +53,9 @@ import io
 import logging
 import multiprocessing
 import pickle
+import queue
 import sys
+import time
 import traceback
 from typing import Any
 
@@ -172,6 +174,7 @@ def _worker(
     result_queue: "multiprocessing.Queue[dict[str, Any]]",
     artifacts_pickle: bytes | None = None,
     extract_artifact: str | None = None,
+    constants: dict[str, Any] | None = None,
 ) -> None:
     """
     Execute *code* in a restricted namespace and push the result dict onto
@@ -206,6 +209,7 @@ def _worker(
                 "error_category": "execution_error",
                 "artifact": None,
                 "artifact_key": extract_artifact,
+                "artifact_info": None,
             }
         )
         return
@@ -226,6 +230,11 @@ def _worker(
         "np": np,
         "artifacts": artifacts,  # pre-validated DataFrames from ArtifactStore
     }
+    # Read-only constants the prompts reference by name (e.g. LAST_QUARTER_START).
+    # They can never replace the core sandbox globals above.
+    for name, value in (constants or {}).items():
+        if name not in global_ns:
+            global_ns[name] = value
     local_ns: dict[str, Any] = {}
 
     # Capture stdout from agent code
@@ -242,6 +251,7 @@ def _worker(
         # If requested, extract the named DataFrame variable from the sandbox
         # namespace and include it in the result dict for ArtifactStore registration.
         extracted_artifact: pd.DataFrame | None = None
+        artifact_info: dict[str, Any] | None = None
         if extract_artifact:
             # Use explicit None check — `or` would trigger pd.DataFrame.__bool__
             # which raises "ValueError: The truth value of a DataFrame is ambiguous".
@@ -249,28 +259,13 @@ def _worker(
             if candidate is None:
                 candidate = global_ns.get(extract_artifact)
             if isinstance(candidate, pd.DataFrame) and not candidate.empty:
-                try:
-                    if (
-                        len(pickle.dumps(candidate, protocol=4))
-                        <= _ARTIFACT_SIZE_LIMIT_BYTES
-                    ):
-                        extracted_artifact = candidate
-                except Exception:  # noqa: BLE001
-                    pass  # silently skip oversized or un-picklable artifacts
+                extracted_artifact, artifact_info = _extract_artifact(
+                    extract_artifact, candidate
+                )
 
-        # ── New variable capture (Phase-1) ────────────────────────────────────
-        # Collect every name that the executed code wrote into local_ns.
-        # Protected names (result, _*) and the sandbox globals are excluded.
-        # This dict is returned to the caller so the runtime can absorb new
-        # variables into its persistent namespace without relying on the LLM
-        # to use any particular variable name.
-        _protected = {"result", "pd", "np", "df", "artifacts", "__builtins__"}
-        new_variables: dict[str, Any] = {
-            k: v
-            for k, v in local_ns.items()
-            if k not in _protected and not k.startswith("_")
-        }
-
+        # Only the result repr and the declared artifact go back to the parent.
+        # Other variables stay in the child: sending them could mean hundreds
+        # of MB per attempt on large data, and nothing reads them.
         result_queue.put(
             {
                 "success": True,
@@ -281,7 +276,7 @@ def _worker(
                 "error_category": "none",
                 "artifact": extracted_artifact,
                 "artifact_key": extract_artifact,
-                "new_variables": new_variables,
+                "artifact_info": artifact_info,
             }
         )
     except Exception as exc:  # noqa: BLE001
@@ -308,7 +303,7 @@ def _worker(
                 else "execution_error",
                 "artifact": None,
                 "artifact_key": extract_artifact,
-                "new_variables": {},
+                "artifact_info": None,
             }
         )
     finally:
@@ -345,12 +340,75 @@ def _safe_repr(value: Any) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def _extract_artifact(
+    name: str, candidate: pd.DataFrame
+) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    """
+    Decide whether *candidate* travels back to the parent as an artifact.
+
+    Returns ``(frame_or_None, info)``. ``info`` always describes the frame
+    (rows, columns, size) and says whether it was stored, so an oversized
+    artifact is reported instead of silently disappearing.
+    """
+    info: dict[str, Any] = {
+        "name": name,
+        "rows": len(candidate),
+        "columns": [str(c) for c in candidate.columns],
+        "bytes": None,
+        "stored": False,
+        "reason": None,
+    }
+    try:
+        size = len(pickle.dumps(candidate, protocol=4))
+    except Exception as exc:  # noqa: BLE001
+        info["reason"] = f"not picklable: {type(exc).__name__}"
+        return None, info
+    info["bytes"] = size
+    if size > _ARTIFACT_SIZE_LIMIT_BYTES:
+        info["reason"] = (
+            f"too large to store ({size / 1e6:,.0f} MB > "
+            f"{_ARTIFACT_SIZE_LIMIT_BYTES / 1e6:,.0f} MB limit)"
+        )
+        return None, info
+    info["stored"] = True
+    return candidate, info
+
+
+def _await_result(
+    result_queue: "multiprocessing.Queue[dict[str, Any]]",
+    process: Any,
+    timeout_seconds: float,
+) -> dict[str, Any] | None:
+    """
+    Wait up to *timeout_seconds* for the child's result dict.
+
+    Returns ``None`` if the deadline passes, or if the child exits without
+    putting anything on the queue.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            return result_queue.get(timeout=min(0.5, remaining))
+        except queue.Empty:
+            if not process.is_alive():
+                # The child may have exited just after its feeder thread
+                # flushed the result; give it one last short read.
+                try:
+                    return result_queue.get(timeout=1.0)
+                except queue.Empty:
+                    return None
+
+
 def run_sandboxed(
     code: str,
     df: pd.DataFrame,
     artifacts: dict[str, pd.DataFrame] | None = None,
     extract_artifact: str | None = None,
     timeout_seconds: float = config.SANDBOX_TIMEOUT_SECONDS,
+    constants: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Execute *code* against *df* in an isolated child process with a hard timeout.
@@ -388,6 +446,9 @@ def run_sandboxed(
                           after execution and return as a raw DataFrame.
         timeout_seconds:  Hard wall-clock limit. Defaults to
                           ``config.SANDBOX_TIMEOUT_SECONDS``.
+        constants:        Extra read-only globals (e.g. ``LAST_QUARTER_START``).
+                          Names that clash with ``df``/``pd``/``np``/``artifacts``
+                          are ignored.
 
     Returns:
         A dict with the following keys::
@@ -420,7 +481,7 @@ def run_sandboxed(
             "error_category": "execution_error",
             "artifact": None,
             "artifact_key": extract_artifact,
-            "new_variables": {},
+            "artifact_info": None,
         }
 
     # Pickle the artifacts dict for inter-process transfer
@@ -439,11 +500,28 @@ def run_sandboxed(
 
     process = ctx.Process(
         target=_worker,
-        args=(code, df_pickle, result_queue, artifacts_pickle, extract_artifact),
+        args=(
+            code,
+            df_pickle,
+            result_queue,
+            artifacts_pickle,
+            extract_artifact,
+            constants,
+        ),
         daemon=True,
     )
     process.start()
-    process.join(timeout=timeout_seconds)
+
+    # Read the result BEFORE joining. A child that has put a large item on the
+    # queue cannot exit until the parent reads it, so join-then-get deadlocks
+    # until the timeout whenever the result or artifact is big.
+    result = _await_result(result_queue, process, timeout_seconds)
+    if result is not None:
+        process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join()
+        return result
 
     if process.is_alive():
         # Hard kill — unconditional, no cooperative signalling
@@ -461,12 +539,8 @@ def run_sandboxed(
             "error_category": "execution_error",
             "artifact": None,
             "artifact_key": extract_artifact,
-            "new_variables": {},
+            "artifact_info": None,
         }
-
-    # Retrieve result from the queue
-    if not result_queue.empty():
-        return result_queue.get_nowait()
 
     # Process exited without putting anything in the queue (e.g. OOM kill)
     return {
@@ -481,5 +555,5 @@ def run_sandboxed(
         "error_category": "execution_error",
         "artifact": None,
         "artifact_key": extract_artifact,
-        "new_variables": {},
+        "artifact_info": None,
     }

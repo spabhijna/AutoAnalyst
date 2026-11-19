@@ -1,0 +1,22 @@
+{
+  "VendorID": "TPEP provider: 1 = Creative Mobile Technologies, 2 = Curb Mobility, 6 = Myle Technologies, 7 = Helix.",
+  "tpep_pickup_datetime": "Date and time the meter was engaged.",
+  "tpep_dropoff_datetime": "Date and time the meter was disengaged.",
+  "passenger_count": "Number of passengers (entered by the driver).",
+  "trip_distance": "Elapsed trip distance in miles reported by the taximeter.",
+  "RatecodeID": "Final rate code: 1 = Standard, 2 = JFK, 3 = Newark, 4 = Nassau or Westchester, 5 = Negotiated fare, 6 = Group ride, 99 = Null/unknown.",
+  "store_and_fwd_flag": "Y = trip record held in vehicle memory before sending (no server connection), N = not a store-and-forward trip.",
+  "PULocationID": "TLC taxi zone where the meter was engaged.",
+  "DOLocationID": "TLC taxi zone where the meter was disengaged.",
+  "payment_type": "How the passenger paid: 0 = Flex Fare trip, 1 = Credit card, 2 = Cash, 3 = No charge, 4 = Dispute, 5 = Unknown, 6 = Voided trip.",
+  "fare_amount": "Time-and-distance fare calculated by the meter (USD).",
+  "extra": "Miscellaneous extras and surcharges (USD).",
+  "mta_tax": "MTA tax triggered by the metered rate (USD).",
+  "tip_amount": "Tip (USD). Populated automatically for credit card tips; CASH TIPS ARE NOT RECORDED, so cash trips show 0 tip regardless of what was paid.",
+  "tolls_amount": "Total tolls paid in trip (USD).",
+  "improvement_surcharge": "Improvement surcharge assessed at flag drop (USD).",
+  "total_amount": "Total amount charged to passengers, excluding cash tips (USD).",
+  "congestion_surcharge": "New York State congestion surcharge (USD).",
+  "Airport_fee": "Fee for pick up at LaGuardia and JFK airports (USD).",
+  "_notes": "Negative amounts usually mark refunds or voided/disputed trips. Source: NYC TLC Yellow Taxi data dictionary."
+}

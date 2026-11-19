@@ -294,3 +294,54 @@ None in this phase (no test files touched; the follow-up commit above is separat
 3. **`loop.py` ≤ 600 lines; no function in `agent/` over 80 lines (exception: `prompts.py`, `sandbox.py`); `runtime.py` and `executors.py` gone.** Yes: `agent/loop.py` is 589 lines. An AST scan of `agent/*.py` finds only `prompts.repair_prompt` (85), `prompts.critique_prompt` (167), `sandbox._worker` (147) and `sandbox.run_sandboxed` (138), which are the exempted modules. `ls agent/runtime.py agent/executors.py` reports both missing.
 4. **`grep -rn 'step_[0-9]' agent/` finds only `_task_id`-style generation.** It finds nothing at all (IDs are generated as `f"step_{index + 1}"` in `planning.task_id`, and `apply_replan` parses them with a regex): no special-casing.
 5. **`REFACTOR_NOTES.md` lists every deviation and every changed test assertion, with the reason.** Yes: each phase section (0–6, plus the review follow-ups) has "Deviations from the plan" and "Test assertions changed". Assertion changes are in Phase 0 (restored `plan_revisions` assertion), Phase 3 (two engine tests), Phase 4 (`test_plan_revision_cap`, xfail removals), Phase 5 (`state.history` → `debug_history`, rewritten summary-memory tests, replaced D1 test, patch-target strings) and the Phase 5 follow-up (rewritten strip-failures test); Phases 1, 2 and 6 changed none.
+
+## After the live run: dataset independence fixes
+
+Found during the first live run (`run_4d4821f5`) and an audit for sales-specific hard-coding.
+
+### 1. What changed
+- **Capabilities can no longer crash a run.** `CapabilityValidator.validate_context` now checks each capability's declared `input_schema` columns against its first required artifact, or against `df` when it requires none. `ExecutionEngine.execute` also catches any exception from a capability executor. In both cases the task falls back to CODE-GEN. Before this, a sales capability matched on a dataset without `region`/`revenue` raised `KeyError` and ended the whole run with no run JSON.
+- **No default-dataset figures in the critique prompt.** The contradiction example used `{"West": 46384.76, "South": 45317.93}`, which is the actual answer for `--seed 42` data. It now uses neutral `{"A": 1200.00, "B": 950.00}`.
+- **`LAST_QUARTER_START` / `LAST_QUARTER_END` are defined in the sandbox.** The prompts tell the model to use these names, but the sandbox never defined them, so first attempts failed with `NameError` (seen in the live run's step 4). `dates.last_quarter_constants(df)` returns them at day precision, matching the schema summary, and `run_sandboxed(..., constants=...)` injects them without ever overriding `df`, `pd`, `np` or `artifacts`.
+
+### 2. Test assertions changed
+None. New file `tests/test_dataset_independence.py` (8 tests).
+
+### 3. Results
+- `pytest tests/ -q`: 262 passed.
+- `python main.py --dry-run` and `--dry-run --corrupt`: both finish.
+
+### 4. Left alone (a larger design change)
+Capabilities, the observer's checks, the "last quarter" logic and the prompt examples still assume the sales schema. Other datasets now degrade to CODE-GEN instead of crashing, but making the pipeline properly dataset-agnostic, with configurable or inferred column roles, is separate work.
+
+## After the large-dataset run: sandbox deadlock
+
+Found by a live run on NYC yellow taxi trips, January 2024 (2,964,624 rows, 536 MB in memory). Every codegen attempt timed out.
+
+### 1. What changed
+- **The result is read before the child is joined.** `run_sandboxed` used to `join()` the child and only then read the queue. A child that has put a large item can't exit until the parent reads it, so any result bigger than the OS pipe buffer hung until the timeout. On the taxi data, a one-line filter timed out even at 180s. The new `_await_result` reads the queue with a deadline first, then joins (and kills the child if it doesn't exit).
+- **`new_variables` is no longer returned.** The sandbox sent every variable the code created back to the parent, hundreds of MB per attempt on large data. Nothing has read it since `AnalysisRuntime` was removed in Phase 1.
+
+### 2. Test assertions changed
+- `tests/test_sandbox.py`: `RESULT_KEYS` no longer includes `new_variables`.
+- New `TestLargeResults` (2 tests, 200k rows). Both fail on the old code and pass with the fix.
+
+### 3. Results
+- `pytest tests/ -q`: 264 passed.
+- 3M-row filters in the sandbox: 185s timeout before, 5–8s after.
+
+## After the large-dataset rerun: oversized artifacts
+
+With the deadlock fixed, the taxi rerun (`run_86b2e2e7`) still aborted at step 1. The filtered table (~3M rows, ~400 MB) was over the sandbox's 50 MB artifact limit. The sandbox dropped it silently, and the contract check then reported "no DataFrame artifact was produced", which was false. The model and critic spent all 5 attempts chasing that.
+
+### 1. What changed
+- **The sandbox describes an artifact it doesn't send.** A new `artifact_info` key (name, rows, columns, bytes, `stored`, `reason`) is in every result. `_extract_artifact` decides whether a frame is stored or only described.
+- **An oversized artifact satisfies the contract.** `validate_semantic_contract(..., artifact_info)` checks its columns from the metadata and sets `metadata["artifact_not_stored"]`. Producing nothing still fails.
+- **The step is accepted without registering the table.** The loop logs a warning and appends a `[pipeline] ... not stored ... Later steps will recompute it from df.` line to stdout, so the critic knows why. Later steps don't find the artifact and recompute from `df`, which is the fallback the codegen prompt already teaches.
+
+### 2. Test assertions changed
+- `tests/test_sandbox.py`: `RESULT_KEYS` now includes `artifact_info`.
+- New `tests/test_oversized_artifacts.py` (7 tests), including an end-to-end run past an oversized artifact.
+
+### 3. Results
+- `pytest tests/ -q`: 271 passed.
