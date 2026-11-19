@@ -14,6 +14,7 @@ import pandas as pd
 import pytest
 
 import agent.loop as loop
+from agent.parsing import parse_json_list
 from agent.artifact_store import ArtifactStore
 from agent.loop import MAX_PLAN_REVISIONS, run
 from data.generate_data import generate_sales_data
@@ -51,7 +52,7 @@ def test_dry_run_smoke(sales_df, tmp_path, monkeypatch) -> None:
 
 @pytest.mark.xfail(strict=True, reason="bug D1: unterminated character set in regex")
 def test_parse_json_list_numbered_fallback() -> None:
-    result = loop._parse_json_list("1. First question\n2) Second question")
+    result = parse_json_list("1. First question\n2) Second question")
     assert result == ["First question", "Second question"]
 
 

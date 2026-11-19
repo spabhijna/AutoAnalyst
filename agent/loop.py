@@ -26,7 +26,6 @@ Every accepted OR aborted step is logged to JSONL immediately.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import time
@@ -35,19 +34,25 @@ from typing import Any
 
 import pandas as pd
 
-from agent import config
+from agent import config, reporting
 from agent.artifact_store import ArtifactStore
-from agent.dates import last_quarter_window
 from agent.execution_engine import ExecutionEngine
 from agent.execution_graph import ExecutionGraph
 from agent.llm_client import call_llm
 from agent.observer import observe
+from agent.parsing import parse_critique_json, strip_markdown_fences
+from agent.planning import (
+    build_tasks,
+    do_plan,
+    do_replan,
+    task_id,
+    task_order,
+)
+from agent.schema import build_schema_summary
 from agent.logger import LogEntry, export_run_json, new_run_id, write_log_entry
 from agent.prompts import (
     codegen_prompt,
     critique_prompt,
-    plan_prompt,
-    replan_prompt,
     repair_prompt,
     summary_prompt,
 )
@@ -163,14 +168,14 @@ class AgentRun:
     @history.setter
     def history(self, entries: list[dict[str, Any]]) -> None:
         """Set debug history from the legacy dict shape used by older tests."""
-        self.tasks = _build_tasks(self.plan)
+        self.tasks = build_tasks(self.plan)
         question_to_task_id = {task.question: task.task_id for task in self.tasks}
         self.debug_history = [
             AttemptRecord(
                 task_id=str(
                     entry.get("task_id")
                     or question_to_task_id.get(str(entry.get("sub_question", "")))
-                    or _task_id(i)
+                    or task_id(i)
                 ),
                 sub_question=str(entry.get("sub_question", "")),
                 iteration=int(entry.get("iteration", 0)),
@@ -192,11 +197,11 @@ class AgentRun:
                     task=_task_for_attempt(self.tasks, attempt),
                     attempt_count=attempt.iteration + 1,
                     had_execution_errors=False,
-                    reason=_parse_critique_json(attempt.critique).get("reason", ""),
+                    reason=parse_critique_json(attempt.critique).get("reason", ""),
                 )
                 self.working_memory.add_finding(finding)
         self.final_results = self.working_memory.accepted_findings(
-            _task_order(self.tasks)
+            task_order(self.tasks)
         )
 
 
@@ -230,7 +235,7 @@ def run(
         Completed :class:`AgentRun` with full history and summary populated.
     """
     t_start = time.monotonic()
-    schema_summary = _build_schema_summary(df)
+    schema_summary = build_schema_summary(df)
     state = AgentRun(
         goal=goal,
         schema_summary=schema_summary,
@@ -239,10 +244,7 @@ def run(
     )
 
     logger.info("=== AgentRun start: run_id=%s ===", state.run_id)
-    print(f"\n{'=' * 60}")
-    print(f"  run_id : {state.run_id}")
-    print(f"  goal   : {goal}")
-    print(f"{'=' * 60}\n")
+    reporting.run_banner(state.run_id, goal)
 
     # ── Inject dry-run mode ─────────────────────────────────────────────────
     if dry_run:
@@ -277,10 +279,10 @@ def run(
 
         _m.call_llm = _dry_call
         logger.info("Dry-run mode enabled — using canned LLM responses")
-        print("  [dry-run] LLM calls return canned responses")
+        reporting.dry_run_notice()
 
     # ── PLAN ──────────────────────────────────────────────────────────────────
-    _do_plan(state, df)  # sets state.plan and state.tasks (with artifact declarations)
+    do_plan(state, df, call_llm, _log)  # sets state.plan and state.tasks (with artifact declarations)
 
     # ── Per-sub-question loop ─────────────────────────────────────────────────
     try:
@@ -295,7 +297,7 @@ def run(
                 )
             state.current_step = state.execution_graph.task_index(task.task_id)
             sub_question = task.question
-            _print_step_header(state.current_step, len(state.plan), sub_question)
+            reporting.step_header(state.current_step, len(state.plan), sub_question)
             _ensure_dependencies_available(state, task)
             task.status = "running"
 
@@ -309,9 +311,11 @@ def run(
                     )
                     state.current_step += 1
                 else:
-                    new_plan_tail = _do_replan(state, df)
+                    new_plan_tail = do_replan(
+                        state, df, call_llm, _build_working_memory_prompt(state)
+                    )
                     state.plan = state.plan[: state.current_step] + new_plan_tail
-                    state.tasks = _build_tasks(state.plan)
+                    state.tasks = build_tasks(state.plan)
                     state.execution_graph = ExecutionGraph.from_tasks(state.tasks)
                     state.plan_revisions += 1
                     logger.info(
@@ -339,17 +343,14 @@ def run(
                 extra={"abort_reason": exc.last_reason},
             ),
         )
-        print(f"\n{'=' * 60}")
-        print("  ✖  PIPELINE ABORTED")
-        print(f"{'=' * 60}")
-        print(f"  Step {state.current_step + 1}/{len(state.plan)} could not produce a")
-        print(f"  trustworthy answer after {state.max_retries_per_step} attempts.")
-        print(f"  Sub-question: {exc.sub_question}")
-        print(f"  Last critique: {exc.last_reason}")
-        print()
-        print("  Completed steps are in the JSONL log. Fix the data or")
-        print("  increase max_retries_per_step and re-run.")
-        print(f"  Log: runs/{state.run_id}.jsonl")
+        reporting.abort_banner(
+            state.current_step + 1,
+            len(state.plan),
+            state.max_retries_per_step,
+            exc.sub_question,
+            exc.last_reason,
+            state.run_id,
+        )
         # ── Write structured run JSON even on abort ───────────────────────────
         _finalize_run(state, t_start)
         return state
@@ -358,10 +359,7 @@ def run(
     state.summary = _do_summary(state)
 
     logger.info("=== AgentRun complete: run_id=%s ===", state.run_id)
-    print(f"\n{'=' * 60}")
-    print("  FINAL SUMMARY")
-    print(f"{'=' * 60}")
-    print(state.summary)
+    reporting.final_summary(state.summary)
 
     # ── Write structured run JSON ─────────────────────────────────────────────
     _finalize_run(state, t_start)
@@ -371,68 +369,6 @@ def run(
 # ---------------------------------------------------------------------------
 # Stage implementations
 # ---------------------------------------------------------------------------
-
-
-def _do_plan(state: AgentRun, df: pd.DataFrame) -> list[str]:
-    """Call the PLAN stage, parse the structured plan, and return sub-question strings."""
-    print("► PLAN stage …")
-    prompt = plan_prompt(state.goal, state.schema_summary)
-    raw = call_llm(prompt, role="plan")
-    task_specs = _parse_plan_json(raw)
-    questions = [spec["question"] for spec in task_specs]
-    state.plan = questions
-    state.tasks = _build_tasks(questions, task_specs)
-    state.execution_graph = ExecutionGraph.from_tasks(state.tasks)
-    _sync_task_capabilities(state)
-    print(f"  → {len(questions)} sub-questions generated")
-    for i, q in enumerate(questions, 1):
-        print(f"     {i}. {q}")
-    print()
-
-    _log(
-        state,
-        LogEntry(
-            run_id=state.run_id,
-            sub_question=state.goal,
-            iteration=0,
-            stage="plan",
-            action="plan_generated",
-            extra={"plan": questions},
-        ),
-    )
-    return questions
-
-
-def _do_replan(state: AgentRun, df: pd.DataFrame) -> list[str]:
-    """Re-plan from the current step forward, carrying completed findings.
-
-    Replanning emits a flat string array (no artifact declarations) since the
-    LLM doesn't know which artifacts have already been registered. Replanned
-    tasks will still have access to the ArtifactStore via the `artifacts` sandbox
-    global — the code-gen prompt lists all available artifacts regardless of
-    whether the task declared explicit consumes_artifacts.
-    """
-    print("► RE-PLAN stage …")
-    completed = _build_working_memory_prompt(state)
-    # Get the critique reason from the most recent debug attempt.
-    last_reason = ""
-    if state.debug_history:
-        last_reason = state.debug_history[-1].critique
-
-    prompt = replan_prompt(
-        state.goal,
-        state.schema_summary,
-        completed,
-        last_reason,
-    )
-    raw = call_llm(prompt, role="plan")
-    # Replan uses flat string array for simplicity
-    questions = _parse_json_list(raw)
-    print(f"  → {len(questions)} new sub-questions")
-    for i, q in enumerate(questions, 1):
-        print(f"     {i}. {q}")
-    print()
-    return questions
 
 
 def _run_question(
@@ -483,9 +419,9 @@ def _run_question(
         else [],
     )
     if deterministic_result is not None:
-        print("  ► DETERMINISTIC EXECUTE …")
+        reporting.deterministic_execute_start()
         sandbox_result = deterministic_result
-        print("    ✓ OK (deterministic)")
+        reporting.deterministic_execute_ok()
         reason = "Deterministic executor validated the reusable dataframe step."
         trust = "high"
         attempt = AttemptRecord(
@@ -524,7 +460,7 @@ def _run_question(
         )
         state.working_memory.add_finding(finding)
         state.final_results = state.working_memory.accepted_findings(
-            _task_order(state.tasks)
+            task_order(state.tasks)
         )
         if task.produces_artifact:
             extracted_df = sandbox_result.get("artifact")
@@ -543,7 +479,7 @@ def _run_question(
 
     for iteration in range(state.max_retries_per_step):
         # ── CODE-GEN ──────────────────────────────────────────────────────────
-        print(f"  ► CODE-GEN (iter {iteration}) …")
+        reporting.codegen_start(iteration)
         if iteration == 0:
             code = _do_codegen(state, sub_question, task_memory)
         else:
@@ -554,10 +490,10 @@ def _run_question(
                 previous_critique_reason or "",
                 task_memory,
             )
-        print(f"    {len(code)} chars generated")
+        reporting.codegen_done(len(code))
 
         # ── EXECUTE ───────────────────────────────────────────────────────────
-        print("  ► EXECUTE …")
+        reporting.execute_start()
         sandbox_result = run_sandboxed(
             code,
             df,
@@ -571,12 +507,7 @@ def _run_question(
             if sandbox_result["success"]
             else f"✗ {sandbox_result.get('error_type', 'ERROR')}"
         )
-        print(f"    {status}")
-        if sandbox_result.get("stdout"):
-            # Print first 3 lines of stdout for visibility
-            lines = sandbox_result["stdout"].strip().splitlines()[:3]
-            for ln in lines:
-                print(f"    | {ln}")
+        reporting.execute_status(status, sandbox_result.get("stdout"))
 
         error_category = sandbox_result.get("error_category", "none")
 
@@ -593,26 +524,22 @@ def _run_question(
                 sandbox_result["error_category"] = "logic_error"
                 error_category = "logic_error"
                 had_execution_errors = True
-                print(f"    ✗ Semantic error: {sandbox_result['error']}")
+                reporting.semantic_error(sandbox_result['error'])
 
         # ── OBSERVE ───────────────────────────────────────────────────────────
         # Deterministic data-quality checks on the live DataFrame BEFORE critique.
         # The observer computes actual null counts, duplicates, and outliers so
         # the critique LLM sees hard facts instead of speculating.
-        print("  ► OBSERVE …")
+        reporting.observe_start()
         obs_report = observe(
             df,
             sandbox_result,
             artifact_store_available_keys=state.artifact_store.available_keys(),
         )
-        print(
-            f"    ✓ nulls={obs_report.null_counts}, dupes={obs_report.duplicate_txn_ids}, "
-            f"neg_rev={obs_report.negative_revenue_rows}, "
-            f"outliers={len(obs_report.revenue_outliers_iqr)}"
-        )
+        reporting.observe_result(obs_report)
 
         # ── CRITIQUE ──────────────────────────────────────────────────────────
-        print("  ► CRITIQUE …")
+        reporting.critique_start()
         history_summary = _build_history_summary(state)
         critique_raw, critique_parsed = _do_critique(
             state,
@@ -638,10 +565,7 @@ def _run_question(
         elif error_category == "logic_error":
             task_memory.add_constraint(f"Address critique: {reason}")
 
-        trust_icon = "✓" if trust == "high" else "⚠"
-        print(f"    {trust_icon} trust={trust} action={action}")
-        print(f"    reason: {reason[:400]}")
-        print()
+        reporting.critique_result(trust, action, reason)
 
         # ── LOG this iteration ─────────────────────────────────────────────────
         attempt = AttemptRecord(
@@ -684,7 +608,7 @@ def _run_question(
             )
             state.working_memory.add_finding(finding)
             state.final_results = state.working_memory.accepted_findings(
-                _task_order(state.tasks)
+                task_order(state.tasks)
             )
 
             # ── Artifact registration ──────────────────────────────────────────
@@ -737,9 +661,7 @@ def _run_question(
         state.max_retries_per_step,
         sub_question[:60],
     )
-    print(
-        f"  ✖ max_retries_exceeded after {state.max_retries_per_step} attempts — aborting\n"
-    )
+    reporting.max_retries_exceeded(state.max_retries_per_step)
     raise PipelineAbortedError(
         sub_question=sub_question,
         last_reason=last_reason,
@@ -762,7 +684,7 @@ def _do_codegen(
         available_artifacts=state.artifact_store.describe(),
     )
     raw = call_llm(prompt, role="codegen")
-    return _strip_markdown_fences(raw)
+    return strip_markdown_fences(raw)
 
 
 def _do_repair(
@@ -784,7 +706,7 @@ def _do_repair(
         available_artifacts=state.artifact_store.describe(),
     )
     raw = call_llm(prompt, role="codegen")
-    return _strip_markdown_fences(raw)
+    return strip_markdown_fences(raw)
 
 
 def _do_critique(
@@ -816,7 +738,7 @@ def _do_critique(
         observation_text=observation_text,
     )
     raw = call_llm(prompt, role="critique")
-    parsed = _parse_critique_json(raw)
+    parsed = parse_critique_json(raw)
     return raw, parsed
 
 
@@ -848,7 +770,7 @@ def _do_summary(state: AgentRun) -> str:
     summary LLM. Intermediate failed iterations are internal loop state
     and must never appear in the summary narrative.
     """
-    print("► SUMMARY stage …")
+    reporting.summary_stage_start()
     findings = _final_results(state)
     prompt = summary_prompt(state.goal, findings)
     summary = call_llm(prompt, role="observe")
@@ -870,65 +792,6 @@ def _do_summary(state: AgentRun) -> str:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _build_schema_summary(df: pd.DataFrame) -> str:
-    """
-    Build a concise schema description for use in LLM prompts.
-
-    Includes column names, dtypes, null percentages, and 3 sample values.
-    Does NOT include full row data.
-
-    The "last quarter" date window is computed here in Python and injected as
-    concrete constants (LAST_QUARTER_START / LAST_QUARTER_END) so the LLM
-    never has to derive date boundaries itself — eliminating the entire class
-    of off-by-one critique loops that arise when the model re-derives the
-    window independently on every attempt.
-
-    Args:
-        df: The DataFrame to describe.
-
-    Returns:
-        Multi-line schema string.
-    """
-    lines = [f"Rows: {len(df):,}  |  Columns: {len(df.columns)}"]
-    for col in df.columns:
-        dtype = str(df[col].dtype)
-        null_pct = df[col].isna().mean() * 100
-        samples = df[col].dropna().head(3).tolist()
-        sample_str = ", ".join(repr(v) for v in samples)
-        lines.append(f"  • {col!r} ({dtype}) nulls={null_pct:.1f}% — e.g. {sample_str}")
-
-    # ── Pre-compute the "last quarter" window in Python so LLMs never have to ──
-    # "Last quarter" = the 3 most-recent complete calendar months in the data.
-    # Example: if max date is 2024-06-15, the window is 2024-04-01 → 2024-06-15.
-    window = last_quarter_window(df)
-    last_quarter_start = window[0].strftime("%Y-%m-%d") if window else None
-    last_quarter_end = window[1].strftime("%Y-%m-%d") if window else None
-
-    lines.append("")
-    if last_quarter_start and last_quarter_end:
-        lines.append(
-            "PRE-COMPUTED DATE WINDOW (do NOT re-derive these; copy them verbatim):\n"
-            f"  LAST_QUARTER_START = pd.Timestamp('{last_quarter_start}')  # inclusive\n"
-            f"  LAST_QUARTER_END   = pd.Timestamp('{last_quarter_end}')    # inclusive\n"
-            "\n"
-            "Use EXACTLY this filter when the goal mentions 'last quarter':\n"
-            "  mask = (pd.to_datetime(df['date']) >= LAST_QUARTER_START) & \\\n"
-            "         (pd.to_datetime(df['date']) <= LAST_QUARTER_END)\n"
-            "  quarter_df = df[mask]\n"
-            "\n"
-            "Do NOT use pd.Timestamp('today'), datetime.date objects, or\n"
-            "pd.DateOffset arithmetic in your code — the boundaries are already\n"
-            "computed above. Mismatching these constants is a logic error."
-        )
-    else:
-        lines.append(
-            'Time range note: "last quarter" means the most recent 3 calendar\n'
-            "months in the data. Use df['date'].max() as reference, filter back\n"
-            "2 full months to the first of that month, and do not use today's date."
-        )
-    return "\n".join(lines)
 
 
 def _build_history_summary(state: AgentRun) -> str:
@@ -975,69 +838,7 @@ def _final_results(state: AgentRun) -> list[dict[str, str]]:
     Returns:
         List of dicts with ``question``, ``answer``, and ``trust`` keys.
     """
-    return state.working_memory.summary_payload(_task_order(state.tasks))
-
-
-def _task_id(index: int) -> str:
-    """Return the stable task ID for a 0-based plan index."""
-    return f"step_{index + 1}"
-
-
-def _task_order(tasks: list[TaskNode]) -> list[str]:
-    """Return task IDs in current plan order."""
-    return [task.task_id for task in tasks]
-
-
-def _build_tasks(
-    plan: list[str], task_specs: list[dict] | None = None
-) -> list[TaskNode]:
-    """
-    Build task nodes from the ordered plan.
-
-    When *task_specs* is provided (structured plan format), each TaskNode is
-    populated with the planner-declared ``produces_artifact`` and
-    ``consumes_artifacts`` values. When *task_specs* is absent or incomplete
-    (flat string array / legacy format), these fields default to None / []
-    and the pipeline operates without artifact declarations.
-
-    The dependency graph (``depends_on``) still chains all prior tasks for
-    safety, regardless of artifact declarations.
-    """
-    tasks: list[TaskNode] = []
-    for index, question in enumerate(plan):
-        spec = task_specs[index] if task_specs and index < len(task_specs) else {}
-        produces = spec.get("produces_artifact") or None
-        consumes = spec.get("consumes_artifacts") or []
-        output_schema = spec.get("output_schema") or []
-        if isinstance(consumes, str):
-            consumes = [consumes]  # defensive: normalize stray strings
-        if isinstance(output_schema, str):
-            output_schema = [output_schema]
-        execution_fn = "llm_codegen"
-        capability = spec.get("capability") or None
-        tasks.append(
-            TaskNode(
-                task_id=_task_id(index),
-                question=question,
-                depends_on=[_task_id(i) for i in range(index)],
-                produces_artifact=produces,
-                consumes_artifacts=list(consumes),
-                capability=capability,
-                execution_fn=execution_fn,
-                output_schema=list(output_schema),
-            )
-        )
-    return tasks
-
-
-def _sync_task_capabilities(state: AgentRun) -> None:
-    """Resolve missing capability IDs using the registered capability set."""
-    for task in state.tasks:
-        if task.capability:
-            continue
-        capability = state.execution_engine.registry.resolve(task)
-        if capability is not None:
-            task.capability = capability.capability_id
+    return state.working_memory.summary_payload(task_order(state.tasks))
 
 
 def _task_for_attempt(tasks: list[TaskNode], attempt: AttemptRecord) -> TaskNode:
@@ -1146,7 +947,7 @@ def _build_working_memory_prompt(state: AgentRun) -> str:
     description so CODE-GEN sees both the accepted text answers AND which
     pre-validated DataFrames are available for reuse.
     """
-    memory_text = state.working_memory.as_prompt_text(_task_order(state.tasks))
+    memory_text = state.working_memory.as_prompt_text(task_order(state.tasks))
     artifact_text = state.artifact_store.describe()
     if artifact_text == "(no pre-computed artifacts available yet)":
         return memory_text
@@ -1160,250 +961,12 @@ def _coerce_trust(value: Any) -> str:
     return "unknown"
 
 
-def _parse_plan_json(raw: str) -> list[dict]:
-    """
-    Parse the plan LLM response into a list of task specification dicts.
-
-    Handles two formats:
-
-    **Structured format (new)** — a JSON array of task objects::
-
-        [
-          {"question": "...", "produces_artifact": "quarter_df", "consumes_artifacts": []},
-          {"question": "...", "produces_artifact": null,          "consumes_artifacts": ["quarter_df"]}
-        ]
-
-    **Legacy flat format (backward-compatible)** — a JSON array of strings::
-
-        ["Q1?", "Q2?", "Q3?"]
-
-    In the legacy case, each string is wrapped in a minimal dict with
-    ``produces_artifact=None`` and ``consumes_artifacts=[]`` so the rest
-    of the loop can treat both formats identically.
-
-    The function is intentionally defensive: if JSON parsing fails entirely,
-    it falls back to line-splitting (same as the old ``_parse_json_list``).
-
-    Args:
-        raw: Raw LLM response string.
-
-    Returns:
-        List of dicts, each with at least ``{"question": str}``.
-    """
-    # Try to extract the outermost JSON array from the raw string.
-    # Use greedy matching so nested [] (e.g. "consumes_artifacts": []) do not
-    # cause an early match — we need the full outer array.
-    match = re.search(r"\[.*\]", raw, re.DOTALL)
-    if match:
-        try:
-            parsed = json.loads(match.group(0))
-            if isinstance(parsed, list) and parsed:
-                # Structured format: list of dicts with "question" key
-                if all(
-                    isinstance(item, dict) and "question" in item for item in parsed
-                ):
-                    return [
-                        {
-                            "question": str(item["question"]).strip(),
-                            "capability": str(item.get("capability") or "").strip()
-                            or None,
-                            "produces_artifact": item.get("produces_artifact") or None,
-                            "consumes_artifacts": list(
-                                item.get("consumes_artifacts") or []
-                            ),
-                            "output_schema": list(item.get("output_schema") or []),
-                        }
-                        for item in parsed
-                        if str(item.get("question", "")).strip()
-                    ]
-                # Legacy flat format: list of strings
-                if all(isinstance(item, str) for item in parsed):
-                    return [
-                        {
-                            "question": q.strip(),
-                            "produces_artifact": None,
-                            "consumes_artifacts": [],
-                        }
-                        for q in parsed
-                        if q.strip()
-                    ]
-                # Mixed or partial: extract what we can
-                result = []
-                for item in parsed:
-                    if isinstance(item, dict) and item.get("question"):
-                        result.append(
-                            {
-                                "question": str(item["question"]).strip(),
-                                "capability": str(item.get("capability") or "").strip()
-                                or None,
-                                "produces_artifact": item.get("produces_artifact")
-                                or None,
-                                "consumes_artifacts": list(
-                                    item.get("consumes_artifacts") or []
-                                ),
-                                "output_schema": list(item.get("output_schema") or []),
-                            }
-                        )
-                    elif isinstance(item, str) and item.strip():
-                        result.append(
-                            {
-                                "question": item.strip(),
-                                "capability": None,
-                                "produces_artifact": None,
-                                "consumes_artifacts": [],
-                                "output_schema": [],
-                            }
-                        )
-                if result:
-                    return result
-        except json.JSONDecodeError:
-            pass
-
-    # Fallback: split on numbered lines (same as legacy _parse_json_list)
-    lines = []
-    for line in raw.splitlines():
-        line = re.sub(r"^\d+[\.)\-]\s*", "", line.strip())
-        if line and not line.startswith("{") and not line.startswith("["):
-            lines.append(
-                {
-                    "question": line,
-                    "capability": None,
-                    "produces_artifact": None,
-                    "consumes_artifacts": [],
-                    "output_schema": [],
-                }
-            )
-    if lines:
-        return lines
-    return [
-        {
-            "question": raw.strip(),
-            "capability": None,
-            "produces_artifact": None,
-            "consumes_artifacts": [],
-            "output_schema": [],
-        }
-    ]
-
-
-def _parse_json_list(raw: str) -> list[str]:
-    """
-    Parse a JSON array of strings from LLM output.
-
-    Handles extra prose or markdown fences around the JSON.
-    Falls back to splitting on newlines if JSON parsing fails.
-
-    Args:
-        raw: Raw LLM response string.
-
-    Returns:
-        List of question strings (non-empty).
-    """
-    # Try to extract a JSON array
-    match = re.search(r"\[.*?\]", raw, re.DOTALL)
-    if match:
-        try:
-            result = json.loads(match.group(0))
-            if isinstance(result, list) and all(isinstance(q, str) for q in result):
-                return [q.strip() for q in result if q.strip()]
-        except json.JSONDecodeError:
-            pass
-
-    # Fallback: numbered lines
-    lines = []
-    for line in raw.splitlines():
-        line = re.sub(r"^\d+[\.)\]\s*", "", line.strip())
-        if line:
-            lines.append(line)
-    return lines or [raw.strip()]
-
-
-def _parse_critique_json(raw: str) -> dict[str, Any]:
-    """
-    Parse the critique JSON response defensively.
-
-    Returns a safe default (revise_code) if parsing fails so the loop
-    never silently accepts a result due to a malformed critique response.
-
-    Args:
-        raw: Raw LLM response string expected to contain a JSON object.
-
-    Returns:
-        Dict with ``trust``, ``reason``, ``action`` keys.
-    """
-    _safe_default: dict[str, Any] = {
-        "trust": "low",
-        "reason": f"Critique response could not be parsed: {raw[:200]}",
-        "action": "revise_code",
-    }
-
-    # Strip markdown fences if present
-    cleaned = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
-
-    # Extract first JSON object
-    match = re.search(r"\{.*?\}", cleaned, re.DOTALL)
-    if not match:
-        return _safe_default
-
-    try:
-        parsed = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return _safe_default
-
-    # Validate required fields and allowed values
-    trust = parsed.get("trust", "low")
-    action = parsed.get("action", "revise_code")
-    reason = parsed.get("reason", "")
-
-    if trust not in ("high", "low"):
-        trust = "low"
-    if action not in ("accept", "revise_code", "revise_plan"):
-        action = "revise_code"
-
-    return {"trust": trust, "reason": str(reason), "action": action}
-
-
-def _strip_markdown_fences(code: str) -> str:
-    """
-    Remove markdown code fences that LLMs frequently wrap output in.
-
-    Handles all variants::
-
-        ```python\ncode\n```
-        ```\ncode\n```
-        ` ` `python\ncode\n` ` `   (no spaces in real output)
-
-    This is applied as a post-processing step after every CODE-GEN call
-    because prompt instructions alone are not reliable enough to prevent
-    models from adding fences, especially on the first attempt.
-
-    Args:
-        code: Raw LLM response string.
-
-    Returns:
-        Code string with leading/trailing markdown fences removed.
-    """
-    stripped = code.strip()
-    # Remove leading ```python or ``` fence
-    stripped = re.sub(r"^```(?:python|py)?\s*\n?", "", stripped)
-    # Remove trailing ``` fence
-    stripped = re.sub(r"\n?```\s*$", "", stripped)
-    return stripped.strip()
-
-
 def _log(state: AgentRun, entry: LogEntry) -> None:
     """Write a log entry, catching I/O errors so they don't crash the run."""
     try:
         write_log_entry(entry, state.log_dir)
     except OSError as exc:
         logger.error("Failed to write log entry for run_id=%s: %s", state.run_id, exc)
-
-
-def _print_step_header(step_idx: int, total: int, sub_question: str) -> None:
-    """Print a visible step header for console output."""
-    print(f"┌─ Step {step_idx + 1}/{total} {'─' * 50}")
-    print(f"│  {sub_question}")
-    print(f"└{'─' * 58}")
 
 
 def _finalize_run(state: AgentRun, t_start: float) -> None:
@@ -1443,4 +1006,4 @@ def _finalize_run(state: AgentRun, t_start: float) -> None:
         total_llm_calls=state.llm_call_count,
         log_dir=state.log_dir,
     )
-    print(f"\nRun JSON exported: {json_path}")
+    reporting.run_json_exported(json_path)

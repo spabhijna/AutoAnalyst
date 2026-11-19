@@ -20,14 +20,16 @@ import pytest
 from agent.loop import (
     AgentRun,
     _accepted_findings,
-    _build_schema_summary,
     _final_results,
-    _parse_critique_json,
-    _parse_json_list,
-    _parse_plan_json,
-    _strip_markdown_fences,
     run,
 )
+from agent.parsing import (
+    parse_critique_json,
+    parse_json_list,
+    parse_plan_json,
+    strip_markdown_fences,
+)
+from agent.schema import build_schema_summary
 from agent.prompts import codegen_prompt, critique_prompt, plan_prompt
 
 
@@ -549,7 +551,7 @@ class TestSummaryWorkingMemory:
 
 
 # ---------------------------------------------------------------------------
-# _parse_plan_json — structured plan parser
+# parse_plan_json — structured plan parser
 # ---------------------------------------------------------------------------
 
 
@@ -561,7 +563,7 @@ class TestParsePlanJson:
           {"question": "Revenue by region", "produces_artifact": "region_revenue", "consumes_artifacts": ["quarter_df"]},
           {"question": "Top region?", "produces_artifact": null, "consumes_artifacts": ["region_revenue"]}
         ]"""
-        specs = _parse_plan_json(raw)
+        specs = parse_plan_json(raw)
         assert len(specs) == 3
         assert specs[0]["question"] == "Filter to last quarter"
         assert specs[0]["produces_artifact"] == "quarter_df"
@@ -572,7 +574,7 @@ class TestParsePlanJson:
     def test_parses_legacy_flat_format(self) -> None:
         """Legacy flat string arrays are backward-compatible."""
         raw = '["Q1?", "Q2?", "Q3?"]'
-        specs = _parse_plan_json(raw)
+        specs = parse_plan_json(raw)
         assert len(specs) == 3
         assert specs[0]["question"] == "Q1?"
         assert specs[0]["produces_artifact"] is None
@@ -631,13 +633,13 @@ class TestParsePlanJson:
         raw = (
             '[{"question": "Q?", "produces_artifact": null, "consumes_artifacts": []}]'
         )
-        specs = _parse_plan_json(raw)
+        specs = parse_plan_json(raw)
         assert specs[0]["produces_artifact"] is None
 
     def test_malformed_json_falls_back_gracefully(self) -> None:
         """Non-JSON input falls back to line-splitting without crashing."""
         raw = "1. What is revenue?\n2. Which region is top?"
-        specs = _parse_plan_json(raw)
+        specs = parse_plan_json(raw)
         assert len(specs) >= 1
         assert all("question" in s for s in specs)
 
@@ -651,7 +653,7 @@ class TestHelpers:
     def test_build_schema_summary_contains_columns(
         self, small_df: pd.DataFrame
     ) -> None:
-        summary = _build_schema_summary(small_df)
+        summary = build_schema_summary(small_df)
         assert "region" in summary
         assert "revenue" in summary
         assert "date" in summary
@@ -659,22 +661,22 @@ class TestHelpers:
 
     def test_build_schema_summary_shows_null_pct(self) -> None:
         df = pd.DataFrame({"x": [1.0, None, 3.0]})
-        summary = _build_schema_summary(df)
+        summary = build_schema_summary(df)
         assert "33.3%" in summary or "nulls=" in summary
 
     def test_parse_json_list_clean(self) -> None:
         raw = '["What is X?", "How does Y compare?"]'
-        result = _parse_json_list(raw)
+        result = parse_json_list(raw)
         assert result == ["What is X?", "How does Y compare?"]
 
     def test_parse_json_list_with_prose(self) -> None:
         raw = 'Here are the questions:\n["Q1?", "Q2?"]'
-        result = _parse_json_list(raw)
+        result = parse_json_list(raw)
         assert "Q1?" in result
 
     def test_parse_critique_json_valid(self) -> None:
         raw = '{"trust": "high", "reason": "Looks good.", "action": "accept"}'
-        parsed = _parse_critique_json(raw)
+        parsed = parse_critique_json(raw)
         assert parsed["trust"] == "high"
         assert parsed["action"] == "accept"
 
@@ -682,23 +684,23 @@ class TestHelpers:
         raw = (
             '```json\n{"trust": "low", "reason": "Bad.", "action": "revise_code"}\n```'
         )
-        parsed = _parse_critique_json(raw)
+        parsed = parse_critique_json(raw)
         assert parsed["action"] == "revise_code"
 
     def test_parse_critique_json_malformed_defaults_to_revise(self) -> None:
         """Malformed critique JSON must never silently accept."""
-        parsed = _parse_critique_json("this is not json at all")
+        parsed = parse_critique_json("this is not json at all")
         assert parsed["action"] == "revise_code"
         assert parsed["trust"] == "low"
 
     def test_parse_critique_json_invalid_action_clamped(self) -> None:
         raw = '{"trust": "high", "reason": "ok", "action": "something_weird"}'
-        parsed = _parse_critique_json(raw)
+        parsed = parse_critique_json(raw)
         assert parsed["action"] == "revise_code"
 
     def test_parse_critique_json_invalid_trust_clamped(self) -> None:
         raw = '{"trust": "medium", "reason": "ok", "action": "accept"}'
-        parsed = _parse_critique_json(raw)
+        parsed = parse_critique_json(raw)
         assert parsed["trust"] == "low"
 
 
@@ -788,23 +790,23 @@ class TestPromptTemplates:
 class TestMarkdownFenceStripping:
     def test_strips_python_fence(self) -> None:
         raw = "```python\nresult = df['revenue'].sum()\n```"
-        assert _strip_markdown_fences(raw) == "result = df['revenue'].sum()"
+        assert strip_markdown_fences(raw) == "result = df['revenue'].sum()"
 
     def test_strips_plain_fence(self) -> None:
         raw = "```\nresult = 42\n```"
-        assert _strip_markdown_fences(raw) == "result = 42"
+        assert strip_markdown_fences(raw) == "result = 42"
 
     def test_strips_py_fence(self) -> None:
         raw = "```py\nresult = df.shape\n```"
-        assert _strip_markdown_fences(raw) == "result = df.shape"
+        assert strip_markdown_fences(raw) == "result = df.shape"
 
     def test_no_fences_unchanged(self) -> None:
         code = "result = df.groupby('region')['revenue'].sum()"
-        assert _strip_markdown_fences(code) == code
+        assert strip_markdown_fences(code) == code
 
     def test_multiline_code_preserved(self) -> None:
         raw = "```python\ntotal = df['revenue'].sum()\nresult = round(total, 2)\n```"
-        stripped = _strip_markdown_fences(raw)
+        stripped = strip_markdown_fences(raw)
         assert "total = df['revenue'].sum()" in stripped
         assert "result = round(total, 2)" in stripped
         assert "```" not in stripped

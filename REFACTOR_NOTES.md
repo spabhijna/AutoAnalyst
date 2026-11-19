@@ -70,3 +70,38 @@ None changed. Removed whole files only: `test_runtime.py` (the runtime is gone) 
 ### Phase 1 review follow-ups
 - Restored the `plan_revisions` assertion (see Phase 0 §3 correction) and added the D8 xfail test.
 - Reminder for Phase 4: the D5 fix must update `tests/test_loop.py::TestRevisePlan::test_plan_revision_cap` ("After MAX_PLAN_REVISIONS, revise_plan requests are ignored"), whose behaviour D5 deliberately changes.
+
+## Phase 2 — Split `loop.py` (moves only)
+
+### 1. What changed
+- New `agent/parsing.py`: `parse_plan_json`, `parse_json_list`, `parse_critique_json`, `strip_markdown_fences` (underscore dropped, bodies unchanged except the task-dict collapse below), plus private `_task_spec` / `_normalise_task_spec`.
+- New `agent/schema.py`: `build_schema_summary`.
+- New `agent/planning.py`: `task_id`, `task_order`, `build_tasks`, `sync_task_capabilities`, `do_plan`, `do_replan`.
+- New `agent/reporting.py`: every console `print` (run banner, dry-run notice, step header, plan/replan lines, each stage line, abort banner, final summary, retries exceeded, run-JSON exported). `loop.py` has no `print` left. Output verified byte-identical: normalised stdout of `python main.py --dry-run` is identical before and after (diff, log lines and run ids excluded).
+- `agent/loop.py`: 1446 → 1009 lines; calls the new modules.
+- Tests: `tests/test_loop.py` and `tests/test_regressions.py` now import from the new modules (no aliases in `loop.py`, none in the tests).
+
+### 2. Deviations from the plan
+- **Moved functions take their dependencies as arguments.** Tests patch `agent.loop.call_llm` and the dry-run replaces `loop.call_llm` at run time, so `planning.py` calling its own imported `call_llm` would silently bypass both. `loop.py` therefore passes `call_llm` (looked up at call time) and `_log`:
+  - `do_plan(state, df, llm, log)`
+  - `do_replan(state, df, llm, completed)`, where `completed` is `_build_working_memory_prompt(state)` computed by the caller.
+  
+  This also avoids a `planning` ↔ `loop` import cycle, and Phase 3's "pass the llm callable through the stage functions" builds on it. The `df` parameter is unused in both (as before); kept to keep the move faithful.
+- `task_id`, `task_order`, `build_tasks`, `sync_task_capabilities` are public (no underscore) because they are now cross-module. The plan only named the parsers.
+- Public names follow the Phase 2 text (`parse_plan_json`, …), not the Target-shape list (`parse_plan`, `strip_fences`).
+- Task-dict collapse (`_normalise_task_spec`) preserves the plan's three return paths. Two edge differences:
+  - legacy flat items now carry `capability` / `output_schema` keys (None / `[]`); `build_tasks` read them via `.get`, so behaviour is the same;
+  - a *mixed* list item `{"question": "   "}` (whitespace-only) is now dropped; before it produced a spec with an empty question.
+
+### 3. Test assertions changed
+None. Only import lines and the names used in call sites changed in `test_loop.py` (`_parse_json_list` → `parse_json_list`, etc.) and in `test_regressions.py`.
+
+### 4. Results
+- `pytest tests/ -q`: `206 passed, 7 xfailed`.
+- `python main.py --dry-run` and `--dry-run --corrupt` both finish (5 steps).
+- `agent/loop.py`: 1009 lines (target is ≤450 after Phase 3; `_run_question` is still ~340 lines).
+
+### 5. Noticed, left alone
+- `_do_summary`, `_do_codegen`, `_do_repair`, `_do_critique` still call `call_llm` directly in `loop.py`; Phase 3 threads the callable through.
+- `_log`, `_finalize_run` (with its hard-coded `"clean"` label, D7) and `_finalize_run`'s Groq model names stay in `loop.py`.
+- `ruff --select F` also flags unused imports in tests (`MagicMock`, `call`, `ObservationReport`, numpy in `test_sandbox.py`) and F841 in `prompts.py` / `sandbox.py`; untouched (out of scope).
