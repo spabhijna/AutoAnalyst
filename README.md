@@ -1,99 +1,175 @@
 # AutoAnalyst — Self-Correcting Data Pipeline Agent
 
-A portfolio project demonstrating an agentic data analysis loop with
-**independent LLM-based self-critique** and **deterministic semantic validation**.
-
-The agent analyses a sales dataset by running a structured loop:
+An agentic data-analysis loop with **independent LLM critique**, **deterministic
+capabilities** and **typed, validated artifacts**. Give it a goal and a sales dataset; it plans
+the analysis as a dependency graph, computes what it can deterministically, has an LLM write
+(and a *separate* LLM audit) code for the rest, and summarises only what was accepted.
 
 ```
-PLAN → CODE-GEN → EXECUTE → OBSERVE → CRITIQUE → (revise or advance)
+PLAN → for each task: [deterministic capability | CODE-GEN → EXECUTE → OBSERVE → CRITIQUE] → ACCEPT → SUMMARY
 ```
 
-A separate LLM call (using a different model) critiques each result before
-the pipeline advances, catching errors that the generator would silently miss
-(duplicate-inflated aggregations, null-dropped means, logical inconsistencies).
+- Registered **capabilities** (filter to the last quarter, revenue by region, top region,
+  monthly trend, revenue share, ...) run without any LLM call.
+- Everything else is generated pandas code, run in a process-isolated sandbox, checked against
+  the task's declared output contract, annotated with deterministic data-quality facts
+  (nulls, duplicate IDs, outliers) and audited by an independent critique before it is accepted.
+- Every attempt is logged (`runs/<run_id>.jsonl` and `runs/<run_id>.json`); the run aborts
+  rather than force-accepting a result nobody trusts.
 
-It also features a robust deterministic execution engine and a resilient runtime (`AnalysisRuntime`) that safely encapsulates state, ensuring robust analysis.
+For how the pieces fit together read [ARCHITECTURE.md](ARCHITECTURE.md); for current status,
+[PROGRESS.md](PROGRESS.md).
 
 ---
 
-## Quick Start
+## Quick start
+
+Requires Python 3.12+.
 
 ```bash
-# 1. Clone and enter the repo
 git clone <your-repo-url>
 cd AutoAnalyst
 
-# 2. Install dependencies (use your package manager of choice)
-pip install -r requirements.txt
-
-# 3. (Optional) Set up API keys for a live run
-cp .env.example .env
-# Edit .env and add your GROQ_API_KEY and GEMINI_API_KEY
-
-# 4. Run the demo (requires API keys)
-python run_demo.py
-
-# 5. Or run the agent in dry-run mode (no API keys needed)
-python run_demo.py --dry-run
-
-# 6. Run tests
-pytest tests/ -v
+# Install (pick one)
+uv sync                       # creates .venv from pyproject.toml / uv.lock (includes pytest)
+# or
+pip install -e ".[dev]"
 ```
+
+Run without any API keys (canned LLM responses; the plan is executed deterministically):
+
+```bash
+python main.py --dry-run
+```
+
+Run for real (needs at least a Groq key, see below):
+
+```bash
+cp .env.example .env          # then fill in your keys
+python main.py
+```
+
+Run the tests (no network, no credentials: LLM calls are mocked):
+
+```bash
+pytest tests/ -q
+```
+
+With `uv sync`, prefix commands with `uv run` (for example `uv run python main.py --dry-run`)
+or activate `.venv`.
+
+### CLI
+
+`main.py` is the only CLI (`python run_demo.py ...` is a thin wrapper around it).
+
+| Flag | Meaning |
+|---|---|
+| `--goal "..."` | Analytical goal (default: revenue trend by region over the last quarter). |
+| `--rows N` | Rows of synthetic data to generate (default 700). |
+| `--seed N` | Random seed for the data generator (default 42). |
+| `--corrupt` | Inject known defects (duplicates, nulls, outliers, ...) and label the run `corrupted`. |
+| `--retries N` | CODE-GEN attempts per task (overrides `MAX_RETRIES`). |
+| `--dry-run` | Use canned LLM responses instead of calling providers. |
+
+```bash
+python main.py --dry-run --corrupt
+python main.py --rows 1000 --retries 3 --goal "Which product category drove the most revenue?"
+```
+
+### Reading a run
+
+Each run writes `runs/<run_id>.jsonl` (one line per step) and `runs/<run_id>.json` (summary:
+goal, dataset label, models, LLM call count, full history). Pretty-print the JSON:
+
+```bash
+python -m agent.log_viewer runs/<run_id>.json
+```
+
+### Using it from code
+
+```python
+from agent.loop import run
+from data.generate_data import generate_sales_data
+
+df = generate_sales_data(n_rows=700, seed=42)
+state = run("Explain revenue by region over the last quarter.", df, dry_run=True)
+
+print(state.summary)
+for finding in state.final_results:      # accepted findings, in plan order
+    print(finding.question, "->", finding.answer)
+```
+
+`run(..., llm=my_callable)` swaps the LLM: any callable `(prompt, role) -> str` works.
+Evaluate the observer against a corruption manifest with `agent.evaluator.evaluate`.
 
 ---
 
-## Project Structure
+## Configuration
+
+Set in the environment or in `.env` (see `.env.example`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GROQ_API_KEY` | none | Primary provider for every stage. |
+| `CEREBRAS_API_KEY` | none | Fallback for codegen and critique. |
+| `OPENROUTER_API_KEY` | none | Fallback for plan, codegen and summary. |
+| `GEMINI_API_KEY` | none | Last-resort fallback for critique. |
+| `MAX_RETRIES` | `5` | CODE-GEN attempts per task. |
+| `SANDBOX_TIMEOUT_SECONDS` | `30` | Timeout per sandbox execution. |
+| `LOG_DIR` | `runs` | Where logs are written. |
+
+Provider chain per stage (each level is retried once, then the next is tried; if all fail,
+`LLMUnavailableError` is raised, errors are never swallowed):
+
+| Stage | Chain |
+|---|---|
+| plan | Groq → OpenRouter |
+| codegen | Groq → Cerebras → OpenRouter |
+| critique | Groq → Cerebras → Gemini |
+| summary | Groq → OpenRouter |
+
+Models live in `agent/config.py` (`openai/gpt-oss-120b` on Groq and Cerebras, free OpenRouter
+models, `gemini-2.5-flash`).
+
+---
+
+## Project structure
 
 ```
 AutoAnalyst/
-├── agent/                    # Core agent package
-│   ├── config.py             # Model names, retry caps, constants
-│   ├── llm_client.py         # call_llm() — single gateway for all LLM calls
-│   ├── loop.py               # Main agent loop (PLAN → CODE-GEN → EXECUTE → CRITIQUE)
-│   ├── runtime.py            # AnalysisRuntime and ArtifactRegistry for persistent state
-│   ├── sandbox.py            # Isolated execution sandbox
-│   ├── execution_engine.py   # Deterministic capability-driven execution engine
-│   ├── validator.py          # Semantic contract and schema validation
-│   └── prompts.py            # LLM prompts
-├── data/
-│   └── generate_data.py      # Synthetic sales data + corruption injector
-├── tests/                    # Comprehensive unit tests
-├── runs/                     # JSONL run logs
-├── .env.example              # API key template (no real values)
-├── run_demo.py               # Main demo script
-└── PROGRESS.md               # Source of truth for project state
+├── main.py                   # the CLI
+├── run_demo.py               # thin wrapper around main.main()
+├── agent/
+│   ├── loop.py               # orchestration: AgentRun, run(), accept path, codegen loop
+│   ├── stages.py             # CODE-GEN / REPAIR / CRITIQUE / SUMMARY stages
+│   ├── planning.py           # plan / replan, task building
+│   ├── parsing.py            # defensive parsers for LLM output
+│   ├── schema.py, dates.py   # dataset summary for prompts, "last quarter" window
+│   ├── findings.py           # attempts → findings, memory views for prompts
+│   ├── scheduling.py         # ready-task selection, dependency checks, abort marking
+│   ├── errors.py             # PipelineAbortedError
+│   ├── reporting.py          # all console output
+│   ├── run_export.py         # JSONL log entries, run JSON
+│   ├── logger.py, log_viewer.py
+│   ├── state.py              # TaskNode, AttemptRecord, Finding, WorkingMemory, ...
+│   ├── execution_graph.py    # dependency-aware scheduling
+│   ├── capabilities.py       # capability registry + deterministic executors
+│   ├── execution_engine.py   # capability dispatch + validation
+│   ├── validator.py          # output and semantic contracts
+│   ├── artifact_store.py     # immutable typed artifacts
+│   ├── sandbox.py            # process-isolated code execution
+│   ├── observer.py           # deterministic data-quality facts
+│   ├── environment.py        # sandbox capability manifest
+│   ├── prompts.py            # every prompt template
+│   ├── llm_client.py         # call_llm(): provider chains
+│   ├── config.py             # models, constants, env overrides
+│   ├── dry_run.py            # canned LLM for --dry-run
+│   └── evaluator.py          # observer vs. corruption manifest
+├── data/generate_data.py     # synthetic sales data + corruption injector
+├── tests/                    # pytest suite (LLM and sandbox boundaries mocked)
+├── docs/HISTORY.md           # historical development log
+├── ARCHITECTURE.md           # architecture and engineering rules
+├── PROGRESS.md               # current status and next steps
+├── .env.example              # key template (no real values)
+└── pyproject.toml            # dependencies (single source of truth)
 ```
-
----
-
-## LLM Architecture
-
-| Stage     | Primary Model           | Fallback |
-|-----------|-------------------------|----------|
-| plan      | Groq llama-3.3-70b      | Gemini   |
-| codegen   | Groq llama-3.3-70b      | Gemini   |
-| observe   | Groq llama-3.3-70b      | Gemini   |
-| critique  | openai/gpt-oss-120b     | Gemini   |
-
-Groq is retried once (with backoff) before falling back. If both fail,
-`LLMUnavailableError` is raised — it never silently swallows provider errors.
-
----
-
-## Required API Keys
-
-| Variable | Where to get it |
-|---|---|
-| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com) — free tier available |
-| `GEMINI_API_KEY` | [aistudio.google.com](https://aistudio.google.com) — free tier available |
-
----
-
-## Running Tests
-
-```bash
-pytest tests/ -v
-```
-
-All tests mock Groq and Gemini — no live API calls, no credentials required. The test suite extensively verifies runtime execution, capabilities, sandbox isolation, semantic validations, and the core analytical loop.

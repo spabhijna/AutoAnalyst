@@ -247,3 +247,50 @@ None. Only import lines and the names used in call sites changed in `test_loop.p
 - `agent/loop.py` still imports `call_llm` and `run_sandboxed` at module level on purpose: tests (and `run()`) resolve them there.
 - `README`, `ARCHITECTURE`, `PROGRESS` still describe the old layout (`runtime.py`, `executors.py`, the old loop); Phase 6.
 - `run_demo.py` is still a near-duplicate of `main.py` (Phase 6).
+
+## Phase 5 review follow-up (`75ee0d9`, "drive accepted-findings test through run()")
+- `test_accepted_findings_strips_intermediate_failures` now goes through `run()` with a mocked LLM and sandbox: revise_code twice (sandbox results `WRONG-0`, `WRONG-1`), accept on iteration 2 (`{'East': 100}`). It asserts three attempts in `debug_history` (`revise_code`, `revise_code`, `accept`), exactly one finding with `source_iteration == 2` and `answer == "{'East': 100}"`, that `final_results(state)` never mentions `WRONG`, and that `attempt_for_finding` returns the iteration-2 attempt. It does not duplicate `test_summary_llm_sees_only_accepted_entry` (one retry, asserts on the summary prompt text), so it was rewritten, not deleted. `test_accepted_findings_preserves_plan_order` unchanged.
+
+## Phase 6 — Entry points, packaging, docs
+
+### 1. What changed
+- **Entry points:** `main.py` is the only CLI. `run_demo.py` is now a three-line wrapper (`from main import main` plus an `if __name__ == "__main__":` guard calling `main()`). The guard is required, not cosmetic: the sandbox uses multiprocessing `spawn`, which re-imports `__main__` in every child, so an unguarded `main()` would re-run the whole pipeline recursively.
+- **Packaging:** `pyproject.toml` is the single source of dependencies; `requirements.txt` is **deleted** (the README points at `uv sync` / `pip install -e ".[dev]"`). `uv.lock` regenerated with `uv lock`. Decision per dependency, from the actual imports:
+  - kept/added as runtime: `groq`, `cerebras-cloud-sdk`, `google-genai` (all three imported lazily by `agent/llm_client.py`), `python-dotenv`, `pandas`, `numpy` (`numpy` was missing, `cerebras-cloud-sdk` was missing).
+  - not added: an OpenAI-compatible client (OpenRouter is called with stdlib `urllib`), `mistralai` (never imported; only a model name on OpenRouter), `pydantic-settings` (removed, unused).
+  - the three provider SDKs are plain runtime dependencies, not a `providers` extra: live runs are the default use of the project and `--dry-run` works either way.
+  - dev: `pytest>=9.0` in both `[project.optional-dependencies] dev` (for pip) and `[dependency-groups] dev` (for uv, installed by default with `uv sync`). `pytest-mock` dropped: no test uses `mocker`. `pytest` was a runtime dependency (`>=9.1.0`); now dev-only.
+  - added `[tool.hatch.build.targets.wheel] packages = ["agent", "data"]` (hatchling could not infer the package from the project name, so `pip install -e .` needed it) and `[tool.pytest.ini_options] testpaths = ["tests"]`.
+- **Docs:** `README.md` and `ARCHITECTURE.md` rewritten against the current code (module map with findings, stages, scheduling, errors, run_export, dates, parsing, planning, schema, reporting, dry_run; provider chain and models from `llm_client` / `config`; `run(llm=...)` injection; artifact contract; env vars). `PROGRESS.md` moved to `docs/HISTORY.md` (history kept verbatim under a note saying it is historical and its file names may no longer exist) and `PROGRESS.md` is now a 58-line status page. `agent/__init__.py` docstring rewritten.
+- `REFACTOR_PLAN.md` (untracked) and `REFACTOR_NOTES.md` left where they are.
+
+### 2. Deviations from the plan
+- `pytest-mock` removed from dev dependencies and the pytest floor lowered from 9.1.0 to 9.0 (the installed versions resolve to 9.2.0).
+- `requirements.txt` deleted rather than regenerated (the plan allowed either).
+- `master_prompt.md` (untracked in the checkout, an old prompt for coding agents that tells them to read `PROGRESS.md` as the source of truth) was left untouched; it still reads correctly since `PROGRESS.md` exists.
+
+### 3. Test assertions changed
+None in this phase (no test files touched; the follow-up commit above is separate).
+
+### 4. Verification of the documented commands (all run from the repo unless noted)
+- `python main.py --dry-run`, `python main.py --dry-run --corrupt`, `python run_demo.py --dry-run`, `python main.py --dry-run --rows 1000 --retries 3 --seed 7 --goal "..."`: each finishes with "Total steps executed: 5".
+- `python -m agent.log_viewer runs/<id>.json`: prints the trace.
+- The README "from code" snippet and the `run(..., llm=dry_run_llm)` call: run, 5 findings / 2 LLM calls.
+- `pytest tests/ -q`: 254 passed.
+- `pip install -e ".[dev]"`: installed into a fresh venv; `import agent, groq, cerebras.cloud.sdk, google.genai, dotenv, pandas, numpy, pytest` succeeded.
+- `uv sync` + `uv run pytest tests/ -q` + `uv run python main.py --dry-run` + `uv run python -m agent.log_viewer ...`: run in a scratch copy of the repo (so the real `.venv` was not touched): 254 passed, dry-run finished.
+- **Not run:** `cp .env.example .env` (would overwrite an existing `.env`) and a live `python main.py` (needs API keys). Both are stated as such in the docs' prerequisites.
+
+### 5. Noticed, left alone
+- `data/generate_data.py` builds `transaction_id` with `uuid4`, so `--seed` does not make the dataset fully reproducible (also listed under "Known limitations" in `PROGRESS.md`).
+- `agent/llm_client.py`'s module docstring still says the codegen chain starts with "Groq (Codestral)"; `config.py` actually uses `openai/gpt-oss-120b` there. The docs describe the config; provider code is out of scope.
+- `ruff` F841 `last_line` in `agent/sandbox.py`; test files still have a few unused imports.
+- Live LLM behaviour is not measured here.
+
+## "Done when" checklist (plan §5)
+
+1. **`pytest tests/ -q` passes with no `xfail` markers left from Phase 0.** Yes: `254 passed`; `grep -rn "mark.xfail\|pytest.xfail" tests` finds 0 matches (the only remaining word "xfail" is in `tests/test_regressions.py`'s module docstring, describing history).
+2. **`python main.py --dry-run` and `python main.py --dry-run --corrupt` both finish.** Yes: both print "Total steps executed: 5"; run JSON shows `dataset` = `clean` / `corrupted` and `total_llm_calls` = 2.
+3. **`loop.py` ≤ 600 lines; no function in `agent/` over 80 lines (exception: `prompts.py`, `sandbox.py`); `runtime.py` and `executors.py` gone.** Yes: `agent/loop.py` is 589 lines. An AST scan of `agent/*.py` finds only `prompts.repair_prompt` (85), `prompts.critique_prompt` (167), `sandbox._worker` (147) and `sandbox.run_sandboxed` (138), which are the exempted modules. `ls agent/runtime.py agent/executors.py` reports both missing.
+4. **`grep -rn 'step_[0-9]' agent/` finds only `_task_id`-style generation.** It finds nothing at all (IDs are generated as `f"step_{index + 1}"` in `planning.task_id`, and `apply_replan` parses them with a regex): no special-casing.
+5. **`REFACTOR_NOTES.md` lists every deviation and every changed test assertion, with the reason.** Yes: each phase section (0–6, plus the review follow-ups) has "Deviations from the plan" and "Test assertions changed". Assertion changes are in Phase 0 (restored `plan_revisions` assertion), Phase 3 (two engine tests), Phase 4 (`test_plan_revision_cap`, xfail removals), Phase 5 (`state.history` → `debug_history`, rewritten summary-memory tests, replaced D1 test, patch-target strings) and the Phase 5 follow-up (rewritten strip-failures test); Phases 1, 2 and 6 changed none.
