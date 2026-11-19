@@ -437,8 +437,8 @@ STEP 2B — GOAL SCOPE AND DEPENDENCY CONSISTENCY:
 
   If a previous accepted finding directly establishes a parent value, this
   result must be consistent with it. Example: if accepted total revenue by
-  region is {{"West": 46384.76, "South": 45317.93}}, then a later "top region"
-  answer of "South" is a genuine contradiction and MUST revise_code.
+  group is {{"A": 1200.00, "B": 950.00}}, then a later "top group"
+  answer of "B" is a genuine contradiction and MUST revise_code.
 
 STEP 3 — DATA QUALITY CHECKS:
   If a "DATA-QUALITY OBSERVATION" block is present above, those null/duplicate/outlier

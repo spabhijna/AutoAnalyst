@@ -43,6 +43,31 @@ class CapabilityValidator:
                 reasons=[f"Missing required artifacts: {', '.join(missing)}"],
                 metadata={"required_artifacts": list(capability.required_artifacts)},
             )
+
+        # The capability reads its input_schema columns from its first required
+        # artifact, or from the input DataFrame when it requires none.
+        source_name = (
+            capability.required_artifacts[0] if capability.required_artifacts else "df"
+        )
+        source = (
+            context.artifacts[source_name]
+            if capability.required_artifacts
+            else context.df
+        )
+        missing_columns = [
+            column for column in capability.input_schema if column not in source.columns
+        ]
+        if missing_columns:
+            return ValidationResult(
+                success=False,
+                reasons=[
+                    f"{capability.capability_id} needs columns {missing_columns} "
+                    f"that are missing from {source_name}"
+                ],
+                expected_schema=list(capability.input_schema),
+                actual_schema=list(source.columns),
+                metadata={"required_artifacts": list(capability.required_artifacts)},
+            )
         return ValidationResult(
             success=True,
             metadata={"required_artifacts": list(capability.required_artifacts)},

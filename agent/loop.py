@@ -35,6 +35,7 @@ import pandas as pd
 
 from agent import config, reporting
 from agent.artifact_store import ArtifactStore
+from agent.dates import last_quarter_constants
 from agent.dry_run import dry_run_llm
 from agent.errors import PipelineAbortedError
 from agent.environment import EnvironmentManifest
@@ -469,13 +470,15 @@ def _run_codegen_loop(state: AgentRun, task: TaskNode, df: pd.DataFrame) -> bool
     had_execution_errors = False
     task_memory = state.task_memories[task.task_id]
     artifact_namespace = _artifact_namespace(state, task)
+    # The prompts tell the model to use these names, so define them in the sandbox.
+    constants = last_quarter_constants(df)
 
     for iteration in range(state.max_retries_per_step):
         code = generate_code(
             state, task, task_memory, iteration, previous_code, previous_reason
         )
         sandbox_result, error_category = _execute_and_validate(
-            state, task, df, code, artifact_namespace
+            state, task, df, code, artifact_namespace, constants
         )
         had_execution_errors = had_execution_errors or not sandbox_result["success"]
         critique_raw, trust, action, reason, error_category = observe_and_critique(
@@ -531,6 +534,7 @@ def _execute_and_validate(
     df: pd.DataFrame,
     code: str,
     artifact_namespace: dict[str, pd.DataFrame],
+    constants: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Run *code* in the sandbox, then apply the task's semantic contract.
 
@@ -544,6 +548,7 @@ def _execute_and_validate(
         artifacts=artifact_namespace,
         extract_artifact=task.produces_artifact,
         timeout_seconds=config.SANDBOX_TIMEOUT_SECONDS,
+        constants=constants,
     )
     status = (
         "✓ OK"

@@ -172,6 +172,7 @@ def _worker(
     result_queue: "multiprocessing.Queue[dict[str, Any]]",
     artifacts_pickle: bytes | None = None,
     extract_artifact: str | None = None,
+    constants: dict[str, Any] | None = None,
 ) -> None:
     """
     Execute *code* in a restricted namespace and push the result dict onto
@@ -226,6 +227,11 @@ def _worker(
         "np": np,
         "artifacts": artifacts,  # pre-validated DataFrames from ArtifactStore
     }
+    # Read-only constants the prompts reference by name (e.g. LAST_QUARTER_START).
+    # They can never replace the core sandbox globals above.
+    for name, value in (constants or {}).items():
+        if name not in global_ns:
+            global_ns[name] = value
     local_ns: dict[str, Any] = {}
 
     # Capture stdout from agent code
@@ -351,6 +357,7 @@ def run_sandboxed(
     artifacts: dict[str, pd.DataFrame] | None = None,
     extract_artifact: str | None = None,
     timeout_seconds: float = config.SANDBOX_TIMEOUT_SECONDS,
+    constants: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Execute *code* against *df* in an isolated child process with a hard timeout.
@@ -388,6 +395,9 @@ def run_sandboxed(
                           after execution and return as a raw DataFrame.
         timeout_seconds:  Hard wall-clock limit. Defaults to
                           ``config.SANDBOX_TIMEOUT_SECONDS``.
+        constants:        Extra read-only globals (e.g. ``LAST_QUARTER_START``).
+                          Names that clash with ``df``/``pd``/``np``/``artifacts``
+                          are ignored.
 
     Returns:
         A dict with the following keys::
@@ -439,7 +449,14 @@ def run_sandboxed(
 
     process = ctx.Process(
         target=_worker,
-        args=(code, df_pickle, result_queue, artifacts_pickle, extract_artifact),
+        args=(
+            code,
+            df_pickle,
+            result_queue,
+            artifacts_pickle,
+            extract_artifact,
+            constants,
+        ),
         daemon=True,
     )
     process.start()

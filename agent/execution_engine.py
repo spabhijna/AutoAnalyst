@@ -10,6 +10,7 @@ owner of artifact registration (so an artifact is registered exactly once).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,6 +24,8 @@ from agent.capabilities import (
 )
 from agent.state import TaskNode
 from agent.validator import CapabilityValidator
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -57,9 +60,26 @@ class ExecutionEngine:
         )
         context_validation = self.validator.validate_context(capability, context)
         if not context_validation.success:
+            logger.info(
+                "Capability %s skipped for %s: %s",
+                capability.capability_id,
+                task.task_id,
+                "; ".join(context_validation.reasons),
+            )
             return None
-            
-        result = capability.executor(context)
+
+        # A capability must never crash the run: any error means the loop
+        # falls back to CODE-GEN for this task.
+        try:
+            result = capability.executor(context)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Capability %s raised %s for %s; falling back to codegen",
+                capability.capability_id,
+                type(exc).__name__,
+                task.task_id,
+            )
+            return None
         if not result.success:
             return None
 
