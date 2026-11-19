@@ -7,7 +7,7 @@ time) so tests and dry-run can swap them without this module importing the loop.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Callable
 
 import pandas as pd
 
@@ -17,6 +17,9 @@ from agent.logger import LogEntry
 from agent.parsing import parse_json_list, parse_plan_json
 from agent.prompts import plan_prompt, replan_prompt
 from agent.state import TaskNode
+
+if TYPE_CHECKING:
+    from agent.loop import AgentRun
 
 LLM = Callable[..., str]
 
@@ -73,7 +76,7 @@ def build_tasks(
     return tasks
 
 
-def sync_task_capabilities(state: Any) -> None:
+def sync_task_capabilities(state: "AgentRun") -> None:
     """Resolve missing capability IDs using the registered capability set."""
     for task in state.tasks:
         if task.capability:
@@ -84,7 +87,7 @@ def sync_task_capabilities(state: Any) -> None:
 
 
 def do_plan(
-    state: Any, df: pd.DataFrame, llm: LLM, log: Callable[[Any, LogEntry], None]
+    state: "AgentRun", df: pd.DataFrame, llm: LLM, log: Callable[["AgentRun", LogEntry], None]
 ) -> list[str]:
     """Call the PLAN stage, parse the structured plan, and return sub-question strings."""
     reporting.plan_stage_start()
@@ -113,7 +116,7 @@ def do_plan(
 
 
 def do_replan(
-    state: Any, df: pd.DataFrame, llm: LLM, completed: str
+    state: "AgentRun", df: pd.DataFrame, llm: LLM, completed: str
 ) -> list[str]:
     """Re-plan from the current step forward, carrying completed findings.
 
