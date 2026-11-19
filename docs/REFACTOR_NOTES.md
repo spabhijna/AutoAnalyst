@@ -313,3 +313,19 @@ None. New file `tests/test_dataset_independence.py` (8 tests).
 
 ### 4. Left alone (a larger design change)
 Capabilities, the observer's checks, the "last quarter" logic and the prompt examples still assume the sales schema. Other datasets now degrade to CODE-GEN instead of crashing, but making the pipeline properly dataset-agnostic, with configurable or inferred column roles, is separate work.
+
+## After the large-dataset run: sandbox deadlock
+
+Found by a live run on NYC yellow taxi trips, January 2024 (2,964,624 rows, 536 MB in memory). Every codegen attempt timed out.
+
+### 1. What changed
+- **The result is read before the child is joined.** `run_sandboxed` used to `join()` the child and only then read the queue. A child that has put a large item can't exit until the parent reads it, so any result bigger than the OS pipe buffer hung until the timeout. On the taxi data, a one-line filter timed out even at 180s. The new `_await_result` reads the queue with a deadline first, then joins (and kills the child if it doesn't exit).
+- **`new_variables` is no longer returned.** The sandbox sent every variable the code created back to the parent, hundreds of MB per attempt on large data. Nothing has read it since `AnalysisRuntime` was removed in Phase 1.
+
+### 2. Test assertions changed
+- `tests/test_sandbox.py`: `RESULT_KEYS` no longer includes `new_variables`.
+- New `TestLargeResults` (2 tests, 200k rows). Both fail on the old code and pass with the fix.
+
+### 3. Results
+- `pytest tests/ -q`: 264 passed.
+- 3M-row filters in the sandbox: 185s timeout before, 5–8s after.

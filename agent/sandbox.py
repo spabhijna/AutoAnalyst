@@ -53,7 +53,9 @@ import io
 import logging
 import multiprocessing
 import pickle
+import queue
 import sys
+import time
 import traceback
 from typing import Any
 
@@ -264,19 +266,9 @@ def _worker(
                 except Exception:  # noqa: BLE001
                     pass  # silently skip oversized or un-picklable artifacts
 
-        # ── New variable capture (Phase-1) ────────────────────────────────────
-        # Collect every name that the executed code wrote into local_ns.
-        # Protected names (result, _*) and the sandbox globals are excluded.
-        # This dict is returned to the caller so the runtime can absorb new
-        # variables into its persistent namespace without relying on the LLM
-        # to use any particular variable name.
-        _protected = {"result", "pd", "np", "df", "artifacts", "__builtins__"}
-        new_variables: dict[str, Any] = {
-            k: v
-            for k, v in local_ns.items()
-            if k not in _protected and not k.startswith("_")
-        }
-
+        # Only the result repr and the declared artifact go back to the parent.
+        # Other variables stay in the child: sending them could mean hundreds
+        # of MB per attempt on large data, and nothing reads them.
         result_queue.put(
             {
                 "success": True,
@@ -287,7 +279,6 @@ def _worker(
                 "error_category": "none",
                 "artifact": extracted_artifact,
                 "artifact_key": extract_artifact,
-                "new_variables": new_variables,
             }
         )
     except Exception as exc:  # noqa: BLE001
@@ -314,7 +305,6 @@ def _worker(
                 else "execution_error",
                 "artifact": None,
                 "artifact_key": extract_artifact,
-                "new_variables": {},
             }
         )
     finally:
@@ -349,6 +339,34 @@ def _safe_repr(value: Any) -> str | None:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+def _await_result(
+    result_queue: "multiprocessing.Queue[dict[str, Any]]",
+    process: Any,
+    timeout_seconds: float,
+) -> dict[str, Any] | None:
+    """
+    Wait up to *timeout_seconds* for the child's result dict.
+
+    Returns ``None`` if the deadline passes, or if the child exits without
+    putting anything on the queue.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            return result_queue.get(timeout=min(0.5, remaining))
+        except queue.Empty:
+            if not process.is_alive():
+                # The child may have exited just after its feeder thread
+                # flushed the result; give it one last short read.
+                try:
+                    return result_queue.get(timeout=1.0)
+                except queue.Empty:
+                    return None
 
 
 def run_sandboxed(
@@ -430,7 +448,6 @@ def run_sandboxed(
             "error_category": "execution_error",
             "artifact": None,
             "artifact_key": extract_artifact,
-            "new_variables": {},
         }
 
     # Pickle the artifacts dict for inter-process transfer
@@ -460,7 +477,17 @@ def run_sandboxed(
         daemon=True,
     )
     process.start()
-    process.join(timeout=timeout_seconds)
+
+    # Read the result BEFORE joining. A child that has put a large item on the
+    # queue cannot exit until the parent reads it, so join-then-get deadlocks
+    # until the timeout whenever the result or artifact is big.
+    result = _await_result(result_queue, process, timeout_seconds)
+    if result is not None:
+        process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join()
+        return result
 
     if process.is_alive():
         # Hard kill — unconditional, no cooperative signalling
@@ -478,12 +505,7 @@ def run_sandboxed(
             "error_category": "execution_error",
             "artifact": None,
             "artifact_key": extract_artifact,
-            "new_variables": {},
         }
-
-    # Retrieve result from the queue
-    if not result_queue.empty():
-        return result_queue.get_nowait()
 
     # Process exited without putting anything in the queue (e.g. OOM kill)
     return {
@@ -498,5 +520,4 @@ def run_sandboxed(
         "error_category": "execution_error",
         "artifact": None,
         "artifact_key": extract_artifact,
-        "new_variables": {},
     }
