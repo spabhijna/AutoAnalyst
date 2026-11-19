@@ -11,6 +11,7 @@
   - `test_dry_run_does_not_leak` — `xfail(strict)` bug D3.
   - `test_plan_revision_cap_aborts` — `xfail(strict)` bug D5, parametrized over 1- and 3-question plans.
   - `test_dry_run_is_fully_deterministic` — `xfail(strict)` bug D6 (added after review).
+  - `test_critique_prompt_includes_observation_text` — `xfail(strict)` bug D8 (added in the Phase 1 review; Phase 4 fixes it).
 - Tests that run `dry_run=True` use `monkeypatch.setattr(loop, "call_llm", loop.call_llm)` so teardown undoes the D3 leak and other tests aren't polluted.
 
 ### 2. Deviations from the plan
@@ -19,6 +20,8 @@
 
 ### 3. Test assertions changed
 None. No existing test was modified.
+
+**Correction (Phase 1 review):** the `fix(phase-0)` commit rewrote `test_plan_revision_cap_aborts` and silently dropped `assert state.plan_revisions == MAX_PLAN_REVISIONS` (a new Phase 0 test, not a pre-existing one). It is restored in `fix(phase-1)`. It holds for both parametrized plans (verified with `--runxfail`: the failure comes later, at `state.aborted` / the "revision" reason check).
 
 ### 4. Results
 - `pytest tests/ -q`: `250 passed, 4 xfailed in 55.70s` at first commit; after review feedback `250 passed, 6 xfailed` (baseline was 249 passed; +1 is the smoke test).
@@ -63,3 +66,7 @@ None changed. Removed whole files only: `test_runtime.py` (the runtime is gone) 
 - `ruff` F841 in `agent/prompts.py` (`obs_block` unused, in `critique_prompt`) and `agent/sandbox.py` (`last_line`): out of scope (prompts/sandbox).
 - `README.md`, `ARCHITECTURE.md` and `PROGRESS.md` still mention `runtime.py` / `executors.py`; Phase 6 rewrites them.
 - `_accepted_findings` and the `AgentRun.history` shim remain (tests still use them).
+
+### Phase 1 review follow-ups
+- Restored the `plan_revisions` assertion (see Phase 0 §3 correction) and added the D8 xfail test.
+- Reminder for Phase 4: the D5 fix must update `tests/test_loop.py::TestRevisePlan::test_plan_revision_cap` ("After MAX_PLAN_REVISIONS, revise_plan requests are ignored"), whose behaviour D5 deliberately changes.

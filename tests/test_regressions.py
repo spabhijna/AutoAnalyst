@@ -126,6 +126,7 @@ def test_plan_revision_cap_aborts(sales_df, tmp_path, plan) -> None:
     ):
         state = run("goal", sales_df, log_dir=str(tmp_path))
 
+    assert state.plan_revisions == MAX_PLAN_REVISIONS
     assert state.aborted
     assert "revision" in state.abort_reason.lower()
 
@@ -151,3 +152,23 @@ def test_dry_run_is_fully_deterministic(sales_df, tmp_path, monkeypatch) -> None
         "monthly_trend",
         "revenue_share",
     }
+
+
+# ---------------------------------------------------------------------------
+# D8: critique_prompt drops the observer's facts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(strict=True, reason="bug D8: obs_block not interpolated")
+def test_critique_prompt_includes_observation_text() -> None:
+    from agent.prompts import critique_prompt
+
+    prompt = critique_prompt(
+        "goal",
+        "sub question",
+        "result = 1",
+        {"success": True, "result": "1", "stdout": "", "error": None},
+        "(no history)",
+        observation_text="SENTINEL_OBS",
+    )
+    assert "SENTINEL_OBS" in prompt
