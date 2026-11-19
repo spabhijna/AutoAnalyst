@@ -26,12 +26,11 @@ import os
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Literal
+from typing import Callable, Literal
 
 from dotenv import load_dotenv
 
 from agent.config import (
-    CEREBRAS_BASE_URL,
     CEREBRAS_CODEGEN_FALLBACK_MODEL,
     CEREBRAS_CRITIQUE_FALLBACK_MODEL,
     GEMINI_FALLBACK_MODEL,

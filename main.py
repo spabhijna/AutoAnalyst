@@ -90,10 +90,11 @@ def main() -> None:
     if args.retries is not None:
         kwargs["max_retries_per_step"] = args.retries
 
+    kwargs["dataset_label"] = "corrupted" if args.corrupt else "clean"
     state = run(args.goal, df, dry_run=args.dry_run, **kwargs)
 
     print(f"\nLog written to: runs/{state.run_id}.jsonl")
-    print(f"Total steps executed: {len(state.history)}")
+    print(f"Total steps executed: {len(state.debug_history)}")
 
 
 if __name__ == "__main__":

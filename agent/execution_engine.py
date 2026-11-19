@@ -2,8 +2,10 @@
 Generic execution engine for capability-driven analytical workflows.
 
 The engine resolves a task to a registered capability, fetches required
-artifacts, invokes the deterministic executor, validates the contract, and
-registers any produced artifact back into the ArtifactStore.
+artifacts, invokes the deterministic executor and validates the contract.
+
+The engine never writes to the ArtifactStore: the loop's ``_accept`` is the single
+owner of artifact registration (so an artifact is registered exactly once).
 """
 
 from __future__ import annotations
@@ -37,7 +39,6 @@ class ExecutionEngine:
         task: TaskNode,
         df: pd.DataFrame,
         artifact_store: ArtifactStore,
-        consumers: list[str] | None = None,
     ) -> dict[str, Any] | None:
         capability = self.registry.resolve(task)
         if capability is None:
@@ -69,23 +70,11 @@ class ExecutionEngine:
             return None
 
         semantic_validation = self.validator.validate_semantic_contract(
-            task.task_id, result.artifact, result.result, artifact_store.as_namespace()
+            task, result.artifact
         )
         if not semantic_validation.success:
             return None
 
-        if capability.produced_artifacts and result.artifact is not None:
-            artifact_key = (
-                task.produces_artifact
-                or result.artifact_key
-                or capability.produced_artifacts[0]
-            )
-            artifact_store.register(
-                key=artifact_key,
-                df=result.artifact,
-                producing_task_id=task.task_id,
-                consumers=consumers or [],
-                confidence="high",
-                provenance=[capability.capability_id, task.task_id],
-            )
-        return result.to_sandbox_result()
+        payload = result.to_sandbox_result()
+        payload["capability_id"] = capability.capability_id
+        return payload

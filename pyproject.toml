@@ -4,22 +4,36 @@ version = "0.1.0"
 description = "Self-Correcting Data Pipeline Agent — analyzes sales data via a PLAN→CODEGEN→EXECUTE→OBSERVE→CRITIQUE loop with independent LLM critique."
 readme = "README.md"
 requires-python = ">=3.12"
+# Runtime dependencies, one per import in the code:
+#   groq / cerebras-cloud-sdk / google-genai  -> agent/llm_client.py (provider chain;
+#       OpenRouter is called with urllib from the standard library, no SDK)
+#   python-dotenv -> agent/config.py, agent/llm_client.py (.env loading)
+#   pandas, numpy -> analysis, sandbox, data generator
 dependencies = [
-    "groq",
+    "cerebras-cloud-sdk",
     "google-genai",
-    "python-dotenv",
+    "groq",
+    "numpy",
     "pandas",
-    "pydantic-settings",
-    "pytest>=9.1.0",
-    "pytest-mock>=3.15.1",
+    "python-dotenv",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest",
-    "pytest-mock",
+    "pytest>=9.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent", "data"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

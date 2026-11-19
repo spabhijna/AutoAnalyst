@@ -28,6 +28,111 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 
+def _print_header(data: dict[str, Any], meta: dict[str, Any]) -> None:
+    """Print the run id and the metadata block."""
+    print("=" * 72)
+    print(f"  RUN TRACE — {data.get('run_id', 'unknown')}")
+    print("=" * 72)
+    print()
+    print("📋 METADATA")
+    print("-" * 72)
+    print(f"  Goal:       {meta.get('goal', '(none)')[:120]}")
+    print(f"  Dataset:    {meta.get('dataset', 'unknown')}")
+    print(f"  Models:     {json.dumps(meta.get('model_versions', {}))}")
+    print(f"  Iterations: {meta.get('total_iterations', 0)}")
+    print(f"  LLM calls:  {meta.get('total_llm_calls', 0)}")
+    print(f"  Wall clock: {meta.get('wall_clock_seconds', 0):.1f}s")
+    aborted = meta.get("aborted", False)
+    print(f"  Status:     {'❌ ABORTED' if aborted else '✅ Complete'}")
+    print()
+
+
+def _print_plan_entry(entry: dict[str, Any]) -> None:
+    print("📝 PLAN")
+    plan_items = entry.get("extra", {}).get("plan", [])
+    for i, q in enumerate(plan_items, 1):
+        print(f"  {i}. {q}")
+    print()
+
+
+def _print_attempt_entry(entry: dict[str, Any]) -> None:
+    """Print one codegen/execute/critique iteration."""
+    iteration = entry.get("iteration", 0)
+    if iteration == 0:
+        action = entry.get("action", "")
+        status = "✅ ACCEPTED" if action == "accept" else "🔄 retry →"
+        print(f"  Iteration {iteration}: {status}")
+    else:
+        print(f"  Iteration {iteration}: 🔄 retry")
+
+    code = entry.get("code", "")
+    if code:
+        print("  ── Code ──")
+        for line in code.strip().splitlines()[:10]:
+            print(f"    {line}")
+        if len(code.strip().splitlines()) > 10:
+            print(f"    … (+{len(code.strip().splitlines()) - 10} more lines)")
+
+    sandbox = entry.get("sandbox_result") or {}
+    if sandbox.get("stdout"):
+        stdout_lines = sandbox["stdout"].strip().splitlines()
+        print(f"  📤 stdout ({len(stdout_lines)} lines):")
+        for line in stdout_lines[:5]:
+            print(f"    | {line}")
+
+    result_repr = sandbox.get("result")
+    if result_repr:
+        print(f"  📊 result: {result_repr[:200]}")
+
+    critique = entry.get("critique", "")
+    trust = entry.get("trust", "?")
+    action = entry.get("action", "?")
+    if critique:
+        try:
+            crit_data = json.loads(critique)
+            reason = crit_data.get("reason", critique)[:300]
+        except (json.JSONDecodeError, TypeError):
+            reason = critique[:300]
+        print(f"  🔍 critique [{trust} trust, {action}]: {reason}")
+
+    print()
+
+
+def _print_summary_entry(entry: dict[str, Any]) -> None:
+    extra = entry.get("extra", {})
+    summary_text = extra.get("summary", "")
+    print("📝 FINAL SUMMARY")
+    print("-" * 72)
+    print(summary_text)
+    print()
+
+
+def _print_steps(history: list[dict[str, Any]]) -> None:
+    """Print the step-by-step trace, grouping entries by sub-question."""
+    step_number = 0
+    last_question = None
+
+    for entry in history:
+        stage = entry.get("stage", "?")
+        question = entry.get("sub_question", "")
+
+        # Group entries by sub_question — print a step header when it changes
+        if question != last_question and stage != "plan" and stage != "summary":
+            step_number += 1
+            print(f"━━━ STEP {step_number} ━━━{'━' * 60}")
+            print(f"  ❓ {question[:120]}")
+            print()
+
+        if stage == "plan":
+            _print_plan_entry(entry)
+        elif stage == "codegen_execute_critique":
+            _print_attempt_entry(entry)
+        elif stage == "summary":
+            _print_summary_entry(entry)
+
+        last_question = question
+
+
 def print_run_trace(json_path: str | Path) -> None:
     """
     Print a human-readable trace of the run stored in *json_path*.
@@ -49,95 +154,8 @@ def print_run_trace(json_path: str | Path) -> None:
     meta: dict[str, Any] = data.get("metadata", {})
     history: list[dict[str, Any]] = data.get("history", [])
 
-    # ── Header ────────────────────────────────────────────────────────────────
-    print("=" * 72)
-    print(f"  RUN TRACE — {data.get('run_id', 'unknown')}")
-    print("=" * 72)
-    print()
-    print("📋 METADATA")
-    print("-" * 72)
-    print(f"  Goal:       {meta.get('goal', '(none)')[:120]}")
-    print(f"  Dataset:    {meta.get('dataset', 'unknown')}")
-    print(f"  Models:     {json.dumps(meta.get('model_versions', {}))}")
-    print(f"  Iterations: {meta.get('total_iterations', 0)}")
-    print(f"  LLM calls:  {meta.get('total_llm_calls', 0)}")
-    print(f"  Wall clock: {meta.get('wall_clock_seconds', 0):.1f}s")
-    aborted = meta.get("aborted", False)
-    print(f"  Status:     {'❌ ABORTED' if aborted else '✅ Complete'}")
-    print()
-
-    # ── Step trace ────────────────────────────────────────────────────────────
-    step_number = 0
-    last_question = None
-
-    for entry in history:
-        stage = entry.get("stage", "?")
-        question = entry.get("sub_question", "")
-
-        # Group entries by sub_question — print a step header when it changes
-        if question != last_question and stage != "plan" and stage != "summary":
-            step_number += 1
-            print(f"━━━ STEP {step_number} ━━━{'━' * 60}")
-            print(f"  ❓ {question[:120]}")
-            print()
-
-        if stage == "plan":
-            print("📝 PLAN")
-            plan_items = entry.get("extra", {}).get("plan", [])
-            for i, q in enumerate(plan_items, 1):
-                print(f"  {i}. {q}")
-            print()
-
-        elif stage == "codegen_execute_critique":
-            iteration = entry.get("iteration", 0)
-            if iteration == 0:
-                action = entry.get("action", "")
-                status = "✅ ACCEPTED" if action == "accept" else "🔄 retry →"
-                print(f"  Iteration {iteration}: {status}")
-            else:
-                print(f"  Iteration {iteration}: 🔄 retry")
-
-            code = entry.get("code", "")
-            if code:
-                print("  ── Code ──")
-                for line in code.strip().splitlines()[:10]:
-                    print(f"    {line}")
-                if len(code.strip().splitlines()) > 10:
-                    print(f"    … (+{len(code.strip().splitlines()) - 10} more lines)")
-
-            sandbox = entry.get("sandbox_result") or {}
-            if sandbox.get("stdout"):
-                stdout_lines = sandbox["stdout"].strip().splitlines()
-                print(f"  📤 stdout ({len(stdout_lines)} lines):")
-                for line in stdout_lines[:5]:
-                    print(f"    | {line}")
-
-            result_repr = sandbox.get("result")
-            if result_repr:
-                print(f"  📊 result: {result_repr[:200]}")
-
-            critique = entry.get("critique", "")
-            trust = entry.get("trust", "?")
-            action = entry.get("action", "?")
-            if critique:
-                try:
-                    crit_data = json.loads(critique)
-                    reason = crit_data.get("reason", critique)[:300]
-                except (json.JSONDecodeError, TypeError):
-                    reason = critique[:300]
-                print(f"  🔍 critique [{trust} trust, {action}]: {reason}")
-
-            print()
-
-        elif stage == "summary":
-            extra = entry.get("extra", {})
-            summary_text = extra.get("summary", "")
-            print("📝 FINAL SUMMARY")
-            print("-" * 72)
-            print(summary_text)
-            print()
-
-        last_question = question
+    _print_header(data, meta)
+    _print_steps(history)
 
     # ── Final summary from metadata ───────────────────────────────────────────
     final = meta.get("final_summary", "")

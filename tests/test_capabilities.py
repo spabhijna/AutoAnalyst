@@ -100,3 +100,76 @@ def test_execute_top_selling_product_category() -> None:
     assert len(result.artifact) == 2
     assert result.artifact.iloc[0]["product_category"] == "B"
     assert result.artifact.iloc[0]["total_units_sold"] == 10
+
+
+def test_deterministic_execution_result_to_sandbox_result() -> None:
+    import pandas as pd
+
+    from agent.capabilities import DeterministicExecutionResult
+
+    frame = pd.DataFrame({"a": [1]})
+    result = DeterministicExecutionResult(
+        success=True,
+        result="ok",
+        stdout="",
+        error=None,
+        error_type=None,
+        error_category="none",
+        artifact=frame,
+        artifact_key="k",
+    )
+    payload = result.to_sandbox_result()
+    assert payload["success"] is True
+    assert payload["artifact_key"] == "k"
+    assert payload["artifact"] is frame
+    assert payload["error_category"] == "none"
+
+
+def test_df_result_defaults_to_head_text() -> None:
+    import pandas as pd
+
+    from agent.capabilities import _df_result
+
+    frame = pd.DataFrame({"a": [1, 2]})
+    result = _df_result(frame, "k")
+    assert result.success is True
+    assert result.artifact is frame
+    assert result.artifact_key == "k"
+    assert result.result == frame.head().to_string(index=False)
+    assert _df_result(frame, "k", "custom").result == "custom"
+
+
+def test_revenue_share_uses_named_total_revenue_column() -> None:
+    import pandas as pd
+
+    from agent.capabilities import CapabilityExecutionContext, execute_revenue_share
+    from agent.state import TaskNode
+
+    # Column order deliberately differs from (region, total_revenue).
+    region_revenue = pd.DataFrame(
+        {"total_revenue": [75.0, 25.0], "region": ["North", "South"]}
+    )
+    context = CapabilityExecutionContext(
+        task=TaskNode(task_id="s", question="q", produces_artifact="revenue_share"),
+        df=pd.DataFrame(),
+        artifacts={"region_revenue": region_revenue},
+    )
+    result = execute_revenue_share(context)
+    assert result.success is True
+    assert list(result.artifact["revenue_share"]) == [0.75, 0.25]
+
+
+def test_revenue_share_without_total_revenue_column_fails_gracefully() -> None:
+    import pandas as pd
+
+    from agent.capabilities import CapabilityExecutionContext, execute_revenue_share
+    from agent.state import TaskNode
+
+    context = CapabilityExecutionContext(
+        task=TaskNode(task_id="s", question="q", produces_artifact="revenue_share"),
+        df=pd.DataFrame(),
+        artifacts={"region_revenue": pd.DataFrame({"region": ["N"], "revenue": [1.0]})},
+    )
+    result = execute_revenue_share(context)
+    assert result.success is False
+    assert "total_revenue" in result.error

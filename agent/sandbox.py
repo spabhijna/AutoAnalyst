@@ -60,6 +60,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from agent import config
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -348,7 +350,7 @@ def run_sandboxed(
     df: pd.DataFrame,
     artifacts: dict[str, pd.DataFrame] | None = None,
     extract_artifact: str | None = None,
-    timeout_seconds: int = 5,
+    timeout_seconds: float = config.SANDBOX_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """
     Execute *code* against *df* in an isolated child process with a hard timeout.
@@ -384,7 +386,8 @@ def run_sandboxed(
                           the ``artifacts`` global dict. Defaults to empty dict.
         extract_artifact: Variable name to extract from the sandbox namespace
                           after execution and return as a raw DataFrame.
-        timeout_seconds:  Hard wall-clock limit. Defaults to 5 s.
+        timeout_seconds:  Hard wall-clock limit. Defaults to
+                          ``config.SANDBOX_TIMEOUT_SECONDS``.
 
     Returns:
         A dict with the following keys::
