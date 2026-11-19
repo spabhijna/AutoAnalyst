@@ -14,6 +14,7 @@ from typing import Any
 import pandas as pd
 
 from agent.capabilities import Capability, CapabilityExecutionContext
+from agent.dates import DATE_COLUMN_TOKEN, detect_date_column
 from agent.state import SCHEMA_PLACEHOLDERS, TaskNode
 
 
@@ -55,7 +56,11 @@ class CapabilityValidator:
             else context.df
         )
         missing_columns = [
-            column for column in capability.input_schema if column not in source.columns
+            column
+            for column in capability.input_schema
+            if column not in source.columns
+            # "date" means the detected datetime column, whatever its name.
+            and not (column == DATE_COLUMN_TOKEN and detect_date_column(source))
         ]
         if missing_columns:
             return ValidationResult(

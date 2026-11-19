@@ -16,7 +16,7 @@ import pandas as pd
 from agent import reporting
 from agent.findings import build_history_summary, coerce_trust, final_results
 from agent.logger import LogEntry
-from agent.observer import observe
+from agent.observer import observe, observe_dataset
 from agent.parsing import parse_critique_json, strip_markdown_fences
 from agent.prompts import (
     codegen_prompt,
@@ -68,10 +68,13 @@ def observe_and_critique(
     Returns ``(raw_critique, trust, action, reason, error_category)``.
     """
     reporting.observe_start()
+    if state.data_quality is None:
+        state.data_quality = observe_dataset(df)  # once per run
     obs_report = observe(
         df,
         sandbox_result,
         artifact_store_available_keys=state.artifact_store.available_keys(),
+        baseline=state.data_quality,
     )
     reporting.observe_result(obs_report)
 
@@ -187,6 +190,8 @@ def do_codegen(
         task_constraints=task_memory.as_prompt_text(),
         available_artifacts=state.artifact_store.describe(),
         artifact_contract=artifact_contract_text(task),
+        time_scoped=state.scope.quarter,
+        data_dictionary=state.data_dictionary,
     )
     raw = state.llm(prompt, role="codegen")
     return strip_markdown_fences(raw)
@@ -210,6 +215,8 @@ def do_repair(
         error_reason=previous_critique_reason,
         available_artifacts=state.artifact_store.describe(),
         artifact_contract=artifact_contract_text(task),
+        time_scoped=state.scope.quarter,
+        data_dictionary=state.data_dictionary,
     )
     raw = state.llm(prompt, role="codegen")
     return strip_markdown_fences(raw)
@@ -242,6 +249,8 @@ def do_critique(
         sandbox_result,
         history_summary,
         observation_text=observation_text,
+        time_scoped=state.scope.quarter,
+        data_dictionary=state.data_dictionary,
     )
     raw = state.llm(prompt, role="critique")
     parsed = parse_critique_json(raw)
@@ -258,7 +267,9 @@ def do_summary(state: "AgentRun") -> str:
     """
     reporting.summary_stage_start()
     findings = final_results(state)
-    prompt = summary_prompt(state.goal, findings)
+    prompt = summary_prompt(
+        state.goal, findings, data_dictionary=state.data_dictionary
+    )
     summary = state.llm(prompt, role="observe")
 
     log_entry(
